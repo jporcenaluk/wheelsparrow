@@ -11,6 +11,7 @@
     "build": "pnpm -r --sort run build",
     "fix": "biome check --write . && markdownlint-cli2 --fix \"**/*.md\"",
     "lint": "biome check . && markdownlint-cli2 \"**/*.md\"",
+    "smoke:production": "node scripts/production-smoke.mjs",
     "test:unit": "vitest run",
     "typecheck": "pnpm -r --if-present run typecheck && tsc -p tsconfig.tests.json --noEmit",
     "verify:policy": "vitest run scripts/repository-policy.test.ts",
