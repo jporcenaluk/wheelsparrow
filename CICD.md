@@ -1,407 +1,282 @@
-# Symphony Encore Continuous Integration and Delivery Specification
+# Wheelsparrow MVP Continuous Integration and Delivery
 
-Status: Draft v1
+Status: Approved MVP baseline
 
-Purpose: Define the required local checks, GitHub pull-request gates, `main` branch validation,
-artifact publication, dependency maintenance, and deployment controls for the Symphony Encore
-reference implementation.
+Purpose: Define a mature but compact delivery contract for Wheelsparrow itself. This document borrows
+the proven operating shape used in `automations`: stable Make targets, isolated worktrees, a local
+gate that mirrors CI, layered tests, workflow-contract tests, separate PR metadata checks, and exact
+commit evidence.
 
-The key words MUST, MUST NOT, SHOULD, and MAY are used per RFC 2119. This document defines the
-delivery contract; workflow YAML and repository settings implement it. A green workflow is evidence
-only for the exact commit, inputs, toolchain, and workflow revision that produced it.
+This document does not define how Wheelsparrow's target repositories deploy to staging; that is the
+configured repository contract in `SPEC.md`.
 
 ## 1. Delivery Principles
 
-1. **One gate, several triggers.** Pull requests, merge-queue candidates, and `main` MUST run the
-   same canonical verification commands. A second, weaker implementation of a check is forbidden.
-2. **Reproducible and current.** Toolchains, dependencies, actions, and container bases are pinned.
-   Automated pull requests keep those pins on the newest stable mutually compatible releases.
-3. **Untrusted code gets no authority.** Pull-request code MUST run without repository, package,
-   cloud, or deployment credentials and with a read-only token unless a narrower permission is
-   required by an isolated trusted job.
-4. **Build once after trust.** Deployable artifacts MUST be built from a verified `main` or release
-   commit, identified by immutable digest, and promoted without rebuilding.
-5. **Local feedback is fast; CI is authoritative.** Pre-commit hooks catch cheap mistakes. They MUST
-   NOT replace server-side required checks, and bypassing a local hook MUST NOT bypass CI.
-6. **Failures leave evidence.** Test reports, relevant logs, browser traces, coverage, SBOMs,
-   attestations, and scan results MUST remain available long enough to diagnose the failing commit.
-7. **No deployment target is invented.** Until a hosted environment is selected, successful `main`
-   runs publish verified artifacts but MUST NOT claim a production deployment occurred.
+1. **One command composition.** Contributors, agents, and GitHub Actions use the same Make targets.
+2. **Evidence belongs to a revision.** Local results, reviews, CI, approvals, artifacts, and security
+   findings identify the exact commit they evaluated.
+3. **Required checks never disappear.** A required workflow reports pass or fail for every relevant
+   pull request; path filters MUST NOT silently omit it.
+4. **Untrusted code has no authority.** Ordinary PR jobs receive no secrets and read-only contents.
+5. **Fast checks happen early.** Pre-commit catches cheap problems; CI repeats all merge gates.
+6. **Failures stay visible.** Logs, reports, traces, and screenshots are retained for diagnosis.
+7. **No fictional deployment.** Until Wheelsparrow has a selected hosted target, `main` produces a
+   verified local build artifact and does not claim a deployment.
 
-## 2. Repository and Branch Controls
+## 2. Branch and Pull-Request Contract
 
-The default branch MUST be `main` and MUST be protected by a GitHub ruleset or equivalent branch
-protection. Direct pushes to `main` are forbidden except for an explicitly audited break-glass role.
+`main` MUST require pull requests and stable required checks. Direct pushes and force pushes are
+disabled except for an audited break-glass path. Squash merge is preferred, and the PR title becomes
+the commit subject.
 
-The protection policy MUST require:
+PR titles MUST use Conventional Commit form:
 
-- a pull request;
-- the current required checks from Section 5;
-- all review conversations resolved;
-- the head branch to be current with the protected base or validated through GitHub's merge queue;
-- at least one approving review once the repository has more than one maintainer;
-- dismissal or invalidation of approval when the reviewed diff changes materially; and
-- successful validation of the exact merge-group commit when merge queue is enabled.
+```text
+<type>(optional-scope): imperative summary
+```
 
-The repository SHOULD use squash merging so `main` contains one intentional commit per pull request.
-The pull-request title MUST follow the repository's Conventional Commit subset because it becomes
-the squash subject. Merge commits and force pushes to `main` SHOULD be disabled.
+Allowed initial types are `feat`, `fix`, `docs`, `refactor`, `test`, `build`, `ci`, and `chore`.
 
-`CODEOWNERS` MUST protect workflow files, dependency and toolchain configuration, container files,
-migrations, authentication code, sandbox/process-control code, and release configuration once an
-independent owner exists. A sole-maintainer repository MAY begin without an impossible self-approval
-rule, but CI and conversation-resolution requirements still apply.
+Branch protection SHOULD require:
 
-Required-check names MUST remain stable. A workflow refactor MUST update the ruleset in the same
-administrative change and MUST NOT leave `main` accidentally unguarded.
+- `validate-pr-title`;
+- `ready-for-review-gate`;
+- `test`;
+- `prompt-contract`;
+- `integration`;
+- `e2e`;
+- `actionlint`; and
+- `security`.
 
-## 3. Workflow Structure and Triggers
+It also requires resolved conversations and current-base or merge-queue validation. A sole-maintainer
+repository MAY omit mandatory self-approval; the explicit Wheelsparrow product approval gate is
+unrelated to GitHub review policy for this repository.
 
-The repository SHOULD separate reusable verification logic from trigger-specific authority:
+The current names and repository ruleset settings MUST be recorded in this document whenever they
+change. Workflow renaming without the matching ruleset update is a release-blocking defect.
+
+## 3. Workflow Shape
+
+The initial workflows are:
 
 ```text
 .github/workflows/
-  ci.yml                 pull_request, merge_group, push to main
-  codeql.yml             pull_request, push to main, scheduled analysis
-  publish-container.yml  build and publish verified main commits
-  release.yml            promote existing artifacts for version tags
+  pr-title.yml       PR title and ready-for-review metadata checks
+  ci.yml             test, prompt-contract, integration, e2e, actionlint
+  security.yml       CodeQL and repository secret scan
+  main.yml           verified build artifact after merge
+  live-smoke.yml     manual disposable-project integration smoke
 ```
 
-`ci.yml` MUST trigger on `pull_request`, `merge_group`, and pushes to `main`. The merge-group trigger
-is REQUIRED when its checks are named in a merge-queue ruleset. Manual `workflow_dispatch` MAY be
-provided for diagnosis, but its result MUST NOT be substituted for a required check on another SHA.
+PR metadata checks are separate from commit-bound CI. Editing a title or changing draft state MUST
+rerun metadata checks without canceling expensive tests for an unchanged SHA.
 
-Pull-request concurrency SHOULD cancel an older run for the same pull request. `main`, merge-group,
-release, and deployment runs MUST NOT be canceled merely because a newer commit appears; cancellation
-could leave an artifact or environment in an unknown state.
+`ci.yml` triggers for `pull_request`, `merge_group`, and pushes to `main`. `merge_group` is required
+when merge queue is enabled. PR concurrency MAY cancel an older run for the same PR and workflow;
+`main` and merge-group runs MUST NOT be canceled merely because another commit appears.
 
-Workflows MUST use repository-owned Make targets. YAML MUST coordinate jobs and permissions, not
-duplicate build logic. The same `make verify` composition MUST be runnable on a contributor host.
+The manual live smoke requires an explicitly configured disposable GitHub repository and project.
+It MUST NOT target a real delivery board by default.
 
-## 4. Workflow Security
+## 4. Required Checks
 
-Every workflow MUST declare top-level `permissions: contents: read` or `permissions: {}` and grant
-additional GitHub token permissions only to the job that needs them. Build and test jobs MUST NOT
-receive write permissions.
+### 4.1 `validate-pr-title`
 
-Third-party and GitHub-authored actions MUST be pinned to a full commit SHA. A nearby comment SHOULD
-record the corresponding release tag for human review. Floating tags such as `@main`, `@latest`, or
-an unpinned major tag are forbidden in executed workflow steps. Automated dependency updates MUST
-keep action SHAs current.
+Runs without checking out PR code. It validates the current title and reports a useful correction.
+It reruns on title edits.
 
-Workflows MUST NOT use `pull_request_target` to check out or execute untrusted pull-request content.
-If a future metadata-only workflow needs `pull_request_target`, it MUST NOT fetch, evaluate, import,
-or interpolate executable data from the pull request and MUST have an explicit threat-model review.
+### 4.2 `ready-for-review-gate`
 
-Untrusted issue titles, branch names, commit messages, pull-request bodies, and workflow inputs MUST
-NOT be interpolated directly into shell scripts. Values MUST pass through environment variables or
-structured action inputs and be quoted by the receiving program.
+Runs without checking out PR code. It fails while the PR is a draft and reruns when the PR changes
+draft state. Drafts may receive test feedback but cannot merge accidentally.
 
-Secrets MUST NOT be available to ordinary pull-request jobs. Fork pull requests MUST receive the
-same validation that can run safely without secrets. Deployment jobs MUST use GitHub Environments,
-environment-specific protection, and OpenID Connect where the target supports it rather than
-long-lived cloud credentials.
+### 4.3 `test`
 
-The repository MUST enable secret scanning and push protection when the GitHub plan permits them.
-CI MUST run a repository secret scanner that can operate without receiving secrets of its own.
-
-Workflow changes MUST pass actionlint and zizmor before merge. Generated workflow changes MUST
-receive the same review as handwritten YAML. Gitleaks MUST provide the repository secret scan, and
-Trivy MUST scan the final container filesystem when a Dockerfile exists. These tools are build-time
-controls, not application runtime dependencies, and follow the pinning policy in Section 8.
-
-CodeQL or an equivalent TypeScript static application-security analysis MUST run on pull requests,
-pushes to `main`, and a regular schedule. Results MUST be uploaded to GitHub code scanning and MUST
-identify the analyzed commit. A configured severity policy MUST block newly introduced actionable
-findings; suppressions require a reviewed reason and scope.
-
-## 5. Pull-Request and Merge-Queue Verification
-
-The pull-request graph MUST expose stable required checks. Jobs MAY run in parallel after dependency
-installation, but the final `ci / required` check MUST fail unless every required job for that commit
-has passed or produced an explicitly permitted result.
-
-### 5.1 Policy and Documentation
-
-The policy job MUST:
-
-- reject conflict markers, whitespace errors, and unexpected generated drift;
-- validate Markdown links and normative-document formatting with Markdownlint CLI2;
-- lint GitHub Actions and container definitions when present;
-- validate the pnpm lockfile and workspace graph; and
-- check the pull-request title convention.
-
-Path filtering MAY skip work inside a job, but a required workflow MUST still report a terminal
-status. GitHub path filters MUST NOT silently omit a required check and leave the pull request
-unmergeable or, worse, unguarded.
-
-### 5.2 Supply-Chain Review
-
-Pull requests that change a supported package manifest or lockfile MUST run GitHub dependency review
-or an equivalent manifest-aware gate. It MUST reject newly introduced packages with known
-vulnerabilities at the configured severity threshold or licenses forbidden by project policy.
-
-The review SHOULD surface dependency additions even when they pass, so reviewers can evaluate
-maintenance, documentation, transitive size, native build requirements, and replacement cost.
-
-Workflow-action changes MUST instead pass full-SHA pin validation, actionlint, and zizmor; package
-dependency review MUST NOT be described as evidence about an action's executed code. Container-base
-changes MUST resolve to an immutable digest. The built image's generated SBOM, vulnerability scan,
-and configured license policy are the evidence for its final contents.
-
-### 5.3 Static Verification
-
-The static-verification job MUST use a frozen lockfile and run:
+Runs the local agent gate:
 
 ```text
-Biome check
-TypeScript type checking with no emit
-package-boundary and cycle checks
-generated OpenAPI/client drift checks
+make verify-agent
 ```
 
-CI MUST fail rather than rewrite files. Formatting fixes belong in the contributor workspace.
+That target performs frozen dependency validation, Biome check, TypeScript type checking, unit and
+component tests, Markdown checks, and `git diff --check`. CI checks; it never rewrites files.
 
-### 5.4 Unit and Contract Tests
+### 4.4 `prompt-contract`
 
-Vitest MUST run unit, contract, and component suites with deterministic time and randomness. Test
-sharding MAY be introduced only when it preserves complete reporting and deterministic retries.
-Failed tests MUST NOT be automatically retried into a green result without preserving the original
-failure and identifying the test as flaky.
+Runs `make test-prompts`. It validates all three role prompts, their authority boundaries, required
+terminal contracts and stop rules, model configuration shape, stable fixture rendering, and prompt
+hash generation. It MUST NOT call a model or require credentials.
 
-Coverage MUST be collected from the complete unit/contract suite. The initial floor MUST be based on
-real measured coverage and SHOULD ratchet upward. A threshold reduction requires an explicit reason
-in the pull request.
+### 4.5 `integration`
 
-### 5.5 Persistence and Process Integration
+Runs `make test-integration` against:
 
-Integration tests MUST use production migrations and temporary SQLite files. They MUST exercise:
+- a real temporary SQLite file and production migrations;
+- temporary Git repositories and worktrees;
+- child processes that prove timeout and process-tree termination;
+- the stateful GitHub fake; and
+- stop/restart reconciliation with duplicate-effect detection.
 
-- migration from every supported prior schema;
-- transaction rollback and uniqueness constraints;
-- claim and budget concurrency;
-- restart and intent/receipt recovery;
-- subprocess timeout, signal forwarding, and process-tree termination; and
-- workspace path and symlink escape rejection.
+Tests MUST cover every state transition, dependency filtering, serial dispatch, bounded retry and
+repair, PR revision drift, approval invalidation, and Done evidence.
 
-Process and filesystem integration MUST run on Linux and macOS for changes that touch those
-boundaries. The repository SHOULD keep a small cross-platform smoke suite on both hosted runner
-types and run deeper platform suites on `main` and on a schedule if pull-request cost becomes
-material.
+### 4.6 `e2e`
 
-WSL behavior MUST be covered by a documented release smoke test until a trustworthy automated WSL
-runner is available. Linux CI alone MUST NOT be described as proof of Windows-host/WSL networking.
+Runs `make test-e2e` with a production server build and Playwright Chromium. It covers:
 
-### 5.6 Production Build
+- queue ordering and blocked reasons;
+- one active Todo with multiple Review items;
+- run detail logs and findings;
+- Return to Todo;
+- merge approval for the exact displayed SHA;
+- rejection after a simulated head-SHA change; and
+- Done only after matching staging and smoke evidence.
 
-The build job MUST create the production server and Vite assets from a frozen lockfile. It MUST start
-the built server, verify its health and readiness endpoints, and prove that Fastify serves the
-browser application and Control API from one port.
+On failure it uploads the Playwright report, trace, browser console, and screenshots.
 
-The build MUST fail on missing environment declarations, stale generated artifacts, or a browser
-bundle that includes server-only modules or secret-bearing configuration.
+### 4.7 `actionlint`
 
-### 5.7 Browser End-to-End Tests
+Runs actionlint, zizmor, and repository workflow-contract tests. The tests parse workflow YAML and
+assert:
 
-Playwright MUST run against the built application, not only the Vite development server. The minimum
-suite MUST cover bootstrap/login, the operations dashboard, issue history, live log reconnection,
-settings validation, stale-version rejection, authorization failure, and safe rendering of hostile
-issue/log content.
+- required triggers and stable check names exist;
+- required jobs cannot skip themselves green;
+- `pull_request_target` never executes untrusted PR content;
+- actions use immutable full-SHA pins;
+- permissions are least privilege;
+- untrusted metadata is not interpolated into shell source; and
+- main/merge-group runs do not use unsafe cancellation.
 
-On failure, CI MUST retain the Playwright report, screenshots, traces, and relevant redacted server
-logs. Browser tests MUST use synthetic credentials and data.
+These semantic tests are required because syntactically valid workflow YAML can still weaken branch
+protection.
 
-### 5.8 Container Verification
+### 4.8 `security`
 
-When the Dockerfile exists, pull requests MUST build the production image without publishing it. CI
-MUST run the image as its declared non-root user, exercise health/readiness, confirm persistent paths,
-inspect the effective user and entrypoint, and scan the final filesystem for known vulnerabilities
-and accidentally included credentials.
+Runs CodeQL for TypeScript and Gitleaks for repository content. It blocks new findings at the
+configured severity and always identifies the analyzed SHA. A suppression requires a narrow checked-
+in reason; a blanket ignore is forbidden.
 
-The build context MUST exclude `.git`, local databases, workspaces, environment files, coverage,
-browser artifacts, and dependency directories not intentionally copied by the multi-stage build.
+Dependency review SHOULD block newly introduced dependencies with disallowed licenses or known
+high-severity vulnerabilities. It is additional supply-chain evidence, not a substitute for CodeQL,
+Gitleaks, or action pin review.
 
-## 6. Validation After Merge to `main`
+## 5. Local Commands
 
-Every push to `main` MUST rerun the complete canonical verification graph on the resulting commit.
-The branch run MUST NOT trust a pull-request result for a different synthetic merge SHA. A failure on
-`main` blocks publication and release from that commit and MUST be treated as a repository incident.
-
-Successful `main` validation SHOULD produce:
-
-- the built server and static UI bundle;
-- a production OCI image;
-- an SPDX or CycloneDX software bill of materials;
-- vulnerability scan results;
-- cryptographic artifact provenance using GitHub artifact attestations where available; and
-- checksums and immutable identifiers for every retained artifact.
-
-The OCI image MUST be identified and promoted by digest. It SHOULD be published to GitHub Container
-Registry under an immutable commit-SHA tag. A mutable `main` tag MAY point to the newest successful
-`main` image, but automation and deployments MUST consume the digest or immutable tag.
-
-Artifact publication requires only package-write, attestation, and identity-token permissions in
-the isolated publication job. Test jobs MUST remain read-only. Publication MUST use artifacts built
-from the verified commit and MUST NOT rebuild source after approval or between environments.
-
-Until a staging or production target is defined, the pipeline ends at verified artifact publication.
-It MUST NOT report an environment deployment. When environments are added, the pipeline MUST promote
-the same digest through staging and production, record the environment and digest in GitHub, and run
-post-deployment health and functional checks.
-
-## 7. Releases
-
-Releases SHOULD use semantic version tags of the form `vMAJOR.MINOR.PATCH`. A release tag MUST point
-to a `main` commit whose full verification and artifact publication succeeded.
-
-The release workflow MUST:
-
-1. verify the tag and referenced commit;
-2. locate the existing immutable image and build artifacts for that commit;
-3. rerun security policy checks whose data may have changed since the build;
-4. attach checksums, SBOM, provenance, and human-readable release notes;
-5. add immutable semantic-version tags without replacing the commit-SHA tag; and
-6. record any failed promotion without deleting the previously published artifact.
-
-Stable release tags MUST NOT be moved. A broken release receives a new version or is explicitly
-yanked; its evidence remains available.
-
-## 8. Dependency and Toolchain Maintenance
-
-The repository MUST configure Dependabot or an equivalent GitHub-integrated updater for npm/pnpm,
-GitHub Actions, and Docker ecosystems. It MUST inspect the entire workspace and root lockfile.
-
-Update policy MUST balance currency with reviewability:
-
-- compatible patch and minor updates MAY be grouped by ecosystem on a regular schedule;
-- security updates SHOULD open promptly and MUST NOT wait for the ordinary batch when a supported
-  fix exists;
-- major updates MUST use separate pull requests;
-- Node.js LTS, pnpm, `better-sqlite3`, Vite, TypeScript, Fastify, TypeBox, React, TanStack packages,
-  Tailwind CSS, Kysely, Pino, Biome, and Playwright updates SHOULD remain individually visible when
-  their release notes or compatibility surfaces differ;
-- GitHub Action updates MUST retain full-SHA execution pins; and
-- container base updates MUST resolve to a reviewed immutable digest.
-
-An update pull request MUST pass the same gates as any other change. Automatic merge MAY be enabled
-only for allowlisted patch-level development dependencies after the full required suite passes and
-the repository has demonstrated reliable rollback. Runtime, native, security-sensitive, migration,
-and major updates require human review.
-
-The lockfile MUST be produced by the pinned pnpm version. CI uses `--frozen-lockfile`; it MUST NOT
-repair or refresh dependency metadata during verification. Install scripts SHOULD be disabled by
-default or explicitly allowlisted when pnpm and dependency compatibility permit it.
-
-The project MUST review direct dependencies periodically and remove unused packages. A package does
-not earn permanent status by appearing in the lockfile.
-
-## 9. Pre-Commit and Local Verification
-
-`make setup` MUST install repository-owned Git hooks after installing the pinned package manager and
-dependencies. Hooks SHOULD use Husky and lint-staged, pinned through the root lockfile. Hook behavior
-MUST be declared in version-controlled files and MUST NOT depend on a developer's global Git config.
-
-The pre-commit hook MUST remain fast and operate on the staged snapshot. It MUST:
-
-- run Biome formatting and safe lint fixes on supported staged source files;
-- run Markdownlint CLI2 on staged documentation;
-- reject conflict markers, trailing whitespace, and accidental large generated or binary files;
-- run Gitleaks in staged-change or pre-commit mode without uploading content; and
-- restage only files selected by lint-staged.
-
-The hook MUST NOT run the complete unit, browser, integration, or container suite. A slow hook trains
-contributors to bypass all hooks. It MUST NOT rewrite unrelated unstaged files or stage new files
-without the contributor selecting them.
-
-A commit-message hook SHOULD validate the Conventional Commit subset used for squash titles. The
-pull-request workflow remains authoritative because local hooks can be bypassed and the final squash
-title may differ from local commits.
-
-The repository MAY provide a pre-push hook for `make verify-fast`, consisting of formatting check,
-type checking, and the normal unit suite. It MUST remain optional if it materially delays iteration.
-`make verify` is required before requesting review and is the canonical local reproduction of CI.
-
-Hooks MAY be bypassed for diagnosis or recovery, but CI requirements do not change. Documentation
-MUST describe bypass as an exception, not the ordinary agent workflow. Agent-authored commits are
-subject to the same hooks and MUST report any bypass in the pull request.
-
-## 10. Caches, Artifacts, and Retention
-
-CI MAY cache the pnpm content-addressed store using keys derived from the operating system, pinned
-Node.js and pnpm versions, and lockfile hash. It MUST NOT cache `node_modules`, built application
-output, mutable SQLite databases, credentials, or agent workspaces as trusted inputs.
-
-Cache hits are performance hints, not evidence. A cache miss MUST produce the same result. Protected
-publication and deployment jobs MUST NOT restore executable artifacts from an untrusted fork cache.
-
-Failed test artifacts SHOULD be retained for at least 14 days. Release artifacts, SBOMs,
-attestations, checksums, and deployment records MUST follow the project release-retention policy and
-MUST NOT disappear merely because an Actions run expires.
-
-Artifacts containing issue text, logs, commands, or browser traces MUST be treated as potentially
-sensitive. They MUST be redacted, access-controlled by the repository, and assigned the shortest
-retention period that still supports diagnosis.
-
-## 11. Failure, Flake, and Rollback Policy
-
-A required check that is canceled, timed out, skipped unexpectedly, or unable to fetch complete
-evidence is not successful. Infrastructure failure MAY be rerun; the rerun and original failure MUST
-remain visible. Product-test failure MUST be fixed or explicitly reverted, not rerun until green.
-
-A flaky test MUST be recorded as a defect with an owner and bounded repair date. Quarantine requires
-an issue, a narrow scope, and a replacement required check that keeps the affected safety property
-covered. Silent retries, permanent quarantine, and blanket `continue-on-error` are forbidden for
-required behavior.
-
-The repository MUST document rollback for every deployed environment before enabling automatic
-deployment. Rollback MUST select a previously verified artifact digest; it MUST NOT rebuild an old
-Git revision with a new dependency resolution. Database migrations require a compatible rollback or
-forward-repair plan before deployment.
-
-## 12. Required Repository Commands
-
-Once implementation begins, these commands form the stable delivery interface:
+The Makefile is the stable interface. A conforming MVP MUST provide:
 
 ```text
-make setup          pinned dependencies and repository hooks
-make format         apply local formatting
-make lint           check formatting, lint, workflow, and documentation policy
-make typecheck      TypeScript no-emit check
-make test           normal Vitest suite
-make test-integration
-make test-e2e       Playwright against a production build
-make build          server and browser production artifacts
-make image          local production container build
-make verify-fast    lint, typecheck, and unit tests
-make verify         complete non-publishing CI gate
+make setup               install the pinned toolchain and frozen dependencies
+make preflight           check Node, pnpm, Git, GitHub, Codex, config, and local paths
+make agent-worktree      create or validate an isolated contributor worktree
+make fix                 apply Biome and Markdown safe fixes
+make verify-agent        run the normal local mirror of the CI test gate
+make test-prompts        run deterministic prompt contract tests
+make eval-prompts        run opt-in model-backed prompt scenarios
+make test-unit           run Vitest unit and component suites
+make test-integration    run SQLite, Git, process, and GitHub-fake integration tests
+make test-e2e            run Playwright against the production build
+make build               build server and browser artifacts
+make start               run the production build locally
+make live-smoke          exercise a configured disposable GitHub project
 ```
 
-Targets MUST fail on the first invalid required result while still preserving available reports.
-CI-specific wrappers MAY collect artifacts, but they MUST call these targets rather than maintain a
-second definition of correctness.
+Targets MUST compose repository scripts rather than hide substantial logic in Make recipes. Local
+and CI invocations use the frozen lockfile. `make verify-agent` is the expected check before a PR;
+the heavier integration and E2E targets are also required before claiming the complete MVP works.
 
-## 13. Adoption Sequence
+## 6. Pre-Commit Quality
 
-CI/CD controls SHOULD land with the code they can validate:
+Pre-commit hooks SHOULD run in this order:
 
-1. documentation, workflow linting, branch rules, and dependency update configuration;
-2. pinned Node.js/pnpm toolchain, frozen installation, Biome, and TypeScript checks;
-3. Vitest unit/contract suites and coverage floor;
-4. SQLite migration and process integration suites;
-5. production build and Playwright tests;
-6. Docker build, runtime verification, scanning, SBOM, and attestation;
-7. immutable `main` artifact publication; and
-8. environment promotion only after a real target and rollback contract exist.
+1. file hygiene: trailing whitespace, EOF newline, conflict markers, oversized accidental files;
+2. Biome safe fixes and formatting for staged TypeScript, JSON, and CSS;
+3. Markdownlint for staged Markdown;
+4. Gitleaks on staged content;
+5. deterministic prompt-contract checks when prompt or model configuration files change;
+6. fast affected unit tests where selection is reliable; and
+7. a commit-msg hook for Conventional Commit syntax.
 
-A temporarily absent check in this sequence MUST be visible as not yet implemented. Documentation or
-an empty passing job MUST NOT imply that an unimplemented safety property has been verified.
+Hooks MUST finish quickly enough to remain enabled. Slow integration, E2E, CodeQL, and live tests
+belong in explicit Make targets or CI. Bypassing a hook never bypasses the server-side check.
 
-## 14. Non-Normative References
+## 7. Workflow Security
 
-- [GitHub Actions security hardening](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions)
-- [GitHub token permissions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication)
-- [GitHub merge queue checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
-- [GitHub dependency review](https://docs.github.com/en/code-security/supply-chain-security/understanding-your-software-supply-chain/about-dependency-review)
-- [GitHub artifact attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations)
-- [GitHub OpenID Connect](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect)
-- [Dependabot configuration](https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference)
+Every workflow declares `permissions: contents: read` or `{}` at top level and grants additional
+permissions only to the job that needs them. Test jobs receive no repository, package, cloud, GitHub
+Project, or deployment credentials.
+
+Every executed action is pinned to a full commit SHA with a nearby release-tag comment. Dependabot
+updates those pins. Floating action tags are forbidden.
+
+`pull_request_target` SHOULD be avoided. If used for metadata checks, the job MUST NOT check out PR
+code, execute repository scripts, interpolate PR fields into shell source, or expose secrets.
+
+Issue titles, branch names, PR bodies, commit messages, agent output, and workflow inputs are
+untrusted. Workflows pass them through structured inputs or environment variables, never directly
+inside generated shell programs.
+
+## 8. Build and Main-Branch Evidence
+
+After the same commit passes required checks on `main`, `main.yml` runs `make build`, performs a
+production-start smoke on loopback, and publishes a versioned archive identified by commit SHA. It
+also retains dependency metadata sufficient to reproduce the build.
+
+The artifact is a CI diagnostic and local distribution candidate, not a production release. Signing,
+SBOM attestation, container publication, semantic version tags, and environment promotion are
+deferred until a distribution target is selected.
+
+Main validation MUST NOT rebuild from an unverified different revision or report success before the
+server-start smoke completes.
+
+## 9. Dependency Maintenance
+
+Dependabot runs separately for:
+
+- the root pnpm workspace; and
+- GitHub Actions.
+
+Updates are grouped conservatively. Patch/minor development-tool updates MAY be grouped; runtime
+major versions, SQLite driver changes, GitHub clients, process-control changes, and Playwright browser
+updates SHOULD remain separately reviewable.
+
+Automated update PRs run the full gate and are never auto-merged in the MVP. The lockfile MUST be
+generated by the pinned pnpm version and CI MUST reject unexpected lockfile drift.
+
+## 10. Evidence and Retention
+
+Failed required jobs upload the smallest useful diagnostic artifact:
+
+- Vitest reports and coverage summaries;
+- integration logs with secrets redacted;
+- Playwright report, trace, and screenshots;
+- workflow-security reports; and
+- build/start logs.
+
+Artifacts SHOULD default to 14-day retention for failures and 7 days for routine success. Security
+results use GitHub code-scanning retention. Logs MUST NOT include credential values, authorization
+headers, raw environment dumps, or unredacted agent secrets.
+
+## 11. Failure and Flake Policy
+
+A required check fails closed. Tests are not automatically retried into green without preserving the
+first failure. A confirmed flaky test gets an owner, issue, and bounded quarantine; the replacement
+gate must still protect the behavior.
+
+CI infrastructure failure is distinguished from product failure in the UI and logs, but neither is
+reported as passing evidence. Re-running a job evaluates the same SHA; changing the SHA invalidates
+prior evidence and product approval.
+
+## 12. Adoption Order
+
+The delivery system SHOULD be implemented in this order:
+
+1. Makefile, pnpm lockfile, Biome, TypeScript, Vitest, and `make verify-agent`;
+2. PR title/draft checks and protected-branch required names;
+3. prompt contracts and pre-commit hooks;
+4. real SQLite/Git/process integration tests;
+5. Playwright E2E and diagnostic artifacts;
+6. workflow-contract tests, CodeQL, Gitleaks, and Dependabot;
+7. verified `main` build artifact; and
+8. opt-in disposable-project live smoke.
+
+Each step leaves a useful, enforced gate. No step requires a hosted production environment.
