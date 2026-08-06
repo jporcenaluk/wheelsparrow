@@ -1,0 +1,37 @@
+PNPM := corepack pnpm
+
+.PHONY: setup fix lint typecheck test-unit verify-policy verify-agent build preflight dev start
+
+setup:
+	$(PNPM) install --frozen-lockfile
+
+fix:
+	$(PNPM) fix
+
+lint:
+	$(PNPM) lint
+
+typecheck:
+	$(PNPM) typecheck
+
+test-unit:
+	$(PNPM) test:unit
+
+verify-policy:
+	$(PNPM) verify:policy
+
+verify-agent:
+	$(PNPM) verify:agent
+	git diff --check
+
+build:
+	$(PNPM) build
+
+preflight:
+	$(PNPM) tsx scripts/preflight.ts
+
+dev:
+	$(PNPM) -r --parallel --stream run dev
+
+start:
+	$(PNPM) --filter @wheelsparrow/server start
