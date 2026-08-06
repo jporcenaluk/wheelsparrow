@@ -1,0 +1,104 @@
+:root {
+  color-scheme: dark light;
+  --surface: #161b1b;
+  --ink: #eee7d6;
+  --grid: rgba(238, 231, 214, 0.035);
+  --accent: #e3a73b;
+  --live: #9ccf9f;
+  --unavailable: #ee8377;
+  color: var(--ink);
+  background: var(--surface);
+  font-family: ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", monospace;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background-color: var(--surface);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 2rem 2rem;
+}
+
+.control-surface {
+  width: min(100% - 3rem, 62rem);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: clamp(5rem, 15vh, 10rem) 0 3rem;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+h1 {
+  max-width: 9ch;
+  margin: 0.6rem 0 3rem;
+  font-family: Rockwell, "Roboto Slab", "DejaVu Serif", serif;
+  font-size: clamp(3.2rem, 11vw, 8rem);
+  font-weight: 800;
+  letter-spacing: -0.065em;
+  line-height: 0.84;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: fit-content;
+  margin: 0;
+  padding: 0.85rem 1rem;
+  border: 1px solid currentColor;
+  font-size: 0.875rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.status__mark {
+  width: 0.65rem;
+  height: 0.65rem;
+  background: currentColor;
+}
+.status--checking {
+  color: var(--accent);
+}
+.status--live {
+  color: var(--live);
+}
+.status--unavailable {
+  color: var(--unavailable);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --surface: #f3eddd;
+    --ink: #202625;
+    --grid: rgba(32, 38, 37, 0.065);
+    --accent: #805100;
+    --live: #24633c;
+    --unavailable: #a3312b;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .status--checking .status__mark {
+    animation: pulse 1.2s steps(2, jump-none) infinite;
+  }
+  @keyframes pulse {
+    50% {
+      opacity: 0.25;
+    }
+  }
+}

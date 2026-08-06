@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@fastify/accept-negotiator": "2.0.1",
     "@fastify/static": "10.1.2",
     "@fastify/type-provider-typebox": "6.1.0",
     "@wheelsparrow/contracts": "workspace:*",
