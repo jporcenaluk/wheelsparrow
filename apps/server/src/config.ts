@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep, win32 } from "node:path";
+import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
 
 import {
   type Configuration,
@@ -10,6 +10,14 @@ import { parse } from "yaml";
 
 export class WorkspaceRootError extends Error {
   override name = "WorkspaceRootError";
+}
+
+export function resolveConfigurationPath(repositoryRoot: string): string {
+  return resolve(repositoryRoot, "wheelsparrow.yaml");
+}
+
+class ConfigurationValidationError extends Error {
+  override name = "ConfigurationValidationError";
 }
 
 export function resolveWorkspaceRoot(
@@ -42,6 +50,14 @@ export function resolveWorkspaceRoot(
 }
 
 function sanitizedError(cause: unknown): Error {
+  if (
+    cause instanceof ConfigurationValidationError ||
+    cause instanceof WorkspaceRootError
+  ) {
+    const sanitized = new Error(`${cause.name}: ${cause.message}`);
+    sanitized.name = cause.name;
+    return sanitized;
+  }
   const rawName = cause instanceof Error ? cause.name : "UnknownError";
   const name = /^[A-Za-z][A-Za-z0-9]*$/.test(rawName)
     ? rawName
@@ -59,11 +75,47 @@ function sanitizedError(cause: unknown): Error {
   return sanitized;
 }
 
-export async function loadConfiguration(path: string): Promise<Configuration> {
+function fieldPath(instancePath: string): string {
+  if (instancePath === "") return "$";
+  const segments = instancePath.split("/").slice(1);
+  if (
+    segments.length === 0 ||
+    segments.some((segment) => !/^[A-Za-z0-9_-]+$/.test(segment))
+  ) {
+    return "$";
+  }
+  return `$.${segments.join(".")}`;
+}
+
+function constraintName(keyword: string): string {
+  if (keyword === "pattern") return "nonWhitespace";
+  if (keyword === "~refine") return "distinctLaneValues";
+  return /^[A-Za-z][A-Za-z0-9]*$/.test(keyword) ? keyword : "schemaConstraint";
+}
+
+function validationError(value: unknown): ConfigurationValidationError {
+  const errors = Value.Errors(ConfigurationSchema, value)
+    .slice(0, 8)
+    .map(
+      (error) =>
+        `${fieldPath(error.instancePath)}: ${constraintName(error.keyword)}`,
+    );
+  const detail = errors.length === 0 ? "schemaConstraint" : errors.join(", ");
+  return new ConfigurationValidationError(
+    `schema validation failed: ${detail}`,
+  );
+}
+
+export async function loadConfiguration(
+  repositoryRoot: string,
+): Promise<Configuration> {
+  const path = resolveConfigurationPath(repositoryRoot);
   try {
     const contents = await readFile(path, "utf8");
-    const configuration = Value.Parse(ConfigurationSchema, parse(contents));
-    resolveWorkspaceRoot(dirname(path), configuration.workspace_root);
+    const value: unknown = parse(contents);
+    if (!Value.Check(ConfigurationSchema, value)) throw validationError(value);
+    const configuration = value as Configuration;
+    resolveWorkspaceRoot(repositoryRoot, configuration.workspace_root);
     return configuration;
   } catch (cause) {
     const sanitizedCause = sanitizedError(cause);

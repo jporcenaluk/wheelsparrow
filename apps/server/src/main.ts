@@ -18,10 +18,8 @@ export function parsePort(value: string | undefined): number {
   return port;
 }
 
-async function start(): Promise<void> {
-  const configurationPath =
-    process.env.WHEELSPARROW_CONFIG ?? resolve("wheelsparrow.yaml");
-  await loadConfiguration(configurationPath);
+export async function start(repositoryRoot = process.cwd()): Promise<void> {
+  await loadConfiguration(repositoryRoot);
 
   const readiness = createReadinessGate();
   const app =

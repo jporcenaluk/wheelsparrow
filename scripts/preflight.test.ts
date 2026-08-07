@@ -152,6 +152,39 @@ describe("evaluatePreflight", () => {
     expect((await stat(workspace)).mode & 0o777).toBe(0o700);
   });
 
+  test("validates the repository-owned configuration when an override is set", async () => {
+    const root = await temporaryRoot();
+    const externalRoot = await temporaryRoot();
+    await writePins(root);
+    await writeFile(
+      join(root, "wheelsparrow.yaml"),
+      await readFile(join(import.meta.dirname, "../wheelsparrow.yaml"), "utf8"),
+      "utf8",
+    );
+    const externalConfiguration = join(externalRoot, "wheelsparrow.yaml");
+    await writeFile(externalConfiguration, "github: [invalid", "utf8");
+    const previousConfiguration = process.env.WHEELSPARROW_CONFIG;
+
+    try {
+      process.env.WHEELSPARROW_CONFIG = externalConfiguration;
+      const result = await evaluatePreflight({ root, run: successfulRun });
+
+      expect(
+        result.checks.find(({ name }) => name === "configuration"),
+      ).toEqual({
+        name: "configuration",
+        ok: true,
+        detail: join(root, "wheelsparrow.yaml"),
+      });
+    } finally {
+      if (previousConfiguration === undefined) {
+        delete process.env.WHEELSPARROW_CONFIG;
+      } else {
+        process.env.WHEELSPARROW_CONFIG = previousConfiguration;
+      }
+    }
+  });
+
   test("secures an existing workspace before reporting success", async () => {
     const root = await temporaryRoot();
     await writePins(root);

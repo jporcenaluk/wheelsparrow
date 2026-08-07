@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   loadConfiguration,
+  resolveConfigurationPath,
   resolveWorkspaceRoot,
   WorkspaceRootError,
 } from "../apps/server/src/config.js";
@@ -315,9 +316,9 @@ export async function evaluatePreflight({
   }
 
   let configuredWorkspaceRoot: string | undefined;
-  const configurationPath = resolve(root, "wheelsparrow.yaml");
+  const configurationPath = resolveConfigurationPath(root);
   try {
-    const configuration = await loadConfiguration(configurationPath);
+    const configuration = await loadConfiguration(root);
     resolveWorkspaceRoot(root, configuration.workspace_root);
     configuredWorkspaceRoot = configuration.workspace_root;
     checks.push({

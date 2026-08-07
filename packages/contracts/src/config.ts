@@ -1,39 +1,49 @@
-import { type Static, Type } from "typebox";
+import { Refine, type Static, Type } from "typebox";
 
-const NonEmpty = Type.String({ minLength: 1 });
-const Command = Type.String({ minLength: 1, maxLength: 4096 });
+const SemanticString = Type.String({ minLength: 1, pattern: "\\S" });
+const Command = Type.String({
+  minLength: 1,
+  maxLength: 4096,
+  pattern: "\\S",
+});
+
+const LanesSchema = Refine(
+  Type.Object(
+    {
+      ready: SemanticString,
+      todo: SemanticString,
+      review: SemanticString,
+      done: SemanticString,
+    },
+    { additionalProperties: false },
+  ),
+  (lanes) => new Set(Object.values(lanes)).size === 4,
+  () => "lane values must be pairwise distinct",
+);
 
 export const ConfigurationSchema = Type.Object(
   {
     github: Type.Object(
       {
-        owner: NonEmpty,
-        repository: NonEmpty,
+        owner: SemanticString,
+        repository: SemanticString,
         project_number: Type.Integer({ minimum: 1 }),
-        status_field: NonEmpty,
-        lanes: Type.Object(
-          {
-            ready: NonEmpty,
-            todo: NonEmpty,
-            review: NonEmpty,
-            done: NonEmpty,
-          },
-          { additionalProperties: false },
-        ),
-        required_labels: Type.Array(NonEmpty, {
+        status_field: SemanticString,
+        lanes: LanesSchema,
+        required_labels: Type.Array(SemanticString, {
           minItems: 1,
           uniqueItems: true,
         }),
-        priority_field: NonEmpty,
+        priority_field: SemanticString,
       },
       { additionalProperties: false },
     ),
     poll_interval_seconds: Type.Integer({ minimum: 5, maximum: 3600 }),
-    workspace_root: NonEmpty,
+    workspace_root: SemanticString,
     agent: Type.Object(
       {
-        command: NonEmpty,
-        model: NonEmpty,
+        command: SemanticString,
+        model: SemanticString,
         reasoning_effort: Type.Union([
           Type.Literal("low"),
           Type.Literal("medium"),
@@ -53,8 +63,8 @@ export const ConfigurationSchema = Type.Object(
     ),
     staging: Type.Object(
       {
-        workflow: NonEmpty,
-        environment: NonEmpty,
+        workflow: SemanticString,
+        environment: SemanticString,
         smoke_command: Command,
       },
       { additionalProperties: false },

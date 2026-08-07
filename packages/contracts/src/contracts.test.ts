@@ -97,6 +97,116 @@ describe("configuration contract", () => {
   });
 
   test.each([
+    [
+      "github.owner",
+      (value: typeof validConfiguration) => (value.github.owner = "   "),
+    ],
+    [
+      "github.repository",
+      (value: typeof validConfiguration) => (value.github.repository = "\t"),
+    ],
+    [
+      "github.status_field",
+      (value: typeof validConfiguration) => (value.github.status_field = "\n"),
+    ],
+    [
+      "github.lanes.ready",
+      (value: typeof validConfiguration) => (value.github.lanes.ready = "   "),
+    ],
+    [
+      "github.lanes.todo",
+      (value: typeof validConfiguration) => (value.github.lanes.todo = "   "),
+    ],
+    [
+      "github.lanes.review",
+      (value: typeof validConfiguration) => (value.github.lanes.review = "   "),
+    ],
+    [
+      "github.lanes.done",
+      (value: typeof validConfiguration) => (value.github.lanes.done = "   "),
+    ],
+    [
+      "github.required_labels[]",
+      (value: typeof validConfiguration) =>
+        (value.github.required_labels[0] = "   "),
+    ],
+    [
+      "github.priority_field",
+      (value: typeof validConfiguration) =>
+        (value.github.priority_field = "   "),
+    ],
+    [
+      "workspace_root",
+      (value: typeof validConfiguration) => (value.workspace_root = "   "),
+    ],
+    [
+      "agent.command",
+      (value: typeof validConfiguration) => (value.agent.command = "   "),
+    ],
+    [
+      "agent.model",
+      (value: typeof validConfiguration) => (value.agent.model = "   "),
+    ],
+    [
+      "verification.command",
+      (value: typeof validConfiguration) =>
+        (value.verification.command = "   "),
+    ],
+    [
+      "staging.workflow",
+      (value: typeof validConfiguration) => (value.staging.workflow = "   "),
+    ],
+    [
+      "staging.environment",
+      (value: typeof validConfiguration) => (value.staging.environment = "   "),
+    ],
+    [
+      "staging.smoke_command",
+      (value: typeof validConfiguration) =>
+        (value.staging.smoke_command = "   "),
+    ],
+  ])("rejects whitespace-only semantic string at %s", (_, makeInvalid) => {
+    const configuration = structuredClone(validConfiguration);
+    makeInvalid(configuration);
+
+    expect(Value.Check(ConfigurationSchema, configuration)).toBe(false);
+  });
+
+  test.each([
+    [
+      "ready and todo",
+      { ready: "Ready", todo: "Ready", review: "Review", done: "Done" },
+    ],
+    [
+      "ready and review",
+      { ready: "Ready", todo: "Todo", review: "Ready", done: "Done" },
+    ],
+    [
+      "ready and done",
+      { ready: "Ready", todo: "Todo", review: "Review", done: "Ready" },
+    ],
+    [
+      "todo and review",
+      { ready: "Ready", todo: "Todo", review: "Todo", done: "Done" },
+    ],
+    [
+      "todo and done",
+      { ready: "Ready", todo: "Todo", review: "Review", done: "Todo" },
+    ],
+    [
+      "review and done",
+      { ready: "Ready", todo: "Todo", review: "Review", done: "Review" },
+    ],
+  ])("rejects duplicate lane values for %s", (_, lanes) => {
+    expect(
+      Value.Check(ConfigurationSchema, {
+        ...validConfiguration,
+        github: { ...validConfiguration.github, lanes },
+      }),
+    ).toBe(false);
+  });
+
+  test.each([
     {
       path: "github",
       configuration: {

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, test } from "vitest";
+import { parse } from "yaml";
 
 const root = resolve(import.meta.dirname, "..");
 
@@ -50,6 +51,41 @@ describe("repository policy", () => {
 
     expect(nodeVersion).toBe("24.18.0");
     expect(packageJson.packageManager).toBe("pnpm@11.15.1");
+  });
+
+  test("quarantines new dependency releases without weakening workspace policy", () => {
+    const workspace = parse(
+      readFileSync(resolve(root, "pnpm-workspace.yaml"), "utf8"),
+    );
+
+    expect(workspace).toEqual({
+      packages: ["apps/*", "packages/*"],
+      minimumReleaseAge: 1440,
+      minimumReleaseAgeStrict: true,
+      allowBuilds: { esbuild: true },
+    });
+  });
+
+  test("runs the exact toolchain check before the normal verification gate", () => {
+    const packageJson = JSON.parse(
+      readFileSync(resolve(root, "package.json"), "utf8"),
+    ) as { scripts?: Record<string, string> };
+    const makefile = readFileSync(resolve(root, "Makefile"), "utf8");
+    const readme = readFileSync(resolve(root, "README.md"), "utf8");
+
+    expect(packageJson.scripts?.["verify:toolchain"]).toBe(
+      "node scripts/verify-toolchain.mjs",
+    );
+    expect(packageJson.scripts?.["verify:agent"]).toBe(
+      "pnpm verify:toolchain && pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm test:unit",
+    );
+    expect(makefile).toMatch(/\.PHONY:.*\bverify-toolchain\b/);
+    expect(makefile).toMatch(
+      /verify-toolchain:\n\t\$\(PNPM\) verify:toolchain\n/,
+    );
+    expect(readme).toMatch(
+      /## Verification[\s\S]*?```bash\nmake verify-toolchain\nmake verify-agent\n/,
+    );
   });
 
   test("keeps Node type declarations on the pinned runtime major", () => {

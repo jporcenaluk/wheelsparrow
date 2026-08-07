@@ -1,9 +1,9 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { loadConfiguration } from "./config.js";
+import { loadConfiguration, resolveConfigurationPath } from "./config.js";
 
 const temporaryDirectories: string[] = [];
 const sentinelSecret = "SENTINEL_CONFIG_SECRET_7f31";
@@ -72,10 +72,25 @@ afterEach(async () => {
 });
 
 describe("loadConfiguration", () => {
+  test("resolves the one repository-owned configuration path", async () => {
+    const path = await configurationFile(validConfiguration);
+    const root = dirname(path);
+
+    expect(resolveConfigurationPath(root)).toBe(path);
+  });
+
+  test("loads configuration relative to an explicit repository root", async () => {
+    const path = await configurationFile(validConfiguration);
+
+    const configuration = await loadConfiguration(dirname(path));
+
+    expect(configuration).toEqual(validConfiguration);
+  });
+
   test("loads the approved configuration shape", async () => {
     const path = await configurationFile(validConfiguration);
 
-    const configuration = await loadConfiguration(path);
+    const configuration = await loadConfiguration(dirname(path));
 
     expect(configuration.github.owner).toBe("jporcenaluk");
     expect(configuration).toEqual(validConfiguration);
@@ -95,7 +110,7 @@ describe("loadConfiguration", () => {
     async (_, value) => {
       const path = await configurationFile(value);
 
-      await expect(loadConfiguration(path)).rejects.toThrow(
+      await expect(loadConfiguration(dirname(path))).rejects.toThrow(
         `Invalid configuration in ${path}:`,
       );
     },
@@ -104,7 +119,7 @@ describe("loadConfiguration", () => {
   test("wraps malformed YAML with its path and cause", async () => {
     const path = await configurationFile(`github: [${sentinelSecret}`);
 
-    const error = await loadConfiguration(path).catch(
+    const error = await loadConfiguration(dirname(path)).catch(
       (caught: unknown) => caught,
     );
 
@@ -118,30 +133,95 @@ describe("loadConfiguration", () => {
     expect(serializeErrorChain(error)).not.toContain(sentinelSecret);
   });
 
-  test("includes the missing file path in read errors", async () => {
-    const path = join(tmpdir(), "missing-wheelsparrow.yaml");
+  test("reports schema field paths and constraint names without values", async () => {
+    const path = await configurationFile({
+      ...validConfiguration,
+      github: {
+        ...validConfiguration.github,
+        owner: { token: sentinelSecret },
+      },
+    });
 
-    await expect(loadConfiguration(path)).rejects.toThrow(
+    const error = await loadConfiguration(dirname(path)).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("$.github.owner: type");
+    expect(serializeErrorChain(error)).not.toContain(sentinelSecret);
+  });
+
+  test("names the distinct-lane constraint without exposing lane values", async () => {
+    const path = await configurationFile({
+      ...validConfiguration,
+      github: {
+        ...validConfiguration.github,
+        lanes: {
+          ready: sentinelSecret,
+          todo: sentinelSecret,
+          review: "Review",
+          done: "Done",
+        },
+      },
+    });
+
+    const error = await loadConfiguration(dirname(path)).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      "$.github.lanes: distinctLaneValues",
+    );
+    expect(serializeErrorChain(error)).not.toContain(sentinelSecret);
+  });
+
+  test("does not expose unknown property names in schema diagnostics", async () => {
+    const path = await configurationFile({
+      ...validConfiguration,
+      github: {
+        ...validConfiguration.github,
+        [sentinelSecret]: sentinelSecret,
+      },
+    });
+
+    const error = await loadConfiguration(dirname(path)).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      "$.github: additionalProperties",
+    );
+    expect(serializeErrorChain(error)).not.toContain(sentinelSecret);
+  });
+
+  test("includes the missing file path in read errors", async () => {
+    const root = await mkdtemp(join(tmpdir(), "wheelsparrow-missing-config-"));
+    temporaryDirectories.push(root);
+    const path = join(root, "wheelsparrow.yaml");
+
+    await expect(loadConfiguration(root)).rejects.toThrow(
       `Invalid configuration in ${path}:`,
     );
   });
 
   test.each([
-    ["absolute", "/tmp/wheelsparrow-outside"],
-    ["traversal", "../wheelsparrow-outside"],
-    ["repository root", "."],
-    ["empty after trimming", "   "],
-  ])("rejects an %s workspace root", async (_, workspaceRoot) => {
+    ["absolute", "/tmp/wheelsparrow-outside", "WorkspaceRootError"],
+    ["traversal", "../wheelsparrow-outside", "WorkspaceRootError"],
+    ["repository root", ".", "WorkspaceRootError"],
+    ["empty after trimming", "   ", "$.workspace_root: nonWhitespace"],
+  ])("rejects an %s workspace root", async (_, workspaceRoot, diagnostic) => {
     const path = await configurationFile({
       ...validConfiguration,
       workspace_root: workspaceRoot,
     });
 
-    const error = await loadConfiguration(path).catch(
+    const error = await loadConfiguration(dirname(path)).catch(
       (caught: unknown) => caught,
     );
 
     expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toContain("WorkspaceRootError");
+    expect((error as Error).message).toContain(diagnostic);
   });
 });
