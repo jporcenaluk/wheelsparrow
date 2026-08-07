@@ -69,7 +69,7 @@ closes the strict documented MVP.
 
 | Block | Working outcome | Status | Evidence |
 | --- | --- | --- | --- |
-| 0 | Runnable foundation, validated config, pinned toolchain, local gate, initial CI | Publication in progress | Implementation checkpoint `87446b6` |
+| 0 | Runnable foundation, validated config, pinned toolchain, local gate, initial CI | Awaiting human approval | PR #25; implementation checkpoint `87446b6` |
 | 1 | SQLite records, serialized coordinator, internal transitions, idempotent effects | Pending | Pending |
 | 2 | Deterministic GitHub discovery, eligibility, claim, and stateful fake | Pending | Pending |
 | 3 | Isolated Codex builder, worktree containment, verification, and process control | Pending | Pending |
@@ -82,7 +82,7 @@ closes the strict documented MVP.
 ## Current Resume Point
 
 - Active block: B0, runnable foundation.
-- Active task: publish Block 0 through the protected pull-request path.
+- Active task: babysit PR #25 through exact-SHA approval and protected squash merge.
 - Isolated checkout: `/home/jporc/wheelsparrow/.worktrees/block0`.
 - Branch: `feat/block-0-foundation`, based on approved base `471a668cbd62db919ce914ce1a891d01cc0ea72a`;
   current implementation checkpoint is `87446b6`.
@@ -93,8 +93,9 @@ closes the strict documented MVP.
 - Completed gate: Task 8 implementation checkpoint `87446b6` includes all six reviewed repairs and
   passed the combined exact-toolchain local gate.
 - Last implementation checkpoint: `87446b6`.
-- Next gate: commit this evidence ledger, push the branch, open a non-draft pull request, and require
-  current-SHA GitHub checks and protected merge evidence.
+- Next gate: push this publication-state ledger checkpoint, require its exact-SHA checks, then obtain
+  the repository-required qualified human approval before squash merge. Repository auto-merge is
+  disabled, so the root orchestrator must perform the merge after approval.
 
 The dependency spine is B0 -> B1 -> B2 -> B3 -> B4 -> B5; B6 may begin after B1 but integrates with
 B5; B7 depends on B5 and B6; B8 closes the programme. Each block must leave `main` runnable and must
@@ -179,6 +180,7 @@ include focused tests, independent review, required CI, merge evidence, and a le
 | 2026-08-07 | B0 repaired artifact proof | Recreated the main-workflow archive from the exact declared path list, extracted it into a fresh temporary directory, completed a frozen production-only install with scripts disabled and supply-chain policy verification, then passed the extracted lifecycle and built-asset smoke at `http://127.0.0.1:40331`; the temporary proof directory was removed |
 | 2026-08-07 | B0 final whole-block rereview | A fresh non-author reviewer reported `SPEC COMPLIANT` and `APPROVED`; it explicitly confirmed all six findings closed, effective pnpm configuration `minimumReleaseAge=1440` and `minimumReleaseAgeStrict=true`, focused 104/104 tests, diff hygiene, and no new security, CI, artifact, source/build drift, false-green, scope, or ledger defect |
 | 2026-08-07 | B0 Task 8 implementation checkpoint | Commit `87446b6` records the reviewed configuration, built-asset smoke, strict supply-chain and exact-toolchain repairs, their tests, and the operator README; the subsequent ledger-only checkpoint does not alter executable behavior |
+| 2026-08-07 | B0 PR #25 initial publication | Non-draft [PR #25](https://github.com/jporcenaluk/wheelsparrow/pull/25) targets unchanged base `471a668cbd62db919ce914ce1a891d01cc0ea72a`; initial head `0967bd0ac2a38b97588857e0d233ba450420cb3b` passed `test`, `validate-pr-title`, and `ready-for-review-gate`; GitHub reported mergeable but `REVIEW_REQUIRED`, and enabling auto-merge failed because the repository has auto-merge disabled |
 
 ## Open Decisions and Risks
 
@@ -192,6 +194,9 @@ include focused tests, independent review, required CI, merge evidence, and a le
   isolated worktree or connector-backed branch that cannot overwrite them.
 - The current ruleset lacks required status checks and resolved-conversation enforcement. B0 must add
   real workflows before the ruleset can safely require their stable names.
+- PR #25 cannot merge until a qualified human approves its latest head. Auto-merge is disabled for
+  the repository, so the orchestrator must recheck exact-SHA CI and merge state after approval and
+  then invoke the authorized squash merge manually.
 - No authorized disposable live-smoke target, staging environment, or deployment exists.
 - The staging contract belongs to target repositories. Tests must prove the orchestration contract
   with a stateful fake even when no real disposable target is authorized.
