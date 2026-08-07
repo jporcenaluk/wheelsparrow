@@ -1,0 +1,15 @@
+{
+  "config": {
+    "MD010": {
+      "code_blocks": false
+    },
+    "MD013": false
+  },
+  "ignores": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/coverage/**",
+    "**/playwright-report/**",
+    "**/test-results/**"
+  ]
+}

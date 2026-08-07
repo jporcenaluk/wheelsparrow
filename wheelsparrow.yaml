@@ -1,0 +1,26 @@
+github:
+  owner: jporcenaluk
+  repository: wheelsparrow
+  project_number: 2
+  status_field: Status
+  lanes:
+    ready: Ready
+    todo: Todo
+    review: Review
+    done: Done
+  required_labels:
+    - mvp
+  priority_field: Priority
+poll_interval_seconds: 30
+workspace_root: .wheelsparrow/workspaces
+agent:
+  command: codex
+  model: gpt-5.6-sol
+  reasoning_effort: high
+  timeout_minutes: 45
+verification:
+  command: make verify-agent
+staging:
+  workflow: deploy-staging.yml
+  environment: staging
+  smoke_command: make smoke-staging
