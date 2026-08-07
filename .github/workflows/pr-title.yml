@@ -1,0 +1,36 @@
+name: PR metadata
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize, ready_for_review, converted_to_draft]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-pr-title:
+    name: validate-pr-title
+    runs-on: ubuntu-latest
+    env:
+      PR_TITLE: ${{ github.event.pull_request.title }}
+    steps:
+      - name: Validate Conventional Commit title
+        run: |
+          node --input-type=module -e '
+            const title = process.env.PR_TITLE ?? "";
+            const pattern = /^(feat|fix|docs|refactor|test|build|ci|chore)(\([a-z0-9-]+\))?: [a-z0-9].+/;
+            if (!pattern.test(title)) {
+              console.error("Use: <type>(optional-scope): imperative summary");
+              process.exit(1);
+            }
+          '
+
+  ready-for-review-gate:
+    name: ready-for-review-gate
+    runs-on: ubuntu-latest
+    env:
+      PR_DRAFT: ${{ github.event.pull_request.draft }}
+    steps:
+      - name: Reject draft pull requests
+        run: |
+          test "$PR_DRAFT" = "false"

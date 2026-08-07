@@ -15,6 +15,7 @@
     "test:unit": "vitest run",
     "typecheck": "pnpm -r --if-present run typecheck && tsc -p tsconfig.tests.json --noEmit",
     "verify:policy": "vitest run scripts/repository-policy.test.ts",
+    "verify:workflows": "vitest run scripts/workflow-policy.test.ts",
     "verify:agent": "pnpm install --frozen-lockfile && pnpm lint && pnpm typecheck && pnpm test:unit"
   },
   "devDependencies": {
