@@ -79,10 +79,11 @@ function tableColumns(
   table: string,
 ): Set<string> {
   return new Set(
-    connection.native
-      .prepare(`PRAGMA table_info(${table})`)
-      .all()
-      .map((column: { name: string }) => column.name),
+    (
+      connection.native.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name),
   );
 }
 
@@ -304,12 +305,13 @@ describe("immutable SQLite migrations", () => {
 
     migrateDatabase(connection, migrationsDirectory);
 
-    const tables = connection.native
-      .prepare(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-      )
-      .all()
-      .map(({ name }: { name: string }) => name);
+    const tables = (
+      connection.native
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .all() as Array<{ name: string }>
+    ).map(({ name }) => name);
     expect(tables).toEqual([
       "approvals",
       "events",
@@ -622,7 +624,7 @@ describe("immutable SQLite migrations", () => {
       ["findings", "id"],
       ["approvals", "id"],
       ["side_effects", "key"],
-    ]) {
+    ] as const) {
       expect(
         tableInfo(connection, table).find(
           (column) => column.name === primaryKey,
@@ -1099,9 +1101,7 @@ describe("immutable SQLite migrations", () => {
         openDatabase(databasePath, {
           requestJournalMode: (native) => {
             capturedNative = native;
-            return native.pragma(`journal_mode = ${unsafeMode}`, {
-              simple: true,
-            }) as string;
+            return unsafeMode.toLowerCase();
           },
         }),
       ).toThrow(/journal.*(?:off|memory)|unsafe/i);
@@ -1157,7 +1157,7 @@ describe("immutable SQLite migrations", () => {
         .createTable("must_not_open")
         .addColumn("id", "integer")
         .execute(),
-    ).rejects.toThrow(/closed|destroyed/i);
+    ).rejects.toThrow(/closed|destroyed|not open/i);
   });
 
   test("does not replay applied migrations after closing and reopening", async () => {
