@@ -1583,6 +1583,47 @@ describe("immutable SQLite migrations", () => {
     ).toEqual([]);
   });
 
+  test("rejects a fresh empty migration directory without creating schema or ledger tables", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    await rm(join(migrationsDirectory, "001_initial.sql"));
+    const connection = open(databasePath);
+
+    expect(() => migrateDatabase(connection, migrationsDirectory)).toThrow(
+      /001_initial|initial migration|no migrations/i,
+    );
+    expect(
+      connection.native
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
+  });
+
+  test("rejects migration id 000 during full-set preflight before executing any SQL", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    await addMigration(
+      migrationsDirectory,
+      "000_invalid.sql",
+      "SELECT observe_migration_execution(); CREATE TABLE must_not_apply (id INTEGER);",
+    );
+    const connection = open(databasePath);
+    let executionCount = 0;
+    connection.native.function("observe_migration_execution", () => {
+      executionCount += 1;
+    });
+
+    expect(() => migrateDatabase(connection, migrationsDirectory)).toThrow(
+      /id|initial|migration/i,
+    );
+    expect(executionCount).toBe(0);
+    expect(
+      connection.native
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
+  });
+
   test("rejects duplicate numeric migration identifiers before mutation", async () => {
     const { databasePath, migrationsDirectory } =
       await createTemporaryDatabase();
