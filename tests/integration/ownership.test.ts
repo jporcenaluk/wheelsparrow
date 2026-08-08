@@ -33,7 +33,7 @@ async function createLockPath(): Promise<string> {
 
 function waitForOutput(
   child: ChildProcess,
-  output: "READY" | "RELEASED",
+  output: "CONFLICT" | "READY" | "RELEASED",
   timeoutMs: number,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -117,6 +117,18 @@ async function startHolder(lockPath: string): Promise<ChildProcess> {
   return child;
 }
 
+function startContender(lockPath: string): ChildProcess {
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", childFixture, lockPath, "contender"],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  children.add(child);
+  return child;
+}
+
 afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   await Promise.all(
@@ -183,6 +195,26 @@ describe("SQLite storage ownership", () => {
     await expect(acquireOwnership(lockPath)).rejects.toBeInstanceOf(
       OwnershipConflictError,
     );
+  });
+
+  test("reports a typed conflict from a second process while the holder remains live", async () => {
+    const lockPath = await createLockPath();
+    const holder = await startHolder(lockPath);
+    const contender = startContender(lockPath);
+
+    await waitForOutput(contender, "CONFLICT", readyTimeoutMs);
+    await waitForExit(contender);
+    children.delete(contender);
+
+    expect(contender.exitCode).toBe(0);
+    expect(holder.exitCode).toBeNull();
+    expect(holder.signalCode).toBeNull();
+
+    holder.stdin?.write("release\n");
+    await waitForOutput(holder, "RELEASED", exitTimeoutMs);
+    await waitForExit(holder);
+    children.delete(holder);
+    expect(holder.exitCode).toBe(0);
   });
 
   test("permits a successor after normal release", async () => {
