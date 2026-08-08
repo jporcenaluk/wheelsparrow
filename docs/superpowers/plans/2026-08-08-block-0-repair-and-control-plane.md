@@ -101,6 +101,64 @@ documents trace the programme; they do not silently prove product requirements. 
 truthful ledger bootstrap form the first durable checkpoint; do not create a plan-only commit that
 would leave the committed ledger stale.
 
+## Owned requirement IDs
+
+Control-plane traceability and recovery:
+
+- `SPEC-00-001`
+- `SPEC-00-002`
+- `CICD-00-001`
+- `CICD-02-008`
+- `CICD-12-001`
+
+Existing Block 0 foundation evidence updated by this slice:
+
+- `SPEC-01-001`
+- `SPEC-03-001`
+- `SPEC-03-003`
+- `SPEC-03-004`
+- `SPEC-03-005`
+- `SPEC-10-001`
+- `STACK-01-001`
+- `STACK-01-002`
+- `STACK-01-003`
+- `STACK-01-004`
+- `STACK-01-005`
+- `STACK-01-006`
+- `STACK-02-004`
+- `STACK-08-001`
+- `STACK-08-002`
+- `STACK-08-003`
+- `STACK-08-009`
+- `STACK-09-001`
+- `STACK-09-003`
+- `STACK-09-006`
+
+Subprocess timeout and process-tree cleanup:
+
+- `SPEC-11-006`
+- `STACK-05-003`
+- `CICD-11-003`
+
+CI, review, publication, and exact-revision evidence for this slice:
+
+- `CICD-01-001`
+- `CICD-01-007`
+- `CICD-02-003`
+- `CICD-03-002`
+- `CICD-03-003`
+- `CICD-03-004`
+- `CICD-03-006`
+- `CICD-04-001`
+- `CICD-04-002`
+- `CICD-04-004`
+- `CICD-04-005`
+- `CICD-04-006`
+- `CICD-05-003`
+- `CICD-08-001`
+- `CICD-08-002`
+- `CICD-08-004`
+
 ## Task 1: Bootstrap the truthful programme ledger
 
 **Files:**
@@ -201,7 +259,7 @@ ledger.
 - Create: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`
 - Modify after assigning IDs: this plan
 
-- [ ] **Step 1: Verify the normative source and branch before inventory**
+- [x] **Step 1: Verify the normative source and branch before inventory**
 
 Run:
 
@@ -223,7 +281,7 @@ SHA to equal the local authoritative ref merged during Task 1. If it differs, re
 procedure: fetch and merge the exact ref, inspect and re-read changed normative blobs, re-review the
 plan where needed, and only then restart the inventory. Do not change only the displayed source SHA.
 
-- [ ] **Step 2: Dispatch bounded read-only inventory workers**
+- [x] **Step 2: Dispatch bounded read-only inventory workers**
 
 Use lower-effort workers for mechanical extraction. Run at most three concurrently; after one
 finishes, dispatch the fourth. Assign exactly one source to each worker:
@@ -249,7 +307,7 @@ Workers return text only. Root checks every proposed row against the source, dec
 dispositions, assigns IDs, resolves duplicate obligations without losing source references, and
 writes the matrix.
 
-- [ ] **Step 3: Write the matrix header, schema, and interpretation rules**
+- [x] **Step 3: Write the matrix header, schema, and interpretation rules**
 
 Create `docs/delivery/MVP_REQUIREMENTS_MATRIX.md` with this opening structure:
 
@@ -288,7 +346,7 @@ Replace the shown source revision with the exact protected-main SHA verified and
 if it changed. The matrix revision must identify the commit whose four normative blobs were actually
 read.
 
-- [ ] **Step 4: Integrate atomic rows in source order**
+- [x] **Step 4: Integrate atomic rows in source order**
 
 Use these prefixes and section-number rules:
 
@@ -323,7 +381,7 @@ full required proof is present. Mark evidence `partial` when local code/tests ex
 review, CI, main, artifact, runtime, or conformance evidence is missing. PR #25's merged evidence
 belongs to its exact merge SHA; it does not prove later code on this branch.
 
-- [ ] **Step 5: Link this plan to its exact row-1 requirement IDs**
+- [x] **Step 5: Link this plan to its exact row-1 requirement IDs**
 
 After assigning all matrix IDs, add a `## Owned requirement IDs` section immediately before
 `## Task 1`. List every exact ID owned by merge-train row 1 and group them as:
@@ -336,7 +394,7 @@ After assigning all matrix IDs, add a `## Owned requirement IDs` section immedia
 Do not copy requirement prose into the plan. The list is an exact link to matrix rows, not a second
 matrix. Confirm every listed ID exists and every matrix row with Delivery slice `1` appears once.
 
-- [ ] **Step 6: Perform root coverage and consistency review**
+- [x] **Step 6: Perform root coverage and consistency review**
 
 Run:
 
@@ -362,7 +420,7 @@ Expected:
 Manually compare the complete matrix to all four source files; the keyword scan is only a backstop.
 Record the final row counts by prefix for the ledger checkpoint.
 
-- [ ] **Step 7: Root prepares the matrix for the combined ledger checkpoint**
+- [x] **Step 7: Root prepares the matrix for the combined ledger checkpoint**
 
 Run:
 
@@ -386,7 +444,7 @@ point, then root commits matrix, plan, and ledger together so the cold-start inv
 - Read: `docs/superpowers/specs/2026-08-07-block-0-process-test-flake-design.md`
 - Modify: `MVP_IMPLEMENTATION_LEDGER.md`
 
-- [ ] **Step 1: Reconcile repository and GitHub facts before writing**
+- [x] **Step 1: Reconcile repository and GitHub facts before writing**
 
 Run locally:
 
@@ -411,7 +469,7 @@ do not finalize or merely relabel the matrix: return to Task 1's drift procedure
 re-read changed normative blobs, regenerate/revalidate affected rows and exact evidence, and repeat
 the complete matrix coverage review before this combined checkpoint.
 
-- [ ] **Step 2: Confirm the authority and merge train, then link the matrix**
+- [x] **Step 2: Confirm the authority and merge train, then link the matrix**
 
 Set the authoritative base to current protected `main`, initially expected to be
 `81271c278c47a96e2882888e20c577449c5f69b8`. Link the approved delivery-control design and the new
@@ -437,7 +495,7 @@ matrix's `not yet created` fact with its exact path, source revision, SHA-256 co
 counts. Compute the hash before the combined commit with
 `sha256sum docs/delivery/MVP_REQUIREMENTS_MATRIX.md`; do not invent a self-referential checkpoint SHA.
 
-- [ ] **Step 3: Replace the stale resume point**
+- [x] **Step 3: Replace the stale resume point**
 
 The resume point must state:
 
@@ -461,7 +519,7 @@ State that the next safe action is to modify only `scripts/preflight.test.ts`, t
 corepack pnpm vitest run scripts/preflight.test.ts -t "terminates a ready detached process group" --pool=threads --maxWorkers=1
 ```
 
-- [ ] **Step 4: Preserve history and append current facts**
+- [x] **Step 4: Preserve history and append current facts**
 
 Keep every old evidence row intact. Append rows for:
 
@@ -480,7 +538,7 @@ Update open risks to remove resolved PR #25 approval claims. Preserve still-curr
 managed sandbox, legacy root checkout, superseded issues, GitHub rules, disposable live-smoke target,
 and external staging target. Add no speculative blocker.
 
-- [ ] **Step 5: Verify the cold-start contract**
+- [x] **Step 5: Verify the cold-start contract**
 
 Run:
 
@@ -495,7 +553,7 @@ Expected: lint and diff hygiene pass; the ledger has one merge train and one una
 point; a cold-start worker can name the current branch, HEAD, task, last proof, and next command
 without conversation history.
 
-- [ ] **Step 6: Root creates the truthful-ledger checkpoint**
+- [x] **Step 6: Root creates the truthful-ledger checkpoint**
 
 Root checks every completed Task 2 and Task 3 box, stages
 `MVP_IMPLEMENTATION_LEDGER.md`, `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`, and this plan, then

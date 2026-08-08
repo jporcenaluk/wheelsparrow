@@ -26,7 +26,10 @@ and marks the ticket done only when the evidence matches.
 - Approved product design: `SPEC.md`, `ARCHITECTURE.md`, `TECH_STACK.md`, and `CICD.md` at that SHA.
 - Approved delivery control:
   `docs/superpowers/specs/2026-08-08-mvp-delivery-control-design.md`.
-- Planned complete traceability matrix: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`; not yet created.
+- Complete traceability matrix: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`, covering the normative
+  sources at `81271c278c47a96e2882888e20c577449c5f69b8`; content SHA-256
+  `812f47388a15b630f1bd1483bf08cfbaebb1ef656823cf2dd5be2f3229292080`; 341 rows
+  (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77).
 - PR #3 is a stale, broad reference quarry. It is not an implementation base.
 - The untracked files in the root checkout belong to an earlier broad implementation attempt. They
   remain untouched until their provenance and reuse value are audited.
@@ -67,13 +70,9 @@ and marks the ticket done only when the evidence matches.
 - Mechanical lane: inventory, formatting, traceability checks, log classification, and narrow test
   review. Prefer a smaller model or lower reasoning effort when representative results preserve
   accuracy.
-- Luna-designated implementation and review lanes: use xhigh reasoning for bounded code sub-blocks,
-  subprocess/persistence/state/security work, specification review, and quality review. Root retains
-  authoritative documents, integration, commits, publication, merge, and completion claims.
-
-Model and effort choices must follow measured task difficulty. Start at medium effort for bounded
-work, use low effort for latency-sensitive mechanical checks, and reserve high or above for tasks
-where deeper reasoning changes the result.
+- Spawned implementation, inventory, and review lanes use the global default `gpt-5.6-terra` with
+  `medium` reasoning. Root retains authoritative documents, integration, commits, publication,
+  merge, and completion claims. An explicit spawn override requires a later user instruction.
 
 ## Merge Train
 
@@ -82,7 +81,7 @@ required product outcomes.
 
 | Order | Outcome | Depends on | Status | Worktree and branch | Plan | Pull request | Merge SHA |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Deterministic Block 0 process cleanup and delivery control | Merged PR #25 foundation | `in_progress` | `.worktrees/block0-flake`; `fix/block-0-process-test-flake` | `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md` | — | — |
+| 1 | Deterministic Block 0 process-cleanup repair and control-plane setup | PR #25 foundation | `in_progress` | `.worktrees/block0-flake`; `fix/block-0-process-test-flake` | `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md` | — | — |
 | 2 | SQLite storage, migrations, and single-process ownership | 1 | `pending` | — | — | — | — |
 | 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `pending` | — | — | — | — |
 | 4 | GitHub discovery and claim through a verified local candidate | 3 | `pending` | — | — | — | — |
@@ -98,17 +97,19 @@ required product outcomes.
 - Active slice: merge-train row 1.
 - Active worktree: `/home/jporc/wheelsparrow/.worktrees/block0-flake`.
 - Branch: `fix/block-0-process-test-flake`.
-- Observed HEAD before this ledger edit: `7db4ee1`.
+- Observed HEAD before this ledger edit: `f42fd5ed80c27c40bacafb42793f18cec8ddfeea`.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
 - Active plan: `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md`.
-- Current checkbox after this checkpoint: Task 2, Step 1, verify the normative source and branch.
-- Last verification: pinned Node `v24.18.0`, pnpm `11.15.1`, plan Markdownlint, placeholder scan, and
-  `git diff --check` passed before this combined plan/ledger checkpoint.
-- Next safe command: `git status --short --branch`, then the Task 2, Step 1 branch/headings commands
-  and a fresh connected-GitHub `main` equality check.
-- Current owner: root orchestrator. Read-only inventory subagents may propose rows; root writes and
-  decides the matrix.
+- Current checkbox after this checkpoint: Task 4, Step 1, dispatch the bounded test-only RED worker.
+- Last verification: connected GitHub reconfirmed protected `main`
+  `81271c278c47a96e2882888e20c577449c5f69b8`, merged PR #25, successful runs
+  `31158318354` and `31158319951`, exact artifact `8986025122`, and no open PR for this branch;
+  the 341-row matrix passed exact ownership, unique-ID, rationale, evidence, source-order,
+  Markdownlint, independent Terra/medium review, and `git diff --check` checks.
+- Next safe command: modify only `scripts/preflight.test.ts`, then run
+  `mise exec node@24.18.0 -- corepack pnpm vitest run scripts/preflight.test.ts -t "terminates a ready detached process group" --pool=threads --maxWorkers=1`.
+- Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
 ## Resolved Requirement Questions
@@ -200,6 +201,8 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | PR #25 main artifact | [Main artifact run 31158319951](https://github.com/jporcenaluk/wheelsparrow/actions/runs/31158319951) job `build-artifact` completed successfully; artifact `wheelsparrow-81271c278c47a96e2882888e20c577449c5f69b8` ID `8986025122`, digest `sha256:aaaee69333851be4fb1794438ed86a8e82f1db62edf07bb2b2744495dfd328e9`, is unexpired and bound to that SHA |
 | 2026-08-08 | Delivery-control design | Approved design commit `7db4ee1` defines the ledger/matrix/one-plan control plane, merge train, recovery protocol, and agent hierarchy |
 | 2026-08-08 | Row 1 execution-plan review | Xhigh Luna, control-plane, and subprocess reviewers inspected the plan; accepted findings corrected source drift, trace IDs, TDD coverage, process wiring, checkpoint invariants, exact checks, and the one-PR boundary before bootstrap |
+| 2026-08-08 | Requirements matrix | Root integrated four bounded source inventories into 341 reviewed rows (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77) at source revision `81271c278c47a96e2882888e20c577449c5f69b8`; matrix SHA-256 `812f47388a15b630f1bd1483bf08cfbaebb1ef656823cf2dd5be2f3229292080`; final Terra/medium review found no open defect |
+| 2026-08-08 | Row 1 control-plane checkpoint | Connected GitHub reconfirmed merged PR #25, protected `main` `81271c278c47a96e2882888e20c577449c5f69b8`, successful jobs in runs `31158318354` and `31158319951`, unexpired exact-SHA artifact `8986025122`, and no open PR for `fix/block-0-process-test-flake`; Markdownlint and diff hygiene passed |
 
 ## Open Decisions and Risks
 
