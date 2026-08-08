@@ -99,20 +99,18 @@ required product outcomes.
 - Active slice: merge-train row 2, Block 1A durable SQLite storage.
 - Active worktree: `/home/jporc/wheelsparrow/.worktrees/block1a-storage`.
 - Branch: `feat/block-1a-storage`.
-- Observed HEAD before this ledger edit: `64951a3edc3de50bdc8007becde965308c5d3040`.
+- Observed HEAD before this ledger edit: `07fc32f`.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
 - Active plan: `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md`.
-- Current checkbox after this checkpoint: Task 6, Step 1, specify lifecycle composition and failure
-  behavior.
-- Last verification: exact dependencies and strict native allowlist passed frozen installation;
-  the real SQLite persistence test passed 1/1, repository policy passed 6/6, safe-path configuration
-  passed 25/25, the unrestricted Linux ownership suite passed 9/9, and the immutable migration suite
-  passed 62/62 twice under Node 24.18.0. Server and test TypeScript, targeted Biome, and diff hygiene
-  passed. Fresh schema, test-contract, specification, and adversarial quality reviews all approved.
-- Next safe command: delegate Task 6 lifecycle RED tests using the audited narrow dependency boundary
-  and returned idempotent service handle; preserve current Fastify behavior and do not introduce a
-  generic lifecycle framework.
+- Current checkbox after this checkpoint: Task 7, Step 1, add the narrow macOS native-storage CI job.
+- Last verification: pinned Node 24.18.0 `make verify-agent` passed formatting, Markdownlint, all
+  TypeScript projects, 14 test files, and 249 tests; the production build passed; and the post-build
+  production lifecycle smoke passed. Its focused contract passed 9/9, and fresh quality and safety
+  rereviews returned `QUALITY APPROVED` and `SAFETY APPROVED`.
+- Next safe command: delegate Task 7 workflow-policy RED tests for the macOS native-storage job and
+  installable source-bundle contract; retain Linux as the canonical full gate and do not claim an
+  offline or cross-platform binary artifact.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
@@ -223,6 +221,7 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | Row 2 ownership GREEN | RED commit `e7b4a47`, implementation commit `db4e59c`, hardening commit `e2bb55a`, and path-boundary commit `17809d6` establish one OS advisory whole-file lock with typed contention, hard-error causality, private regular-file validation, idempotent release, and crash-safe reacquisition. Root's unrestricted Node 24.18.0 suite passed 9/9, including separate live holder and contender children; targeted Biome, server typecheck, diff hygiene, and fresh ownership rereview passed with `APPROVED` |
 | 2026-08-08 | Row 2 immutable SQLite GREEN | RED/hardening commits `6c251e0`, `901cbdb`, `70ac7a3`, and `fc9b21d` plus production commit `c51536f` establish one real SQLite/Kysely handle, canonical immutable migrations, six exact operational tables, restart-safe schema/ledger atomicity, bounded JSON, evidence-preserving constraints, canonical hashes, safe target files, fatal UTF-8 preflight, and await-idempotent close. Root passed 62/62 twice plus both TypeScript configurations, targeted Biome, and diff hygiene; fresh reviewers returned `SCHEMA APPROVED`, `TESTS APPROVED`, `SPEC COMPLIANT`, and `QUALITY APPROVED` |
 | 2026-08-08 | Row 2 lifecycle composition GREEN | Lifecycle RED commits `044978b`, `b606bf9`, and `915242d` plus production commit `577131a` establish complete directory preflight before mutation, private path creation/revalidation, strict existing-lock validation, configuration -> ownership -> SQLite migration -> listener ordering, a shared idempotent close, and startup-phase serialization that defers reverse cleanup until any in-flight acquire/open/migrate/build/listen operation settles. Root passed 59/59 lifecycle/path tests, the unrestricted native ownership suite 10/10, both TypeScript configurations, targeted Biome, and diff hygiene; fresh reviewers returned `SPEC COMPLIANT`, `QUALITY APPROVED`, and `SECURITY APPROVED` after signal-race, force-deadline, handler-removal, and permissive-lock repairs. |
+| 2026-08-08 | Row 2 production lifecycle smoke checkpoint | Commit `07fc32f` runs the built server from an immutable bundle root against a guarded OS-temporary repository fixture, interrupts startup after ownership and database open, verifies private SQLite state and the canonical migration ledger, rejects a live ownership contender before URL announcement, checks health/readiness/UI/assets, shuts down cleanly, and restarts against the same durable state. Focused smoke contracts passed 9/9; pinned Node 24.18.0 `make verify-agent` passed 14 files and 249 tests; production build and post-build smoke passed; fresh reviewers returned `QUALITY APPROVED` and `SAFETY APPROVED`. |
 
 ## Open Decisions and Risks
 

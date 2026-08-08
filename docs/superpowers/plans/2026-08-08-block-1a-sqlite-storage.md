@@ -193,11 +193,11 @@ integration tests.
 - [x] Create data/workspace/log directories with private permissions, revalidate paths, acquire
   ownership, open/migrate, and then construct/listen. Close database and release ownership after the
   app closes; best-effort cleanup must not replace the initiating failure.
-- [ ] Extend production smoke to use an isolated temporary repository/data root and prove the SQLite
+- [x] Extend production smoke to use an isolated temporary repository/data root and prove the SQLite
   file is created, migrated, locked while live, and cleanly reopenable after shutdown. Add child-
   process SIGTERM during startup and after readiness; both must permit immediate restart. Prove the
   packaged build discovers migrations without relying on the source checkout or caller CWD.
-- [ ] Run focused tests, full local verification, build, and production smoke.
+- [x] Run focused tests, full local verification, build, and production smoke.
 
 ## Task 7: Prove native CI and the runnable artifact
 
