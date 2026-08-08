@@ -1069,7 +1069,7 @@ docs(delivery): record Block 0 review evidence
 - Modify: `MVP_IMPLEMENTATION_LEDGER.md`
 - Modify: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`
 
-- [ ] **Step 1: Reconcile publication state and push the exact reviewed branch**
+- [x] **Step 1: Reconcile publication state and push the exact reviewed branch**
 
 Run:
 
@@ -1083,7 +1083,7 @@ git rev-parse HEAD
 Expected: a clean worktree and a bounded diff containing only the approved designs, plan, matrix,
 ledger, and process-cleanup repair. Verify no existing PR owns the branch, then root pushes it.
 
-- [ ] **Step 2: Open a non-draft pull request**
+- [x] **Step 2: Open a non-draft pull request**
 
 Use a Conventional Commit PR title, for example:
 
@@ -1096,7 +1096,7 @@ matrix row counts, state the RED/GREEN and repetition evidence, list full local 
 there is no product timeout or public API change. Create the PR non-draft so the ready-for-review
 gate exercises the real contract.
 
-- [ ] **Step 3: Verify exact-head PR checks and review state**
+- [x] **Step 3: Verify exact-head PR checks and review state**
 
 Record the PR URL and exact head SHA. Wait for every required check for that exact SHA. At minimum,
 re-read the live ruleset and verify repository-reported check names, conclusions, URLs, and head SHA;
@@ -1108,7 +1108,7 @@ If a check fails, classify it before changing code. Accepted defects follow TDD 
 loop; infrastructure or external failures remain explicit evidence. Any new commit invalidates old
 head-bound checks and reviews.
 
-- [ ] **Step 4: Merge through the protected branch**
+- [x] **Step 4: Merge through the protected branch**
 
 Re-read the PR head, mergeability, required reviews, conversations, and exact-head checks immediately
 before merge. Obtain a qualified human approval of the latest head whenever the live ruleset requires
@@ -1116,7 +1116,7 @@ one; stale-head approval is not evidence. The user has authorized protected merg
 goal, but repository rules remain binding. Use the allowed merge method, expected to be squash.
 Record the PR number, merge method, exact pre-merge head, and exact protected-main merge SHA.
 
-- [ ] **Step 5: Verify post-merge main and artifact evidence**
+- [x] **Step 5: Verify post-merge main and artifact evidence**
 
 Wait for the merge-triggered main workflow at the exact merge SHA. Verify:
 

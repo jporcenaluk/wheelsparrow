@@ -21,14 +21,16 @@ and marks the ticket done only when the evidence matches.
 
 ## Authority and Scope
 
-- Authoritative base: protected `main` at `81271c278c47a96e2882888e20c577449c5f69b8`,
+- Authoritative base: protected `main` at `64951a3edc3de50bdc8007becde965308c5d3040`,
   live-verified on 2026-08-08.
-- Approved product design: `SPEC.md`, `ARCHITECTURE.md`, `TECH_STACK.md`, and `CICD.md` at that SHA.
+- Approved product design: `SPEC.md`, `ARCHITECTURE.md`, `TECH_STACK.md`, and `CICD.md`; their
+  content is unchanged from source revision `81271c278c47a96e2882888e20c577449c5f69b8` through the
+  current protected-main SHA.
 - Approved delivery control:
   `docs/superpowers/specs/2026-08-08-mvp-delivery-control-design.md`.
 - Complete traceability matrix: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`, covering the normative
-  sources at `81271c278c47a96e2882888e20c577449c5f69b8`; content SHA-256
-  `b4b76b326663513f411f7f552f89ca65ad9358e54432cf61dae0ebd9219abbff`; 341 rows
+  sources at `81271c278c47a96e2882888e20c577449c5f69b8`; current content SHA-256
+  `8a8df599d4e09b086e16256636b6fb75eea37a0d102ea8e4059dbb4ddb948e89`; 341 rows
   (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77).
 - PR #3 is a stale, broad reference quarry. It is not an implementation base.
 - The untracked files in the root checkout belong to an earlier broad implementation attempt. They
@@ -81,8 +83,8 @@ required product outcomes.
 
 | Order | Outcome | Depends on | Status | Worktree and branch | Plan | Pull request | Merge SHA |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Deterministic Block 0 process-cleanup repair and control-plane setup | PR #25 foundation | `in_progress` | `.worktrees/block0-flake`; `fix/block-0-process-test-flake` | `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md` | — | — |
-| 2 | SQLite storage, migrations, and single-process ownership | 1 | `pending` | — | — | — | — |
+| 1 | Deterministic Block 0 process-cleanup repair and control-plane setup | PR #25 foundation | `merged` | `.worktrees/block0-flake`; `fix/block-0-process-test-flake` | `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md` | [#26](https://github.com/jporcenaluk/wheelsparrow/pull/26) | `64951a3edc3de50bdc8007becde965308c5d3040` |
+| 2 | SQLite storage, migrations, and single-process ownership | 1 | `in_progress` | `.worktrees/block1a-storage`; `feat/block-1a-storage` | `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md` | — | — |
 | 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `pending` | — | — | — | — |
 | 4 | GitHub discovery and claim through a verified local candidate | 3 | `pending` | — | — | — | — |
 | 5 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 4 | `pending` | — | — | — | — |
@@ -92,24 +94,22 @@ required product outcomes.
 
 ## Current Resume Point
 
-- Authoritative remote `main`: `81271c278c47a96e2882888e20c577449c5f69b8`, live-verified through
+- Authoritative remote `main`: `64951a3edc3de50bdc8007becde965308c5d3040`, live-verified through
   the connected GitHub integration on 2026-08-08.
-- Active slice: merge-train row 1.
-- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block0-flake`.
-- Branch: `fix/block-0-process-test-flake`.
-- Observed HEAD before this ledger edit: `f42fd5ed80c27c40bacafb42793f18cec8ddfeea`.
+- Active slice: merge-train row 2, Block 1A durable SQLite storage.
+- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block1a-storage`.
+- Branch: `feat/block-1a-storage`.
+- Observed HEAD before this ledger edit: `64951a3edc3de50bdc8007becde965308c5d3040`.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
-- Active plan: `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md`.
-- Current checkbox after this checkpoint: Task 8, Step 1, reconcile publication state and push the
-  exact reviewed branch.
-- Last verification: fresh whole-branch specification review reports `SPEC COMPLIANT`; fresh
-  subprocess quality review reports `QUALITY APPROVED`; fresh traceability review reports
-  `TRACEABILITY APPROVED`. After accepted document corrections, unrestricted `make verify-agent`
-  passed 11 files and 129 tests, `make build` passed, production lifecycle smoke passed at
-  `http://127.0.0.1:36895`, the five-file Markdownlint gate passed, and diff hygiene passed.
-- Next safe command: run Task 8 Step 1's status, branch-log, branch-diff, and exact-head checks;
-  verify no open PR owns `fix/block-0-process-test-flake`, then push the reviewed branch.
+- Active plan: `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md`.
+- Current checkbox after this checkpoint: Task 2, Step 1, add the failing native persistence probe.
+- Last verification: row 1 merged through protected PR #26. Post-merge CI run `31253147178` and main
+  artifact run `31253147159` succeeded at exact merge SHA
+  `64951a3edc3de50bdc8007becde965308c5d3040`; artifact `9020617150` is unexpired and its digest is
+  `sha256:0f82a1e8def6532a62f5e34fb9066825a63e4f7dfca0afec988b5f5cd0719f50`.
+- Next safe command: delegate Task 2's failing native persistence probe to one bounded Terra/medium
+  worker, reproduce RED at root, and commit only the reviewed test before dependency implementation.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
@@ -209,6 +209,11 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | Row 1 repeatability and full local gate | At exact code checkpoint `5cd12d57027435506b5fb97fd8a47757cf55b875`, the unrestricted host passed the real direct process-group test 25/25 and the complete preflight file 25/25; the explicit single-worker repository suite and canonical `make verify-agent` each passed 11 files and 129 tests; build and production lifecycle smoke passed at `http://127.0.0.1:39993`; diff hygiene passed |
 | 2026-08-08 | Row 1 final independent review | Fresh Terra/medium specification review reached `SPEC COMPLIANT`; fresh subprocess review reached `QUALITY APPROVED`; fresh traceability review reached `TRACEABILITY APPROVED` after correcting superseded model routing, current versus historical matrix hashes, one unbound evidence path, and the productless/circular closeout-PR boundary |
 | 2026-08-08 | Row 1 reviewed local proof | Unrestricted `make verify-agent` passed 11 files and 129 tests; build and production lifecycle smoke passed at `http://127.0.0.1:36895`; the five-file Markdownlint gate and diff hygiene passed at the reviewed working content |
+| 2026-08-08 | Row 1 PR #26 exact-head proof | Non-draft [PR #26](https://github.com/jporcenaluk/wheelsparrow/pull/26) at head `6c2bea8fc4233292e0498e60e1c998360aa460b3` passed PR metadata run `31253089872` and CI run `31253089886`; no open review thread or comment remained and GitHub reported it mergeable |
+| 2026-08-08 | Row 1 protected merge | PR #26 squash-merged with the expected-head guard; connected GitHub and local `github/main` agree on merge SHA `64951a3edc3de50bdc8007becde965308c5d3040` |
+| 2026-08-08 | Row 1 post-merge proof | [CI run 31253147178](https://github.com/jporcenaluk/wheelsparrow/actions/runs/31253147178) and [Main artifact run 31253147159](https://github.com/jporcenaluk/wheelsparrow/actions/runs/31253147159) succeeded at the exact merge SHA; artifact `wheelsparrow-64951a3edc3de50bdc8007becde965308c5d3040` ID `9020617150`, digest `sha256:0f82a1e8def6532a62f5e34fb9066825a63e4f7dfca0afec988b5f5cd0719f50`, is unexpired and passed extracted lifecycle verification |
+| 2026-08-08 | Row 2 planning checkpoint | Clean worktree `.worktrees/block1a-storage` and branch `feat/block-1a-storage` start at exact protected-main SHA `64951a3edc3de50bdc8007becde965308c5d3040`; bounded plan `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md` keeps state/coordinator semantics in row 3 and real agent-log storage in row 4 |
+| 2026-08-08 | Row 2 plan review | Fresh Terra/medium plan, traceability, and security reviewers reached `PLAN APPROVED`, `TRACEABILITY APPROVED`, and `SECURITY APPROVED` after replacing PID metadata and a conflicting second SQLite lock database with a maintained OS advisory file lock, defining the artifact as an installable source bundle, binding native lock behavior to Linux/macOS CI, and tightening migration, path, lifecycle, and supply-chain proofs |
 
 ## Open Decisions and Risks
 
