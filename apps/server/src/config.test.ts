@@ -1,6 +1,7 @@
 import {
   access,
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   rm,
@@ -14,6 +15,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import {
   deriveLocalPaths,
   loadConfiguration,
+  prepareLocalPaths,
   resolveConfigurationPath,
   WorkspaceRootError,
 } from "./config.js";
@@ -401,5 +403,156 @@ describe("loadConfiguration", () => {
 
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain(diagnostic);
+  });
+});
+
+describe("prepareLocalPaths", () => {
+  test("creates the repository-owned storage directories privately and returns canonical paths", async () => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+    const paths = expectedLocalPaths(repositoryRoot);
+
+    await expect(prepareLocalPaths(paths)).resolves.toEqual(paths);
+
+    for (const directory of [
+      paths.dataRoot,
+      paths.workspaceRoot,
+      paths.logsRoot,
+    ]) {
+      const metadata = await lstat(directory);
+      expect(metadata.isDirectory()).toBe(true);
+      expect(metadata.isSymbolicLink()).toBe(false);
+      if (process.platform !== "win32")
+        expect(metadata.mode & 0o777).toBe(0o700);
+      if (typeof process.getuid === "function")
+        expect(metadata.uid).toBe(process.getuid());
+    }
+    await expect(access(paths.databasePath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(access(paths.lockPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "revalidates safe existing private directories without changing their paths",
+    async () => {
+      const repositoryRoot = await mkdtemp(
+        join(tmpdir(), "wheelsparrow-paths-"),
+      );
+      temporaryDirectories.push(repositoryRoot);
+      const paths = expectedLocalPaths(repositoryRoot);
+      await mkdir(paths.workspaceRoot, { recursive: true, mode: 0o700 });
+      await mkdir(paths.logsRoot, { recursive: true, mode: 0o700 });
+      await chmod(paths.dataRoot, 0o700);
+      await chmod(paths.workspaceRoot, 0o700);
+      await chmod(paths.logsRoot, 0o700);
+
+      await expect(prepareLocalPaths(paths)).resolves.toEqual(paths);
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "refuses an unsafe existing component before creating any missing storage directory",
+    async () => {
+      const repositoryRoot = await mkdtemp(
+        join(tmpdir(), "wheelsparrow-paths-"),
+      );
+      temporaryDirectories.push(repositoryRoot);
+      const paths = expectedLocalPaths(repositoryRoot);
+      await mkdir(paths.dataRoot, { mode: 0o700 });
+      await chmod(paths.dataRoot, 0o777);
+
+      await expect(prepareLocalPaths(paths)).rejects.toThrow(
+        WorkspaceRootError,
+      );
+      expect((await lstat(paths.dataRoot)).mode & 0o777).toBe(0o777);
+      await expect(access(paths.workspaceRoot)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(access(paths.logsRoot)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
+  test("refuses a symbolic-link logs root before creating a missing workspace or state files", async ({
+    skip,
+  }) => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+    const paths = expectedLocalPaths(repositoryRoot);
+    const target = await mkdtemp(join(tmpdir(), "wheelsparrow-link-target-"));
+    temporaryDirectories.push(target);
+    await chmod(target, 0o711);
+    await mkdir(paths.dataRoot, { mode: 0o700 });
+    try {
+      await symlink(target, paths.logsRoot);
+    } catch (error) {
+      skipUnsupportedSymlinks(error, skip);
+    }
+
+    await expect(prepareLocalPaths(paths)).rejects.toThrow(WorkspaceRootError);
+    expect((await lstat(paths.logsRoot)).isSymbolicLink()).toBe(true);
+    expect((await lstat(target)).mode & 0o777).toBe(0o711);
+    await expect(access(paths.workspaceRoot)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(access(paths.databasePath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(access(paths.lockPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test("refuses a non-directory logs root before creating a missing workspace or state files", async () => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+    const paths = expectedLocalPaths(repositoryRoot);
+    await mkdir(paths.dataRoot, { mode: 0o700 });
+    await writeFile(paths.logsRoot, "sentinel", "utf8");
+
+    await expect(prepareLocalPaths(paths)).rejects.toThrow(WorkspaceRootError);
+    await expect(access(paths.workspaceRoot)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(access(paths.databasePath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(access(paths.lockPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test("refuses a symbolic-link workspace before creating logs or state files", async ({
+    skip,
+  }) => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+    const paths = expectedLocalPaths(repositoryRoot);
+    const target = await mkdtemp(join(tmpdir(), "wheelsparrow-link-target-"));
+    temporaryDirectories.push(target);
+    await chmod(target, 0o711);
+    await mkdir(paths.dataRoot, { mode: 0o700 });
+    try {
+      await symlink(target, paths.workspaceRoot);
+    } catch (error) {
+      skipUnsupportedSymlinks(error, skip);
+    }
+
+    await expect(prepareLocalPaths(paths)).rejects.toThrow(WorkspaceRootError);
+    expect((await lstat(paths.workspaceRoot)).isSymbolicLink()).toBe(true);
+    expect((await lstat(target)).mode & 0o777).toBe(0o711);
+    await expect(access(paths.logsRoot)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(access(paths.databasePath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(access(paths.lockPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 });
