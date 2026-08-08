@@ -1,5 +1,6 @@
 import {
   access,
+  chmod,
   mkdir,
   mkdtemp,
   rm,
@@ -180,6 +181,72 @@ describe("deriveLocalPaths", () => {
       ),
     ).resolves.toEqual(expectedLocalPaths(resolve(repositoryRoot)));
   });
+
+  test("canonicalizes a symbolic-link repository root alias", async ({
+    skip,
+  }) => {
+    const parent = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(parent);
+    const repositoryRoot = join(parent, "repository");
+    const repositoryRootAlias = join(parent, "repository-alias");
+    await mkdir(repositoryRoot);
+    try {
+      await symlink(repositoryRoot, repositoryRootAlias);
+    } catch (error) {
+      skipUnsupportedSymlinks(error, skip);
+    }
+
+    await expect(
+      deriveLocalPaths(repositoryRootAlias, ".wheelsparrow/workspaces"),
+    ).resolves.toEqual(expectedLocalPaths(repositoryRoot));
+  });
+
+  test.each([
+    ["absolute", join(tmpdir(), "wheelsparrow-outside")],
+    ["traversal", "../wheelsparrow-outside"],
+  ])("directly rejects an %s workspace root", async (_, workspaceRoot) => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+
+    await expect(
+      deriveLocalPaths(repositoryRoot, workspaceRoot),
+    ).rejects.toThrow(WorkspaceRootError);
+  });
+
+  test("permits an existing safe data root without creating its workspace", async () => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+    const paths = expectedLocalPaths(repositoryRoot);
+    await mkdir(paths.dataRoot, { mode: 0o700 });
+
+    await expect(
+      deriveLocalPaths(repositoryRoot, ".wheelsparrow/workspaces"),
+    ).resolves.toEqual(paths);
+    await expect(access(paths.workspaceRoot)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "rejects a group- or world-writable existing data root",
+    async () => {
+      const repositoryRoot = await mkdtemp(
+        join(tmpdir(), "wheelsparrow-paths-"),
+      );
+      temporaryDirectories.push(repositoryRoot);
+      const dataRoot = join(repositoryRoot, ".wheelsparrow");
+      await mkdir(dataRoot, { mode: 0o700 });
+      await chmod(dataRoot, 0o777);
+
+      try {
+        await expect(
+          deriveLocalPaths(repositoryRoot, ".wheelsparrow/workspaces"),
+        ).rejects.toThrow(WorkspaceRootError);
+      } finally {
+        await chmod(dataRoot, 0o700);
+      }
+    },
+  );
 });
 
 describe("loadConfiguration", () => {
