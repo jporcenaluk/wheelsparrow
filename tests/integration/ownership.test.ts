@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import {
+  chmod,
   mkdtemp,
   readFile,
   rm,
@@ -165,6 +166,27 @@ describe("SQLite storage ownership", () => {
 
     await ownership.release();
   });
+
+  test.skipIf(process.platform === "win32")(
+    "rejects a group/world-writable existing lock file without changing it",
+    async () => {
+      const lockPath = await createLockPath();
+      const contents = "unsafe lock contents must survive validation";
+      await writeFile(lockPath, contents, { mode: 0o600 });
+      await chmod(lockPath, 0o666);
+      const before = await stat(lockPath);
+
+      await expect(acquireOwnership(lockPath)).rejects.not.toBeInstanceOf(
+        OwnershipConflictError,
+      );
+
+      const after = await stat(lockPath);
+      expect(await readFile(lockPath, "utf8")).toBe(contents);
+      expect(after.ino).toBe(before.ino);
+      expect(after.mode & 0o777).toBe(before.mode & 0o777);
+      expect(after.mode & 0o777).toBe(0o666);
+    },
+  );
 
   test("rejects a directory lock path as a hard error", async () => {
     const directory = await mkdtemp(join(tmpdir(), "wheelsparrow-ownership-"));

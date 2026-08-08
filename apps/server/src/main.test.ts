@@ -46,14 +46,18 @@ type Phase =
   | "ready"
   | "announce";
 
+type InterruptiblePhase = "acquire" | "open" | "migrate" | "build" | "listen";
+
 function lifecycleFakes({
   events,
   failAt,
   cleanupFailure,
+  pauseAt,
 }: {
   events: string[];
   failAt?: Phase;
   cleanupFailure?: boolean;
+  pauseAt?: InterruptiblePhase;
 }) {
   const paths = localPaths();
   const failure = new Error(`failed at ${failAt}`);
@@ -61,7 +65,20 @@ function lifecycleFakes({
     events.push(phase);
     if (phase === failAt) throw failure;
   };
-  const listeners = new Map<string, () => void>();
+  let resumePausedPhase!: () => void;
+  let pausedPhaseStarted!: () => void;
+  const pausedPhaseMayComplete = new Promise<void>((resolve) => {
+    resumePausedPhase = resolve;
+  });
+  const pausedPhaseHasStarted = new Promise<void>((resolve) => {
+    pausedPhaseStarted = resolve;
+  });
+  const pause = async (phase: InterruptiblePhase): Promise<void> => {
+    if (phase !== pauseAt) return;
+    pausedPhaseStarted();
+    await pausedPhaseMayComplete;
+  };
+  const listeners = new Map<string, () => void | Promise<void>>();
   const signalTarget = {
     once(signal: string, listener: () => void) {
       events.push(`install:${signal}`);
@@ -92,15 +109,24 @@ function lifecycleFakes({
     async listen(options: { host: string; port: number }) {
       fail("listen");
       expect(options).toEqual({ host: "127.0.0.1", port: 4321 });
+      await pause("listen");
       return "http://127.0.0.1:4321";
     },
   };
+  let registerWeb: StartDependencies["registerWeb"];
 
   return {
     paths,
     events,
     failure,
     signalTarget,
+    async emitSignal(signal: "SIGINT" | "SIGTERM") {
+      const listener = listeners.get(signal);
+      expect(listener).toBeDefined();
+      await listener?.();
+    },
+    pausedPhaseHasStarted,
+    resumePausedPhase,
     dependencies: {
       async loadRuntimeConfiguration(repositoryRoot: string) {
         fail("load-runtime");
@@ -115,11 +141,13 @@ function lifecycleFakes({
       async acquireOwnership(lockPath: string) {
         fail("acquire");
         expect(lockPath).toBe(paths.lockPath);
+        await pause("acquire");
         return ownership;
       },
       async openDatabase(databasePath: string) {
         fail("open");
         expect(databasePath).toBe(paths.databasePath);
+        await pause("open");
         return database;
       },
       async migrateDatabase(
@@ -131,10 +159,12 @@ function lifecycleFakes({
         expect(directory).toBe(
           resolve(import.meta.dirname, "../../../migrations"),
         );
+        await pause("migrate");
       },
       async buildApp({ readiness }: { readiness: { isReady(): boolean } }) {
         fail("build");
         expect(readiness.isReady()).toBe(false);
+        await pause("build");
         return app;
       },
       createReadinessGate() {
@@ -155,6 +185,7 @@ function lifecycleFakes({
         fail("announce");
         expect(url).toBe("http://127.0.0.1:4321");
       },
+      registerWeb,
       signalTarget,
     } satisfies StartDependencies,
   };
@@ -272,6 +303,119 @@ describe("start", () => {
       2,
     );
   });
+
+  test.each([
+    [
+      "SIGINT",
+      "acquire",
+      ["not-ready", "ownership-release", "remove:SIGINT", "remove:SIGTERM"],
+    ],
+    [
+      "SIGTERM",
+      "open",
+      [
+        "not-ready",
+        "database-close",
+        "ownership-release",
+        "remove:SIGINT",
+        "remove:SIGTERM",
+      ],
+    ],
+    [
+      "SIGINT",
+      "migrate",
+      [
+        "not-ready",
+        "database-close",
+        "ownership-release",
+        "remove:SIGINT",
+        "remove:SIGTERM",
+      ],
+    ],
+    [
+      "SIGTERM",
+      "build",
+      [
+        "not-ready",
+        "database-close",
+        "ownership-release",
+        "remove:SIGINT",
+        "remove:SIGTERM",
+      ],
+    ],
+    [
+      "SIGINT",
+      "listen",
+      [
+        "not-ready",
+        "app-close",
+        "database-close",
+        "ownership-release",
+        "remove:SIGINT",
+        "remove:SIGTERM",
+      ],
+    ],
+  ] as const)(
+    "defers %s shutdown cleanup until the pending %s phase settles",
+    async (signal, phase, cleanup) => {
+      const events: string[] = [];
+      const fake = lifecycleFakes({ events, pauseAt: phase });
+      const startup = startService(
+        fake.paths.repositoryRoot,
+        fake.dependencies,
+      );
+      await fake.pausedPhaseHasStarted;
+
+      let signalSettled = false;
+      const signalCompletion = fake.emitSignal(signal);
+      void signalCompletion.then(
+        () => {
+          signalSettled = true;
+        },
+        () => {
+          signalSettled = true;
+        },
+      );
+      let preReleaseFailure: unknown;
+      try {
+        await Promise.resolve();
+
+        expect(signalSettled).toBe(false);
+        expect(events).not.toContain("not-ready");
+        expect(events).not.toContain("app-close");
+        expect(events).not.toContain("database-close");
+        expect(events).not.toContain("ownership-release");
+      } catch (error) {
+        preReleaseFailure = error;
+      } finally {
+        fake.resumePausedPhase();
+      }
+
+      await expect(startup).rejects.toMatchObject({
+        name: "ShutdownRequestedError",
+        message: "startup interrupted by shutdown signal",
+      });
+      await signalCompletion;
+
+      if (preReleaseFailure !== undefined) throw preReleaseFailure;
+
+      const expectedStartup = [
+        "load-runtime",
+        "install:SIGINT",
+        "install:SIGTERM",
+        "prepare-paths",
+        "acquire",
+        "open",
+        "migrate",
+        "build",
+        "listen",
+      ].slice(
+        0,
+        ["acquire", "open", "migrate", "build", "listen"].indexOf(phase) + 5,
+      );
+      expect(events).toEqual([...expectedStartup, ...cleanup]);
+    },
+  );
 
   test.each([
     ["load-runtime", []],
@@ -524,6 +668,10 @@ describe("start", () => {
     try {
       process.env.NODE_ENV = "production";
       process.env.WHEELSPARROW_PORT = "8765";
+      fake.dependencies.announce = (url: string) => {
+        events.push("announce");
+        expect(url).toBe("http://127.0.0.1:8765");
+      };
       fake.dependencies.buildApp = async ({
         readiness,
         registerWeb,
