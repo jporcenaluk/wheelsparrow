@@ -1,3 +1,4 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import {
   chmod,
   mkdir,
@@ -10,9 +11,14 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { evaluatePreflight, formatCheck, runCommand } from "./preflight.js";
+import {
+  evaluatePreflight,
+  formatCheck,
+  runCommand,
+  terminateProcessTree,
+} from "./preflight.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -63,7 +69,21 @@ async function waitForProcessExit(pid: number): Promise<boolean> {
   return !processExists(pid);
 }
 
+async function waitForPidFile(file: string): Promise<number> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      const pid = Number(await readFile(file, "utf8"));
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+  throw new Error("timed out waiting for detached process fixture readiness");
+}
+
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -444,46 +464,130 @@ describe("runCommand", () => {
     expect(output).not.toContain("sentinel-");
   });
 
-  test("times out a hanging command promptly without leaking the child", async () => {
-    const root = await temporaryRoot();
-    const pidFile = join(root, "hanging.pid");
+  test("reports a hanging command timeout promptly", async () => {
     const startedAt = Date.now();
-
     const result = await runCommand(
       process.execPath,
-      [
-        "-e",
-        "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 1000)",
-        pidFile,
-      ],
+      ["-e", "setTimeout(() => {}, 10000)"],
       { timeoutMs: 150 },
     );
 
-    const pid = Number(await readFile(pidFile, "utf8"));
     expect(result).toEqual({ ok: false, detail: "timed out after 150ms" });
     expect(Date.now() - startedAt).toBeLessThan(700);
-    expect(await waitForProcessExit(pid)).toBe(true);
   });
 
-  test("kills a descendant that inherits output pipes on timeout", async () => {
-    const root = await temporaryRoot();
-    const pidFile = join(root, "descendant.pid");
-    const startedAt = Date.now();
-    const script = [
-      "const { spawn } = require('node:child_process');",
-      "const { writeFileSync } = require('node:fs');",
-      "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 1000)'],",
-      "  { stdio: ['ignore', process.stdout, process.stderr] });",
-      "writeFileSync(process.argv[1], String(child.pid));",
-    ].join("\n");
+  test.skipIf(process.platform === "win32")(
+    "times out a ready process group through runCommand",
+    async () => {
+      const root = await temporaryRoot();
+      const pidFile = join(root, "descendant.pid");
+      const script = [
+        "const { spawn } = require('node:child_process');",
+        "const { writeFileSync } = require('node:fs');",
+        "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'],",
+        "  { stdio: ['ignore', process.stdout, process.stderr] });",
+        "writeFileSync(process.argv[1], String(child.pid));",
+        "setTimeout(() => {}, 10000);",
+      ].join("\n");
+      const startedAt = Date.now();
+      const resultPromise = runCommand(
+        process.execPath,
+        ["-e", script, pidFile],
+        { timeoutMs: 2000 },
+      );
+      let descendantPid: number | undefined;
 
-    const result = await runCommand(process.execPath, ["-e", script, pidFile], {
-      timeoutMs: 80,
-    });
+      try {
+        descendantPid = await waitForPidFile(pidFile);
+        const result = await resultPromise;
 
-    const descendantPid = Number(await readFile(pidFile, "utf8"));
-    expect(result).toEqual({ ok: false, detail: "timed out after 80ms" });
-    expect(Date.now() - startedAt).toBeLessThan(500);
-    expect(await waitForProcessExit(descendantPid)).toBe(true);
+        expect(result).toEqual({ ok: false, detail: "timed out after 2000ms" });
+        expect(Date.now() - startedAt).toBeLessThan(2700);
+        expect(await waitForProcessExit(descendantPid)).toBe(true);
+      } finally {
+        if (descendantPid !== undefined && processExists(descendantPid)) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch {
+            // The timeout may have won the race with this cleanup.
+          }
+        }
+      }
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "terminates a ready detached process group",
+    async () => {
+      expect(terminateProcessTree).toBeTypeOf("function");
+      if (typeof terminateProcessTree !== "function") return;
+
+      const root = await temporaryRoot();
+      const pidFile = join(root, "descendant.pid");
+      const script = [
+        "const { spawn } = require('node:child_process');",
+        "const { writeFileSync } = require('node:fs');",
+        "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], { stdio: 'ignore' });",
+        "writeFileSync(process.argv[1], String(child.pid));",
+        "setTimeout(() => {}, 10000);",
+      ].join("\n");
+      const leader = spawn(process.execPath, ["-e", script, pidFile], {
+        detached: true,
+        stdio: "ignore",
+      });
+      const leaderPid = leader.pid;
+      if (leaderPid === undefined) {
+        throw new Error("detached process fixture did not start");
+      }
+      let descendantPid: number | undefined;
+
+      try {
+        descendantPid = await waitForPidFile(pidFile);
+        terminateProcessTree(leader);
+
+        expect(await waitForProcessExit(leaderPid)).toBe(true);
+        expect(await waitForProcessExit(descendantPid)).toBe(true);
+        expect(() => terminateProcessTree(leader)).not.toThrow();
+      } finally {
+        terminateProcessTree(leader);
+        if (descendantPid !== undefined && processExists(descendantPid)) {
+          try {
+            process.kill(descendantPid, "SIGKILL");
+          } catch {
+            // The group cleanup may have won the race with this cleanup.
+          }
+        }
+      }
+    },
+  );
+
+  test("uses direct child termination on Windows", () => {
+    expect(terminateProcessTree).toBeTypeOf("function");
+    if (typeof terminateProcessTree !== "function") return;
+    const kill = vi.fn(() => true);
+    const child = { pid: 1234, kill } as unknown as ChildProcess;
+
+    terminateProcessTree(child, "win32");
+
+    expect(kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
   });
+
+  test.skipIf(process.platform === "win32")(
+    "does not let cleanup errors replace the caller result",
+    () => {
+      expect(terminateProcessTree).toBeTypeOf("function");
+      if (typeof terminateProcessTree !== "function") return;
+      const groupKill = vi.spyOn(process, "kill").mockImplementation(() => {
+        throw new Error("group cleanup failed");
+      });
+      const kill = vi.fn(() => {
+        throw new Error("fallback cleanup failed");
+      });
+      const child = { pid: 1234, kill } as unknown as ChildProcess;
+
+      expect(() => terminateProcessTree(child, "linux")).not.toThrow();
+      expect(groupKill).toHaveBeenCalledExactlyOnceWith(-1234, "SIGKILL");
+      expect(kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+    },
+  );
 });

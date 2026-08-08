@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { constants } from "node:fs";
 import {
   access,
@@ -147,6 +147,23 @@ export function formatCheck(check: Check): string {
   return `${status} ${check.name}: ${redactDiagnostic(check.detail)}`;
 }
 
+export function terminateProcessTree(
+  child: ChildProcess,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (child.pid === undefined) return;
+  try {
+    if (platform === "win32") child.kill("SIGKILL");
+    else process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Best-effort cleanup must not replace the original command failure.
+    }
+  }
+}
+
 export function runCommand(
   command: string,
   args: string[],
@@ -190,16 +207,6 @@ export function runCommand(
       resolveResult(result);
     };
 
-    const terminate = () => {
-      if (child.pid === undefined) return;
-      try {
-        if (process.platform === "win32") child.kill("SIGKILL");
-        else process.kill(-child.pid, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
-    };
-
     child.stdout.on("data", capture);
     child.stderr.on("data", capture);
     child.once("error", (error) => {
@@ -218,7 +225,7 @@ export function runCommand(
       });
     });
     const timeout = setTimeout(() => {
-      terminate();
+      terminateProcessTree(child);
       finish({ ok: false, detail: `timed out after ${timeoutMs}ms` }, true);
     }, timeoutMs);
   });

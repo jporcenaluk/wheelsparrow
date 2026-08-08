@@ -575,14 +575,14 @@ verifies that invariant, ancestry, and the working tree before acting.
 - Modify: `scripts/preflight.test.ts`
 - Do not modify: `scripts/preflight.ts`
 
-- [ ] **Step 1: Give one bounded code worker the test-only RED scope**
+- [x] **Step 1: Give one bounded code worker the test-only RED scope**
 
 Use a capable worker because subprocess containment is timing- and platform-sensitive. Provide the
 approved process-cleanup design, the exact test steps below, and write permission only for
 `scripts/preflight.test.ts`. The worker must not edit the matrix, ledger, plan, production code, or
 commit. It must report the diff and exact RED output.
 
-- [ ] **Step 2: Add a compilable wished-for helper probe**
+- [x] **Step 2: Add a compilable wished-for helper probe**
 
 Import the child-process type and Vitest spy support, then load the preflight module as a namespace:
 
@@ -601,7 +601,7 @@ const terminateProcessTree = Reflect.get(
 
 This keeps the test module loadable before the export exists. Do not create the production export yet.
 
-- [ ] **Step 3: Separate timeout behavior from group cleanup behavior**
+- [x] **Step 3: Separate timeout behavior from group cleanup behavior**
 
 Replace both existing process-timeout tests with three focused contracts. First, retain a
 platform-independent API timeout test without a readiness file:
@@ -773,7 +773,7 @@ test.skipIf(process.platform === "win32")(
 Keep exactly one API-level timeout/group-wiring test and one direct group-cleanup test. Cleanup
 remains in `finally` so a failed assertion does not leak processes.
 
-- [ ] **Step 4: Run RED and inspect the failure**
+- [x] **Step 4: Run RED and inspect the failure**
 
 Run:
 
@@ -789,7 +789,7 @@ assertions. On Windows the platform-applicable missing-helper test fails and the
 skip. Failures must be assertions—not transform, import, syntax, type, readiness, or cleanup errors.
 Save the exact baseline pass and RED output in the worker report and ledger before production changes.
 
-- [ ] **Step 5: Root reviews the RED diff and evidence**
+- [x] **Step 5: Root reviews the RED diff and evidence**
 
 Run:
 
@@ -809,13 +809,13 @@ commit the deliberately red state.
 - Modify: `scripts/preflight.ts`
 - Verify: `scripts/preflight.test.ts`
 
-- [ ] **Step 1: Give the same bounded worker the minimal GREEN scope**
+- [x] **Step 1: Give the same bounded worker the minimal GREEN scope**
 
 Provide write permission for `scripts/preflight.ts` and the import/probe cleanup plus focused contract
 tests in `scripts/preflight.test.ts`. Require the exact helper contract below, no successful-path or
 timeout-detail change, no package-public API change, no unrelated refactor, and no commit.
 
-- [ ] **Step 2: Add the child-process type and internal helper**
+- [x] **Step 2: Add the child-process type and internal helper**
 
 Change the import to:
 
@@ -862,14 +862,14 @@ Replace the nested `terminate` function in `runCommand` with a call to
 - output bounds, redaction, and error/close handling;
 - the existing `CommandResult` and `runCommand` public contract.
 
-- [ ] **Step 3: Clean the RED probes after adding the export**
+- [x] **Step 3: Clean the RED probes after adding the export**
 
 Replace the temporary namespace/reflection access with the normal named import. Do not add new tests
 after production code: the direct-group, Windows-routing, and cleanup-error contracts were present
 and observed RED in Task 4. The `runCommand` wiring characterization was also present and passed before
 the refactor, providing the behavioral baseline it must continue to satisfy.
 
-- [ ] **Step 4: Run GREEN for the direct test**
+- [x] **Step 4: Run GREEN for the direct test**
 
 Run:
 
@@ -880,7 +880,7 @@ corepack pnpm vitest run scripts/preflight.test.ts -t "terminates a ready detach
 Expected: one test passes on POSIX; on Windows it is reported skipped. Both spawned processes are
 gone after the test.
 
-- [ ] **Step 5: Run the complete focused file**
+- [x] **Step 5: Run the complete focused file**
 
 Run:
 
@@ -891,7 +891,7 @@ corepack pnpm vitest run scripts/preflight.test.ts --pool=threads --maxWorkers=1
 Expected: every preflight test passes with no unhandled rejection, leaked handle, missing PID file,
 or changed timeout detail.
 
-- [ ] **Step 6: Root inspects and checkpoints the minimal repair**
+- [x] **Step 6: Root inspects and checkpoints the minimal repair**
 
 Run:
 

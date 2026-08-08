@@ -101,14 +101,14 @@ required product outcomes.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
 - Active plan: `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md`.
-- Current checkbox after this checkpoint: Task 4, Step 1, dispatch the bounded test-only RED worker.
-- Last verification: connected GitHub reconfirmed protected `main`
-  `81271c278c47a96e2882888e20c577449c5f69b8`, merged PR #25, successful runs
-  `31158318354` and `31158319951`, exact artifact `8986025122`, and no open PR for this branch;
-  the 341-row matrix passed exact ownership, unique-ID, rationale, evidence, source-order,
-  Markdownlint, independent Terra/medium review, and `git diff --check` checks.
-- Next safe command: modify only `scripts/preflight.test.ts`, then run
-  `mise exec node@24.18.0 -- corepack pnpm vitest run scripts/preflight.test.ts -t "terminates a ready detached process group" --pool=threads --maxWorkers=1`.
+- Current checkbox after this checkpoint: Task 6, Step 1, repeat the direct regression test 25 times.
+- Last verification: the direct process-group test, API wiring, Windows routing, and double-cleanup
+  failure contracts pass; Biome, TypeScript, and diff hygiene pass; the unrestricted full preflight
+  file passes 25/25. A fresh Terra/medium reviewer found no defect and independently repeated the
+  real detached leader/descendant test five times successfully.
+- Next safe command: outside the managed sandbox, repeat
+  `mise exec node@24.18.0 -- corepack pnpm vitest run scripts/preflight.test.ts -t "terminates a ready detached process group" --pool=threads --maxWorkers=1`
+  25 times, then continue Task 6's full local gate.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
@@ -203,6 +203,8 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | Row 1 execution-plan review | Xhigh Luna, control-plane, and subprocess reviewers inspected the plan; accepted findings corrected source drift, trace IDs, TDD coverage, process wiring, checkpoint invariants, exact checks, and the one-PR boundary before bootstrap |
 | 2026-08-08 | Requirements matrix | Root integrated four bounded source inventories into 341 reviewed rows (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77) at source revision `81271c278c47a96e2882888e20c577449c5f69b8`; matrix SHA-256 `812f47388a15b630f1bd1483bf08cfbaebb1ef656823cf2dd5be2f3229292080`; final Terra/medium review found no open defect |
 | 2026-08-08 | Row 1 control-plane checkpoint | Connected GitHub reconfirmed merged PR #25, protected `main` `81271c278c47a96e2882888e20c577449c5f69b8`, successful jobs in runs `31158318354` and `31158319951`, unexpired exact-SHA artifact `8986025122`, and no open PR for `fix/block-0-process-test-flake`; Markdownlint and diff hygiene passed |
+| 2026-08-08 | Row 1 process-cleanup RED checkpoint | One bounded Terra/medium worker changed only `scripts/preflight.test.ts`; TypeScript and the pre-refactor API group-wiring characterization passed, while all three new helper contracts failed only at the expected missing-export assertion; root inspected the diff, reproduced the exact three failures, and confirmed diff hygiene |
+| 2026-08-08 | Row 1 process-cleanup GREEN checkpoint | The minimal helper extraction preserves timeout semantics while making POSIX process-group cleanup, Windows routing, and double-failure suppression directly testable; focused contracts, Biome, TypeScript, and diff hygiene passed; the unrestricted preflight file passed 25/25; fresh Terra/medium review found no defect and repeated the direct fixture 5/5 |
 
 ## Open Decisions and Risks
 
