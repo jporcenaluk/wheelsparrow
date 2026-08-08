@@ -111,6 +111,20 @@ export interface CoordinatorError {
   error: Error;
 }
 
+export class EffectSettlementTimeoutError extends Error {
+  readonly effectKey: string;
+  readonly timeoutMs: number;
+
+  constructor(effectKey: string, timeoutMs: number) {
+    super(
+      `Timed out after ${timeoutMs}ms waiting for durable effect ${effectKey} to settle.`,
+    );
+    this.name = "EffectSettlementTimeoutError";
+    this.effectKey = effectKey;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 /**
  * Failure observations need a trigger that is legal for the run state at the
  * effect's target revision. Keep this exhaustive with the state-domain effect
@@ -339,6 +353,10 @@ export class WorkflowCoordinator {
   private readonly observer: EffectObserverLike | undefined;
   private readonly onError: ((error: CoordinatorError) => void) | undefined;
   private readonly observationErrors: CoordinatorError[] = [];
+  private readonly effectSettlementWaiters = new Map<
+    string,
+    Set<(effect: EffectRecord) => void>
+  >();
   private accepting = true;
   private tail: Promise<void> = Promise.resolve();
   private closePromise: Promise<void> | undefined;
@@ -360,6 +378,16 @@ export class WorkflowCoordinator {
     return !this.accepting;
   }
 
+  /** Whether this coordinator owns the external dispatcher capability. */
+  get hasEffectDispatcher(): boolean {
+    return this.dispatcher !== undefined;
+  }
+
+  /** Whether this coordinator owns the external observer capability. */
+  get hasEffectObserver(): boolean {
+    return this.observer !== undefined;
+  }
+
   get errors(): readonly CoordinatorError[] {
     return [...this.observationErrors];
   }
@@ -367,6 +395,47 @@ export class WorkflowCoordinator {
   /** Resolves after every command accepted so far has settled. */
   async waitForIdle(): Promise<void> {
     await this.tail;
+  }
+
+  /**
+   * Await a confirmed, failed, canceled, or ambiguous observation for one
+   * effect. Ambiguous is a notification that lets restart reconciliation
+   * hand the effect to the observer without dispatching it again.
+   */
+  waitForEffectSettlement(
+    effectKey: string,
+    timeoutMs = 30_000,
+  ): Promise<EffectRecord> {
+    if (effectKey.trim().length === 0)
+      return Promise.reject(
+        new TypeError("Effect key must be non-empty text."),
+      );
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0)
+      return Promise.reject(
+        new TypeError(
+          "Effect settlement timeout must be a finite non-negative number.",
+        ),
+      );
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiter = (effect: EffectRecord): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        const waiters = this.effectSettlementWaiters.get(effectKey);
+        waiters?.delete(waiter);
+        if (waiters?.size === 0) this.effectSettlementWaiters.delete(effectKey);
+        resolve(effect);
+      };
+      const waiters =
+        this.effectSettlementWaiters.get(effectKey) ??
+        new Set<(effect: EffectRecord) => void>();
+      waiters.add(waiter);
+      this.effectSettlementWaiters.set(effectKey, waiters);
+      timer = setTimeout(() => {
+        waiters.delete(waiter);
+        if (waiters.size === 0) this.effectSettlementWaiters.delete(effectKey);
+        reject(new EffectSettlementTimeoutError(effectKey, timeoutMs));
+      }, timeoutMs);
+    });
   }
 
   createClaim(
@@ -498,7 +567,7 @@ export class WorkflowCoordinator {
   }
 
   observeEffect(command: ObserveEffectCommand): Promise<EffectRecord> {
-    return this.enqueue(async () => {
+    const result = this.enqueue(async () => {
       const at = asTimestamp(this.now, command.at);
       return this.connection.db
         .transaction()
@@ -509,6 +578,10 @@ export class WorkflowCoordinator {
           ),
         );
     });
+    return result.then((effect) => {
+      this.notifyEffectSettlement(effect);
+      return effect;
+    });
   }
 
   /** Alias emphasizing that observations are commands, never direct writes. */
@@ -517,7 +590,7 @@ export class WorkflowCoordinator {
   }
 
   cancelEffect(command: CancelEffectCommand): Promise<EffectRecord> {
-    return this.enqueue(async () => {
+    const result = this.enqueue(async () => {
       const at = asTimestamp(this.now, command.at);
       return this.connection.db.transaction().execute(async (tx) => {
         if (command.expectedRevision !== undefined) {
@@ -536,6 +609,10 @@ export class WorkflowCoordinator {
           at,
         );
       });
+    });
+    return result.then((effect) => {
+      this.notifyEffectSettlement(effect);
+      return effect;
     });
   }
 
@@ -602,45 +679,49 @@ export class WorkflowCoordinator {
   }
 
   private async markOwnedEffectsAmbiguous(evidence: string): Promise<void> {
-    await this.connection.db.transaction().execute(async (tx) => {
-      const changed = await createEffectMutationRepository(
-        tx,
-      ).markOwnedInFlightAmbiguous(this.ownerToken, evidence, this.now());
-      const runIds = new Set(changed.map((effect) => effect.runId));
-      for (const runId of runIds) {
-        const run = await readRun(tx, runId);
-        const nextRevision = run.revision + 1;
-        const at = this.now();
-        const updated = await tx
-          .updateTable("runs")
-          .set({ revision: nextRevision, updated_at: at })
-          .where("id", "=", runId)
-          .where("revision", "=", run.revision)
-          .executeTakeFirst();
-        if (Number(updated.numUpdatedRows) !== 1) continue;
-        const previous = await tx
-          .selectFrom("events")
-          .select("sequence")
-          .where("run_id", "=", runId)
-          .orderBy("sequence", "desc")
-          .limit(1)
-          .executeTakeFirst();
-        await tx
-          .insertInto("events")
-          .values({
-            id: randomUUID(),
-            run_id: runId,
-            sequence: (previous?.sequence ?? 0) + 1,
-            run_revision: nextRevision,
-            kind: "effect_ambiguous",
-            summary: evidence,
-            details_json: null,
-            log_reference: null,
-            created_at: at,
-          })
-          .execute();
-      }
-    });
+    const changed = await this.connection.db
+      .transaction()
+      .execute(async (tx) => {
+        const changed = await createEffectMutationRepository(
+          tx,
+        ).markOwnedInFlightAmbiguous(this.ownerToken, evidence, this.now());
+        const runIds = new Set(changed.map((effect) => effect.runId));
+        for (const runId of runIds) {
+          const run = await readRun(tx, runId);
+          const nextRevision = run.revision + 1;
+          const at = this.now();
+          const updated = await tx
+            .updateTable("runs")
+            .set({ revision: nextRevision, updated_at: at })
+            .where("id", "=", runId)
+            .where("revision", "=", run.revision)
+            .executeTakeFirst();
+          if (Number(updated.numUpdatedRows) !== 1) continue;
+          const previous = await tx
+            .selectFrom("events")
+            .select("sequence")
+            .where("run_id", "=", runId)
+            .orderBy("sequence", "desc")
+            .limit(1)
+            .executeTakeFirst();
+          await tx
+            .insertInto("events")
+            .values({
+              id: randomUUID(),
+              run_id: runId,
+              sequence: (previous?.sequence ?? 0) + 1,
+              run_revision: nextRevision,
+              kind: "effect_ambiguous",
+              summary: evidence,
+              details_json: null,
+              log_reference: null,
+              created_at: at,
+            })
+            .execute();
+        }
+        return changed;
+      });
+    for (const effect of changed) this.notifyEffectSettlement(effect);
   }
 
   private enqueueObservation(
@@ -914,6 +995,22 @@ export class WorkflowCoordinator {
         evidence: `Effect ${effect.key} observation failed: ${error instanceof Error ? error.message : String(error)}`,
       });
     }
+  }
+
+  private notifyEffectSettlement(effect: EffectRecord): void {
+    if (
+      !new Set<EffectStatus>([
+        "confirmed",
+        "failed",
+        "cancelled",
+        "ambiguous",
+      ]).has(effect.status)
+    )
+      return;
+    const waiters = this.effectSettlementWaiters.get(effect.key);
+    if (waiters === undefined) return;
+    this.effectSettlementWaiters.delete(effect.key);
+    for (const waiter of waiters) waiter(effect);
   }
 
   private enqueue<T>(command: () => Promise<T>): Promise<T> {

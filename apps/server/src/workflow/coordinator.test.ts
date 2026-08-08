@@ -527,6 +527,36 @@ describe("workflow coordinator", () => {
     await coordinator.close();
   });
 
+  test("notifies an effect settlement waiter when cancellation commits", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    await coordinator.createClaim(claimInput());
+    await coordinator.createEffectIntent({
+      runId: "run-1",
+      dispatch: false,
+      key: "run:run-1:cancel-waiter",
+      kind: "project_todo",
+      intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+    });
+
+    const settled = coordinator.waitForEffectSettlement(
+      "run:run-1:cancel-waiter",
+      100,
+    );
+    await coordinator.cancelEffect({
+      effectKey: "run:run-1:cancel-waiter",
+      expectedRevision: 1,
+      reason: "Canceled before dispatch.",
+      at: "2026-08-08T19:01:00.000Z",
+    });
+
+    await expect(settled).resolves.toMatchObject({
+      key: "run:run-1:cancel-waiter",
+      status: "cancelled",
+    });
+    await coordinator.close();
+  });
+
   test("runs an ambiguous-effect observer outside the transaction and re-enters FIFO", async () => {
     const connection = await createDatabase();
     const first = new WorkflowCoordinator({
@@ -575,6 +605,37 @@ describe("workflow coordinator", () => {
       ).status,
     ).toBe("confirmed");
     await second.close();
+  });
+
+  test("notifies a concurrent waiter when close marks owned work ambiguous", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({
+      connection,
+      ownerToken: "coord-close-waiter",
+    });
+    await coordinator.createClaim(claimInput());
+    await coordinator.createEffectIntent({
+      runId: "run-1",
+      dispatch: false,
+      key: "run:run-1:close-waiter",
+      kind: "project_todo",
+      intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+    });
+    await coordinator.beginEffect({
+      effectKey: "run:run-1:close-waiter",
+      at: "2026-08-08T19:01:00.000Z",
+    });
+
+    const settled = coordinator.waitForEffectSettlement(
+      "run:run-1:close-waiter",
+      100,
+    );
+    await coordinator.close();
+
+    await expect(settled).resolves.toMatchObject({
+      key: "run:run-1:close-waiter",
+      status: "ambiguous",
+    });
   });
 
   test("does not invoke the observer for pending or in-flight effects", async () => {
