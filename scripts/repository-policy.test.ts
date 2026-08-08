@@ -62,7 +62,7 @@ describe("repository policy", () => {
       packages: ["apps/*", "packages/*"],
       minimumReleaseAge: 1440,
       minimumReleaseAgeStrict: true,
-      allowBuilds: { esbuild: true },
+      allowBuilds: { "better-sqlite3": true, esbuild: true },
     });
   });
 

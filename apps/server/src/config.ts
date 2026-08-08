@@ -1,5 +1,13 @@
-import { readFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
+import { chmod, lstat, mkdir, readFile, realpath } from "node:fs/promises";
+import {
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+  win32,
+} from "node:path";
 
 import {
   type Configuration,
@@ -10,6 +18,20 @@ import { parse } from "yaml";
 
 export class WorkspaceRootError extends Error {
   override name = "WorkspaceRootError";
+}
+
+export interface LocalPaths {
+  repositoryRoot: string;
+  dataRoot: string;
+  workspaceRoot: string;
+  databasePath: string;
+  lockPath: string;
+  logsRoot: string;
+}
+
+export interface LoadedRuntimeConfiguration {
+  configuration: Configuration;
+  paths: LocalPaths;
 }
 
 export function resolveConfigurationPath(repositoryRoot: string): string {
@@ -47,6 +69,150 @@ export function resolveWorkspaceRoot(
     );
   }
   return candidate;
+}
+
+function assertContained(repositoryRoot: string, candidate: string): void {
+  const descendant = relative(repositoryRoot, candidate);
+  if (
+    descendant === "" ||
+    descendant === ".." ||
+    descendant.startsWith(`..${sep}`) ||
+    isAbsolute(descendant)
+  ) {
+    throw new WorkspaceRootError(
+      "workspace root must be a relative descendant",
+    );
+  }
+}
+
+function assertPrivateDirectory(path: string, mode: number, uid: number): void {
+  if (typeof process.getuid !== "function") return;
+  if (uid !== process.getuid() || (mode & 0o077) !== 0) {
+    throw new WorkspaceRootError(
+      `workspace storage directory is not private: ${path}`,
+    );
+  }
+}
+
+function assertSafeRepositoryRoot(
+  path: string,
+  isDirectory: boolean,
+  mode: number,
+  uid: number,
+): void {
+  if (!isDirectory) {
+    throw new WorkspaceRootError("repository root must be a directory");
+  }
+  if (
+    typeof process.getuid === "function" &&
+    (uid !== process.getuid() || (mode & 0o022) !== 0)
+  ) {
+    throw new WorkspaceRootError(`repository root is not safe: ${path}`);
+  }
+}
+
+export async function deriveLocalPaths(
+  repositoryRoot: string,
+  configuredWorkspaceRoot: string,
+): Promise<LocalPaths> {
+  // Validate the supplied spelling before resolving physical paths.
+  resolveWorkspaceRoot(repositoryRoot, configuredWorkspaceRoot);
+
+  const canonicalRepositoryRoot = await realpath(repositoryRoot);
+  const repositoryMetadata = await lstat(canonicalRepositoryRoot);
+  assertSafeRepositoryRoot(
+    canonicalRepositoryRoot,
+    repositoryMetadata.isDirectory(),
+    repositoryMetadata.mode,
+    repositoryMetadata.uid,
+  );
+  const workspaceRoot = resolveWorkspaceRoot(
+    canonicalRepositoryRoot,
+    configuredWorkspaceRoot,
+  );
+  assertContained(canonicalRepositoryRoot, workspaceRoot);
+
+  const segments = relative(canonicalRepositoryRoot, workspaceRoot).split(sep);
+  if (segments.length < 2) {
+    throw new WorkspaceRootError(
+      "workspace root must have at least two path segments",
+    );
+  }
+
+  const dataRoot = dirname(workspaceRoot);
+  let component = canonicalRepositoryRoot;
+  for (const segment of segments) {
+    component = join(component, segment);
+    try {
+      const metadata = await lstat(component);
+      if (metadata.isSymbolicLink()) {
+        throw new WorkspaceRootError(
+          "workspace storage path must not contain symbolic links",
+        );
+      }
+      if (!metadata.isDirectory()) {
+        throw new WorkspaceRootError(
+          "workspace storage path components must be directories",
+        );
+      }
+      assertPrivateDirectory(component, metadata.mode, metadata.uid);
+      assertContained(canonicalRepositoryRoot, await realpath(component));
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw cause;
+    }
+  }
+
+  return {
+    repositoryRoot: canonicalRepositoryRoot,
+    dataRoot,
+    workspaceRoot,
+    databasePath: join(dataRoot, "wheelsparrow.sqlite3"),
+    lockPath: join(dataRoot, "wheelsparrow.lock"),
+    logsRoot: join(dataRoot, "logs"),
+  };
+}
+
+async function validateStorageDirectory(path: string): Promise<boolean> {
+  try {
+    const metadata = await lstat(path);
+    if (metadata.isSymbolicLink()) {
+      throw new WorkspaceRootError(
+        "workspace storage path must not contain symbolic links",
+      );
+    }
+    if (!metadata.isDirectory()) {
+      throw new WorkspaceRootError(
+        "workspace storage path components must be directories",
+      );
+    }
+    assertPrivateDirectory(path, metadata.mode, metadata.uid);
+    return true;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw cause;
+  }
+}
+
+export async function prepareLocalPaths(
+  paths: LocalPaths,
+): Promise<LocalPaths> {
+  const directories = [paths.dataRoot, paths.workspaceRoot, paths.logsRoot];
+
+  // Validate every existing target before this function creates anything. This
+  // keeps an unsafe later target from causing an earlier missing one to appear.
+  const existing = await Promise.all(
+    directories.map((directory) => validateStorageDirectory(directory)),
+  );
+  for (const [index, directory] of directories.entries()) {
+    if (existing[index] === false) {
+      await mkdir(directory, { mode: 0o700, recursive: true });
+      if (process.platform !== "win32") await chmod(directory, 0o700);
+    }
+  }
+
+  await Promise.all(directories.map(validateStorageDirectory));
+  return paths;
 }
 
 function sanitizedError(cause: unknown): Error {
@@ -124,4 +290,15 @@ export async function loadConfiguration(
       { cause: sanitizedCause },
     );
   }
+}
+
+export async function loadRuntimeConfiguration(
+  repositoryRoot: string,
+): Promise<LoadedRuntimeConfiguration> {
+  const configuration = await loadConfiguration(repositoryRoot);
+  const paths = await deriveLocalPaths(
+    repositoryRoot,
+    configuration.workspace_root,
+  );
+  return { configuration, paths };
 }

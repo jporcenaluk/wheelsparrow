@@ -14,12 +14,16 @@
     "@fastify/static": "10.1.2",
     "@fastify/type-provider-typebox": "6.1.0",
     "@wheelsparrow/contracts": "workspace:*",
+    "better-sqlite3": "13.0.3",
     "fastify": "5.11.2",
+    "fs-native-extensions": "1.5.0",
+    "kysely": "0.29.4",
     "pino": "10.3.1",
     "typebox": "1.3.10",
     "yaml": "2.9.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
     "tsx": "4.23.8"
   }
 }
