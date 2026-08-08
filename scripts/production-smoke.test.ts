@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertAssetResponse,
+  assertCanonicalSchemaLedger,
+  assertSafeFixturePath,
   extractBuiltAssets,
+  resolveBuiltMain,
+  resolveFixturePrefix,
 } from "./production-smoke.mjs";
 
 const origin = new URL("http://127.0.0.1:43123/");
@@ -16,6 +20,62 @@ function response(contentType: string, body: string): Response {
 }
 
 describe("production smoke built UI verification", () => {
+  it("locates the built server relative to the smoke script, not the caller CWD", () => {
+    expect(resolveBuiltMain()).toMatch(/apps\/server\/dist\/main\.js$/);
+  });
+
+  it("places fixtures directly under the OS temp root with a fixed prefix", () => {
+    expect(resolveFixturePrefix("/var/tmp")).toBe(
+      "/var/tmp/wheelsparrow-production-smoke-",
+    );
+    expect(() =>
+      assertSafeFixturePath(
+        "/var/tmp",
+        "/var/tmp/wheelsparrow-production-smoke-a1b2c3",
+      ),
+    ).not.toThrow();
+    for (const unsafe of [
+      "",
+      "/var/tmp",
+      "/var/tmp/other-a1b2c3",
+      "/var/tmp/wheelsparrow-production-smoke-a1b2c3/nested",
+      "/var/wheelsparrow-production-smoke-a1b2c3",
+    ]) {
+      expect(() => assertSafeFixturePath("/var/tmp", unsafe)).toThrow(
+        "unsafe production smoke fixture",
+      );
+    }
+  });
+
+  it("requires canonical initial migration while allowing later migrations", () => {
+    expect(() =>
+      assertCanonicalSchemaLedger(
+        [
+          { id: 1, name: "001_initial.sql", checksum: "a".repeat(64) },
+          { id: 2, name: "002_later.sql", checksum: "b".repeat(64) },
+        ],
+        ["approvals", "events", "findings", "runs", "side_effects", "steps"],
+        "a".repeat(64),
+      ),
+    ).not.toThrow();
+
+    expect(() =>
+      assertCanonicalSchemaLedger(
+        [{ id: 2, name: "002_later.sql", checksum: "b".repeat(64) }],
+        ["runs"],
+        "a".repeat(64),
+      ),
+    ).toThrow("canonical migration ledger");
+
+    expect(() =>
+      assertCanonicalSchemaLedger(
+        [{ id: 1, name: "001_initial.sql", checksum: "wrong" }],
+        ["runs"],
+        "a".repeat(64),
+      ),
+    ).toThrow("canonical migration ledger");
+  });
+
   it("requires local JavaScript and stylesheet assets from the built HTML", () => {
     expect(() =>
       extractBuiltAssets(
