@@ -378,6 +378,139 @@ describe("workflow coordinator", () => {
     await coordinator.close();
   });
 
+  test("quarantines a queued confirmation before it can prepare the run", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const key = "run:run-1:queued-confirmation";
+    await coordinator.createClaim(claimInput());
+    await coordinator.createEffectIntent({
+      runId: "run-1",
+      dispatch: false,
+      key,
+      kind: "project_todo",
+      intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+    });
+    await coordinator.beginEffect({ effectKey: key });
+
+    const confirmation = coordinator.observeEffect({
+      runId: "run-1",
+      expectedRevision: 1,
+      effectKey: key,
+      outcome: "confirmed",
+      trigger: "todo_observed",
+      evidence: "Queued confirmation must be quarantined.",
+    });
+    const abandonment = coordinator.abandonEffect({
+      runId: "run-1",
+      expectedRevision: 1,
+      effectKey: key,
+      outcome: "ambiguous",
+      trigger: null,
+      evidence: "Quarantined before queued confirmation.",
+    });
+
+    await coordinator.waitForIdle();
+    await expect(abandonment).resolves.toMatchObject({ status: "ambiguous" });
+    await expect(confirmation).rejects.toThrow();
+    expect(
+      connection.native
+        .prepare("SELECT status FROM side_effects WHERE key = ?")
+        .get(key),
+    ).toEqual({ status: "ambiguous" });
+    expect(await readRun(connection.db, "run-1")).toMatchObject({
+      state: "claiming",
+      revision: 1,
+    });
+    await coordinator.close();
+  });
+
+  test("does not drop a callback when a stale quarantine request fails", async () => {
+    const connection = await createDatabase();
+    let complete: ((result: unknown) => void) | undefined;
+    const coordinator = new WorkflowCoordinator({
+      connection,
+      dispatcher: (_, callback) => {
+        complete = callback;
+      },
+    });
+    const key = "run:run-1:stale-quarantine";
+    await coordinator.createClaim(claimInput());
+    await coordinator.createEffectIntent({
+      runId: "run-1",
+      dispatch: false,
+      key,
+      kind: "project_todo",
+      intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+    });
+    await coordinator.beginEffect({ effectKey: key });
+
+    const abandonment = coordinator.abandonEffect({
+      runId: "run-1",
+      expectedRevision: 0,
+      effectKey: key,
+      outcome: "ambiguous",
+      trigger: null,
+      evidence: "Stale quarantine request.",
+    });
+    complete?.({
+      outcome: "confirmed",
+      trigger: "todo_observed",
+      evidence: "Valid callback after stale quarantine request.",
+    });
+
+    await expect(abandonment).rejects.toThrow();
+    await coordinator.waitForIdle();
+    expect(
+      connection.native
+        .prepare("SELECT status FROM side_effects WHERE key = ?")
+        .get(key),
+    ).toEqual({ status: "confirmed" });
+    expect(await readRun(connection.db, "run-1")).toMatchObject({
+      state: "preparing",
+      revision: 2,
+    });
+    await coordinator.close();
+  });
+
+  test("allows ordinary ambiguous evidence with the quarantine prefix to confirm", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const key = "run:run-1:ordinary-ambiguous";
+    await coordinator.createClaim(claimInput());
+    await coordinator.createEffectIntent({
+      runId: "run-1",
+      dispatch: false,
+      key,
+      kind: "project_todo",
+      intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+    });
+    await coordinator.beginEffect({ effectKey: key });
+
+    await coordinator.observeEffect({
+      runId: "run-1",
+      expectedRevision: 1,
+      effectKey: key,
+      outcome: "ambiguous",
+      trigger: null,
+      evidence: "Quarantined effect: ordinary ambiguity, not a quarantine.",
+    });
+    await expect(
+      coordinator.observeEffect({
+        runId: "run-1",
+        expectedRevision: 1,
+        effectKey: key,
+        outcome: "confirmed",
+        trigger: "todo_observed",
+        evidence: "Ordinary ambiguity was later confirmed.",
+      }),
+    ).resolves.toMatchObject({ status: "confirmed" });
+    expect(await readRun(connection.db, "run-1")).toMatchObject({
+      state: "preparing",
+      revision: 2,
+    });
+    await coordinator.close();
+  });
+
   test("rejects a stale pending effect without dispatching it", async () => {
     const connection = await createDatabase();
     const dispatch = vi.fn();
