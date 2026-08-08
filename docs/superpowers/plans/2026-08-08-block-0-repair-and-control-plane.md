@@ -59,11 +59,12 @@ or bounded code-write scopes and report evidence; they do not edit `MVP_IMPLEMEN
 `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`. Do not create a second backlog, workpad, queue, or agent
 ledger.
 
-Use a fresh Luna-designated subagent at xhigh reasoning for each bounded code sub-block and for its
-independent specification and quality reviews. Give each implementer one explicit writable scope,
-full task text, acceptance criteria, and verification commands. The root inspects and integrates the
-result before any commit. Mechanical document inventory may use lower effort, but root must verify
-every returned row; agents may propose matrix or ledger text but must not write either authority.
+Use the global `gpt-5.6-terra` default with `medium` reasoning for each bounded code sub-block and its
+independent specification and quality reviews. Do not override that routing without a later explicit
+user instruction. Give each implementer one explicit writable scope, full task text, acceptance
+criteria, and verification commands. The root inspects and integrates the result before any commit.
+Root must verify every returned row; agents may propose matrix or ledger text but must not write
+either authority.
 
 Before every durable checkpoint, root checks off every completed step in this plan, updates the
 ledger resume point and exact evidence, verifies the diff, and includes the plan plus ledger in the
@@ -996,7 +997,7 @@ docs(delivery): record Block 0 repair evidence
 - Modify: `MVP_IMPLEMENTATION_LEDGER.md`
 - Modify only for exact evidence/status: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`
 
-- [ ] **Step 1: Run fresh specification-compliance review**
+- [x] **Step 1: Run fresh specification-compliance review**
 
 Dispatch a fresh high-capability, read-only reviewer with:
 
@@ -1018,14 +1019,14 @@ The reviewer must verify line by line that:
 Expected report: `SPEC COMPLIANT`, or exact findings with file and line references. Do not begin
 quality review while a specification finding remains open.
 
-- [ ] **Step 2: Repair accepted specification findings with TDD**
+- [x] **Step 2: Repair accepted specification findings with TDD**
 
 Root triages every finding. For an accepted behavior defect, first add a focused regression test and
 observe the expected RED failure, then make the smallest production change, run GREEN, and rerun the
 focused/full gates. Documentation-only inaccuracies receive direct evidence-backed corrections.
 Return the same reviewer to each repair until it reports `SPEC COMPLIANT`.
 
-- [ ] **Step 3: Run fresh code and document quality review**
+- [x] **Step 3: Run fresh code and document quality review**
 
 Only after specification approval, dispatch:
 
@@ -1038,7 +1039,7 @@ Root validates every finding against the files. Accepted code findings follow RE
 accepted document findings are corrected with their validating command. Re-review until no Critical
 or Important findings remain and every Minor finding is fixed or explicitly rejected with rationale.
 
-- [ ] **Step 4: Run final local proof at the reviewed head**
+- [x] **Step 4: Run final local proof at the reviewed head**
 
 Run:
 
@@ -1136,19 +1137,19 @@ record a live workflow change before accepting replacement evidence.
 This slice does not require an external target staging deployment. Record external staging/live-smoke
 as deferred only where the matrix explicitly names the absent target or authority.
 
-## Post-merge handoff to the next one-PR plan
+## Post-merge handoff to the next product-slice plan
 
-This plan ends at the repair/control PR's exact post-merge evidence boundary. It must not create or
-drive a second PR. Root carries the observed PR, review, merge, `CI/test`, `Main
-artifact/build-artifact`, and `wheelsparrow-<exact-merge-sha>` facts into a new, independently reviewed
-`docs/superpowers/plans/2026-08-08-row-1-evidence-closeout.md` plan on a fresh branch from that merge.
-The handoff distinguishes archive file `wheelsparrow-<exact-merge-sha>.tar.gz` from uploaded artifact
+This plan ends when the repair/control PR's exact post-merge `CI/test` and `Main
+artifact/build-artifact` evidence is verified. At that point merge-train row 1 is complete; do not
+create a documentation-only closeout PR.
+
+Root creates the next product-slice branch from the verified merge SHA. Its first checkpoint records
+row 1's observed PR, review, merge, workflow, and `wheelsparrow-<exact-merge-sha>` facts in the
+ledger/matrix and adds the independently reviewed implementation plan for merge-train row 2. Push
+that checkpoint before implementation so the active cold-start state is durable remotely. The row 2
+product implementation and carried-forward row 1 evidence then ship together in row 2's one PR. The
+handoff distinguishes archive file `wheelsparrow-<exact-merge-sha>.tar.gz` from uploaded artifact
 `wheelsparrow-<exact-merge-sha>`.
-
-That next plan owns one documentation closeout PR. It records row-1 evidence in the ledger/matrix,
-preserves the approved Block 1 design/audit quarry, and adds the separate Block 1A implementation plan
-without implementing Block 1A. Only after the closeout PR is checked, reviewed, merged, and verified
-does execution move to Block 1A. This handoff is a boundary declaration, not a second PR plan.
 
 ## Current PR acceptance
 
@@ -1162,8 +1163,7 @@ This repair/control PR is complete only when all of these are true:
 - fresh specification and quality reviewers close all findings;
 - the exact PR head passes the repository's required checks and review rules;
 - protected `main`, the post-merge workflow, and artifact evidence share the exact merge SHA;
-- exact post-merge facts are captured for the separate closeout plan; and
-- the current plan stops without trying to execute that second PR or Block 1A.
+- the current plan stops without starting merge-train row 2 implementation.
 
-Merge-train row 1 remains `in_progress` until the separate closeout PR commits its exact evidence to
-protected `main`. The programme goal remains active throughout.
+Merge-train row 1 is complete when Step 5's exact protected-main evidence passes. The programme goal
+remains active and continues on the next product-slice branch.

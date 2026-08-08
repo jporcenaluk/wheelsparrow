@@ -28,7 +28,7 @@ and marks the ticket done only when the evidence matches.
   `docs/superpowers/specs/2026-08-08-mvp-delivery-control-design.md`.
 - Complete traceability matrix: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`, covering the normative
   sources at `81271c278c47a96e2882888e20c577449c5f69b8`; content SHA-256
-  `812f47388a15b630f1bd1483bf08cfbaebb1ef656823cf2dd5be2f3229292080`; 341 rows
+  `b4b76b326663513f411f7f552f89ca65ad9358e54432cf61dae0ebd9219abbff`; 341 rows
   (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77).
 - PR #3 is a stale, broad reference quarry. It is not an implementation base.
 - The untracked files in the root checkout belong to an earlier broad implementation attempt. They
@@ -101,15 +101,15 @@ required product outcomes.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
 - Active plan: `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md`.
-- Current checkbox after this checkpoint: Task 7, Step 1, run fresh specification-compliance review.
-- Last verification at exact code checkpoint `5cd12d57027435506b5fb97fd8a47757cf55b875`:
-  the direct real process-group test passed 25/25; the complete preflight file passed 25/25; the
-  explicit single-worker repository suite passed 129/129; `make verify-agent`, `make build`,
-  `make smoke-production`, and diff hygiene passed. These subprocess-sensitive runs used the
-  unrestricted host because the managed sandbox is known to suppress inherited child output.
-- Next safe command: dispatch Task 7's fresh read-only specification-compliance reviewer with the
-  exact base `81271c278c47a96e2882888e20c577449c5f69b8`, current head, raw branch diff, approved designs,
-  plan, matrix, ledger, and Task 6 verification evidence.
+- Current checkbox after this checkpoint: Task 8, Step 1, reconcile publication state and push the
+  exact reviewed branch.
+- Last verification: fresh whole-branch specification review reports `SPEC COMPLIANT`; fresh
+  subprocess quality review reports `QUALITY APPROVED`; fresh traceability review reports
+  `TRACEABILITY APPROVED`. After accepted document corrections, unrestricted `make verify-agent`
+  passed 11 files and 129 tests, `make build` passed, production lifecycle smoke passed at
+  `http://127.0.0.1:36895`, the five-file Markdownlint gate passed, and diff hygiene passed.
+- Next safe command: run Task 8 Step 1's status, branch-log, branch-diff, and exact-head checks;
+  verify no open PR owns `fix/block-0-process-test-flake`, then push the reviewed branch.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
@@ -202,11 +202,13 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | PR #25 main artifact | [Main artifact run 31158319951](https://github.com/jporcenaluk/wheelsparrow/actions/runs/31158319951) job `build-artifact` completed successfully; artifact `wheelsparrow-81271c278c47a96e2882888e20c577449c5f69b8` ID `8986025122`, digest `sha256:aaaee69333851be4fb1794438ed86a8e82f1db62edf07bb2b2744495dfd328e9`, is unexpired and bound to that SHA |
 | 2026-08-08 | Delivery-control design | Approved design commit `7db4ee1` defines the ledger/matrix/one-plan control plane, merge train, recovery protocol, and agent hierarchy |
 | 2026-08-08 | Row 1 execution-plan review | Xhigh Luna, control-plane, and subprocess reviewers inspected the plan; accepted findings corrected source drift, trace IDs, TDD coverage, process wiring, checkpoint invariants, exact checks, and the one-PR boundary before bootstrap |
-| 2026-08-08 | Requirements matrix | Root integrated four bounded source inventories into 341 reviewed rows (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77) at source revision `81271c278c47a96e2882888e20c577449c5f69b8`; matrix SHA-256 `812f47388a15b630f1bd1483bf08cfbaebb1ef656823cf2dd5be2f3229292080`; final Terra/medium review found no open defect |
+| 2026-08-08 | Requirements matrix | At checkpoint `62b686c`, root integrated four bounded source inventories into 341 reviewed rows (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77) at source revision `81271c278c47a96e2882888e20c577449c5f69b8`; that checkpoint's matrix SHA-256 was `812f47388a15b630f1bd1483bf08cfbaebb1ef656823cf2dd5be2f3229292080`; final Terra/medium review found no open defect |
 | 2026-08-08 | Row 1 control-plane checkpoint | Connected GitHub reconfirmed merged PR #25, protected `main` `81271c278c47a96e2882888e20c577449c5f69b8`, successful jobs in runs `31158318354` and `31158319951`, unexpired exact-SHA artifact `8986025122`, and no open PR for `fix/block-0-process-test-flake`; Markdownlint and diff hygiene passed |
 | 2026-08-08 | Row 1 process-cleanup RED checkpoint | One bounded Terra/medium worker changed only `scripts/preflight.test.ts`; TypeScript and the pre-refactor API group-wiring characterization passed, while all three new helper contracts failed only at the expected missing-export assertion; root inspected the diff, reproduced the exact three failures, and confirmed diff hygiene |
 | 2026-08-08 | Row 1 process-cleanup GREEN checkpoint | The minimal helper extraction preserves timeout semantics while making POSIX process-group cleanup, Windows routing, and double-failure suppression directly testable; focused contracts, Biome, TypeScript, and diff hygiene passed; the unrestricted preflight file passed 25/25; fresh Terra/medium review found no defect and repeated the direct fixture 5/5 |
 | 2026-08-08 | Row 1 repeatability and full local gate | At exact code checkpoint `5cd12d57027435506b5fb97fd8a47757cf55b875`, the unrestricted host passed the real direct process-group test 25/25 and the complete preflight file 25/25; the explicit single-worker repository suite and canonical `make verify-agent` each passed 11 files and 129 tests; build and production lifecycle smoke passed at `http://127.0.0.1:39993`; diff hygiene passed |
+| 2026-08-08 | Row 1 final independent review | Fresh Terra/medium specification review reached `SPEC COMPLIANT`; fresh subprocess review reached `QUALITY APPROVED`; fresh traceability review reached `TRACEABILITY APPROVED` after correcting superseded model routing, current versus historical matrix hashes, one unbound evidence path, and the productless/circular closeout-PR boundary |
+| 2026-08-08 | Row 1 reviewed local proof | Unrestricted `make verify-agent` passed 11 files and 129 tests; build and production lifecycle smoke passed at `http://127.0.0.1:36895`; the five-file Markdownlint gate and diff hygiene passed at the reviewed working content |
 
 ## Open Decisions and Risks
 
