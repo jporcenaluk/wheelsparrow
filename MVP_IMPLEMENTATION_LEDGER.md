@@ -21,8 +21,9 @@ and marks the ticket done only when the evidence matches.
 
 ## Authority and Scope
 
-- Authoritative base: protected `main` at `64951a3edc3de50bdc8007becde965308c5d3040`,
-  live-verified on 2026-08-08.
+- Authoritative implementation base: Block 1A merge commit
+  `e6899f48ab2c6d5499eae4de16a96c8dd5ec6eca`, present as local `origin/main`; live protected-main
+  status was not re-queried in this worktree.
 - Approved product design: `SPEC.md`, `ARCHITECTURE.md`, `TECH_STACK.md`, and `CICD.md`; their
   content is unchanged from source revision `81271c278c47a96e2882888e20c577449c5f69b8` through the
   current protected-main SHA.
@@ -84,8 +85,8 @@ required product outcomes.
 | Order | Outcome | Depends on | Status | Worktree and branch | Plan | Pull request | Merge SHA |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Deterministic Block 0 process-cleanup repair and control-plane setup | PR #25 foundation | `merged` | `.worktrees/block0-flake`; `fix/block-0-process-test-flake` | `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md` | [#26](https://github.com/jporcenaluk/wheelsparrow/pull/26) | `64951a3edc3de50bdc8007becde965308c5d3040` |
-| 2 | SQLite storage, migrations, and single-process ownership | 1 | `review` | `.worktrees/block1a-storage`; `feat/block-1a-storage` | `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md` | — | — |
-| 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `pending` | — | — | — | — |
+| 2 | SQLite storage, migrations, and single-process ownership | 1 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md` | — | `e6899f48ab2c6d5499eae4de16a96c8dd5ec6eca` |
+| 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `review` | `.worktrees/block1b-state`; `feat/block-1b-coordinator` | `docs/superpowers/plans/2026-08-08-block-1b-coordinator.md` | — | — |
 | 4 | GitHub discovery and claim through a verified local candidate | 3 | `pending` | — | — | — | — |
 | 5 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 4 | `pending` | — | — | — | — |
 | 6 | Operator API and browser controls | 3 and stable read contract | `pending` | — | — | — | — |
@@ -94,24 +95,25 @@ required product outcomes.
 
 ## Current Resume Point
 
-- Authoritative remote `main`: `64951a3edc3de50bdc8007becde965308c5d3040`, live-verified through
-  the connected GitHub integration on 2026-08-08.
-- Active slice: merge-train row 2, Block 1A durable SQLite storage.
-- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block1a-storage`.
-- Branch: `feat/block-1a-storage`.
-- Observed HEAD before this ledger edit: `3c1463e8c68dd2e2043cb2a1a862ef6394ea76b5`.
+- Branch base: local `origin/main` and the Block 1A merge base both resolve to
+  `e6899f48ab2c6d5499eae4de16a96c8dd5ec6eca`; live protected-main status was not re-queried here.
+- Active slice: merge-train row 3, Block 1B durable workflow coordinator.
+- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block1b-state`.
+- Branch: `feat/block-1b-coordinator`.
+- Observed HEAD before this ledger edit: `e604a39f9de8b81026798cc82796a509d117b12d`.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
-- Active plan: `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md`.
-- Current checkbox after this checkpoint: Task 8, Step 4, commit and publish the exact reviewed branch.
-- Last verification: at exact executable head `3c1463e8c68dd2e2043cb2a1a862ef6394ea76b5`, unrestricted
+- Active plan: `docs/superpowers/plans/2026-08-08-block-1b-coordinator.md`.
+- Current checkbox after this checkpoint: Task 5, Step 2, independent requirements and adversarial
+  recovery/concurrency reviews before publication.
+- Last verification: at exact executable head `e604a39f9de8b81026798cc82796a509d117b12d`, unrestricted
   Node 24.18.0 `make verify-agent` passed formatting, Markdownlint, frozen install, all TypeScript
-  projects, and 15 test files / 264 tests; `make build`, `make smoke-production`, and diff hygiene
-  passed. A fresh reconstructed source bundle performed a frozen production-only install and passed
-  the extracted production smoke. The managed sandbox suppresses piped child stdout/stderr and rejects
-  loopback binds, so its empty-output and `EPERM` failures are not used as product evidence.
-- Next safe command: commit this ledger checkpoint, inspect the exact branch diff/status, push the
-  reviewed branch, and open a non-draft Block 1A pull request.
+  projects, and 19 test files / 410 tests; `make build`, `make smoke-production`, and diff hygiene
+  passed. The managed sandbox suppresses piped child stdout/stderr and rejects loopback binds, so its
+  empty-output and `EPERM` failures are not used as product evidence.
+- Publication state: Block 1B is pre-PR; no pull request, CI, approval, or merge evidence is recorded.
+- Next safe command: complete the independent reviews, inspect the exact branch diff/status, update the
+  requirements matrix and ledger, and publish a non-draft Block 1B pull request.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
@@ -237,6 +239,15 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | Row 2 final whole-branch review | Fresh Terra/medium requirements, quality, and security reviewers inspected the complete branch and current evidence. Accepted findings repaired stale matrix rows/hash, unsafe repository/storage permissions and cross-UID disclosure inside the supported stable path boundary, silent journal fallback, and overclaimed lock privacy. The final working content received `REQUIREMENTS APPROVED`, `QUALITY APPROVED`, and `SECURITY APPROVED`; CI-dependent native rows remain explicitly partial until exact-head GitHub Linux/macOS evidence exists. |
 | 2026-08-08 | M0 tracker reconciliation | [Issue #5](https://github.com/jporcenaluk/wheelsparrow/issues/5) was closed as completed with a comment binding its M0 acceptance criteria to merged PR #25 (`81271c278c47a96e2882888e20c577449c5f69b8`) and the subsequent deterministic repair/control-plane PR #26 (`64951a3edc3de50bdc8007becde965308c5d3040`). |
 | 2026-08-08 | Row 2 exact-head local and artifact gate | At `3c1463e8c68dd2e2043cb2a1a862ef6394ea76b5`, unrestricted Node 24.18.0 `make verify-agent` passed 15 files / 264 tests, `make build` and `make smoke-production` passed, and diff hygiene passed. A reconstructed exact-head source bundle then passed frozen production-only installation and extracted production smoke. |
+| 2026-08-08 | Row 3 implementation branch | Clean `.worktrees/block1b-state` / `feat/block-1b-coordinator` starts at the exact Block 1A merge base `e6899f48ab2c6d5499eae4de16a96c8dd5ec6eca`; the bounded plan is `docs/superpowers/plans/2026-08-08-block-1b-coordinator.md`. |
+| 2026-08-08 | B1 immutable workflow guardrails | Commit `8b9107f` adds the coordinator migration, scheduler controls, canonical-state/effect validation, singleton ownership indexes, append-only history triggers, and migration regression coverage. |
+| 2026-08-08 | B1 canonical state machine | Commit `813a30c` defines the complete twenty-state durable workflow vocabulary, exhaustive transition and effect-observation matrices, and malformed-boundary rejection tests. |
+| 2026-08-08 | B1 revision-safe workflow persistence | Commit `421a29b` adds transaction-scoped run, history, and scheduler repositories with exact-revision transitions, ownership/coding-slot constraints, rework epochs, repair budgets, rollback, and concurrent stale-write tests. |
+| 2026-08-08 | B1 durable effect ledger | Commit `dbe81dc` adds idempotent effect intents, lifecycle receipts, fingerprint checks, revision-safe observations, and recovery-state persistence. |
+| 2026-08-08 | B1 serialized coordinator | Commit `3b3fa59` adds FIFO command serialization, commit-before-dispatch effect execution, revision-checked callback observations, and shutdown ambiguity handling. |
+| 2026-08-08 | B1 restart reconciliation | Commit `9fa0ce0` classifies unresolved effects safely on restart, observes dispatched work without replaying it, awaits settlement, and fails closed when recovery adapters are unavailable. |
+| 2026-08-08 | B1 service lifecycle integration | Commit `e604a39` runs durable reconciliation after migration and before listener startup, and closes the coordinator before database resources during shutdown and failure cleanup. |
+| 2026-08-08 | Row 3 exact-head pre-PR whole gate | At `e604a39f9de8b81026798cc82796a509d117b12d`, unrestricted Node 24.18.0 `make verify-agent` passed formatting, Markdownlint, frozen install, all TypeScript projects, 19 test files / 410 tests, and diff hygiene; `make build` and `make smoke-production` passed. No PR, CI, approval, or merge evidence exists yet. |
 
 ## Open Decisions and Risks
 
