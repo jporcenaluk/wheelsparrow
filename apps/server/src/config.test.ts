@@ -1,9 +1,21 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { loadConfiguration, resolveConfigurationPath } from "./config.js";
+import {
+  deriveLocalPaths,
+  loadConfiguration,
+  resolveConfigurationPath,
+  WorkspaceRootError,
+} from "./config.js";
 
 const temporaryDirectories: string[] = [];
 const sentinelSecret = "SENTINEL_CONFIG_SECRET_7f31";
@@ -69,6 +81,105 @@ afterEach(async () => {
       .splice(0)
       .map((directory) => rm(directory, { recursive: true, force: true })),
   );
+});
+
+function expectedLocalPaths(repositoryRoot: string) {
+  const dataRoot = join(repositoryRoot, ".wheelsparrow");
+  return {
+    repositoryRoot,
+    dataRoot,
+    workspaceRoot: join(dataRoot, "workspaces"),
+    databasePath: join(dataRoot, "wheelsparrow.sqlite3"),
+    lockPath: join(dataRoot, "wheelsparrow.lock"),
+    logsRoot: join(dataRoot, "logs"),
+  };
+}
+
+function skipUnsupportedSymlinks(error: unknown, skip: () => never): void {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "EACCES" || code === "EPERM" || code === "ENOTSUP") skip();
+  throw error;
+}
+
+describe("deriveLocalPaths", () => {
+  test("derives the canonical repository-owned local storage layout", async () => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+
+    await expect(
+      deriveLocalPaths(repositoryRoot, ".wheelsparrow/workspaces"),
+    ).resolves.toEqual(expectedLocalPaths(repositoryRoot));
+  });
+
+  test("rejects a one-segment workspace root", async () => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+
+    await expect(
+      deriveLocalPaths(repositoryRoot, "workspaces"),
+    ).rejects.toThrow(WorkspaceRootError);
+  });
+
+  test("rejects an existing symbolic-link data root", async ({ skip }) => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+    const target = await mkdtemp(join(tmpdir(), "wheelsparrow-link-target-"));
+    temporaryDirectories.push(target);
+    try {
+      await symlink(target, join(repositoryRoot, ".wheelsparrow"));
+    } catch (error) {
+      skipUnsupportedSymlinks(error, skip);
+    }
+
+    await expect(
+      deriveLocalPaths(repositoryRoot, ".wheelsparrow/workspaces"),
+    ).rejects.toThrow(WorkspaceRootError);
+  });
+
+  test("rejects an existing symbolic-link workspace root", async ({ skip }) => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+    const dataRoot = join(repositoryRoot, ".wheelsparrow");
+    await mkdir(dataRoot);
+    const target = await mkdtemp(join(tmpdir(), "wheelsparrow-link-target-"));
+    temporaryDirectories.push(target);
+    try {
+      await symlink(target, join(dataRoot, "workspaces"));
+    } catch (error) {
+      skipUnsupportedSymlinks(error, skip);
+    }
+
+    await expect(
+      deriveLocalPaths(repositoryRoot, ".wheelsparrow/workspaces"),
+    ).rejects.toThrow(WorkspaceRootError);
+  });
+
+  test("permits missing storage descendants without creating them", async () => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(repositoryRoot);
+    const paths = expectedLocalPaths(repositoryRoot);
+
+    await expect(
+      deriveLocalPaths(repositoryRoot, ".wheelsparrow/workspaces"),
+    ).resolves.toEqual(paths);
+    await expect(access(paths.dataRoot)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test("canonicalizes a contained repository root", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "wheelsparrow-paths-"));
+    temporaryDirectories.push(parent);
+    const repositoryRoot = join(parent, "repository");
+    await mkdir(repositoryRoot);
+
+    await expect(
+      deriveLocalPaths(
+        join(parent, "nested", "..", "repository"),
+        ".wheelsparrow/workspaces",
+      ),
+    ).resolves.toEqual(expectedLocalPaths(resolve(repositoryRoot)));
+  });
 });
 
 describe("loadConfiguration", () => {
