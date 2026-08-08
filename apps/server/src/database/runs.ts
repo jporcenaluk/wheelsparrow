@@ -637,6 +637,23 @@ export async function readRun(
   return mapRun(await readRunRow(db, identifier(runId, "Run ID")));
 }
 
+/** Return project items with an owner that has not been durably released. */
+export async function listActiveProjectItemIds(
+  db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema>,
+): Promise<ReadonlySet<string>> {
+  const rows = await db
+    .selectFrom("runs")
+    .select("project_item_id")
+    .where("owner_token", "is not", null)
+    .where("ownership_released_at", "is", null)
+    .orderBy("project_item_id", "asc")
+    .execute();
+  return new Set(rows.map((row) => row.project_item_id));
+}
+
+/** Compatibility name for discovery callers that use ownership terminology. */
+export const listOwnedProjectItemIds = listActiveProjectItemIds;
+
 export async function listEvents(
   db: Kysely<DatabaseSchema> | Transaction<DatabaseSchema>,
   runId: string,
