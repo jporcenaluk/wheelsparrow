@@ -921,7 +921,7 @@ that SHA, and records the SHA plus results in its next explicit ledger/plan evid
 - Modify: `MVP_IMPLEMENTATION_LEDGER.md`
 - Update checkboxes: this plan
 
-- [ ] **Step 1: Repeat the direct regression test 25 times**
+- [x] **Step 1: Repeat the direct regression test 25 times**
 
 Run on a POSIX host outside a managed sandbox that suppresses detached-child I/O:
 
@@ -936,7 +936,7 @@ Expected: the exact toolchain check passes, followed by 25 consecutive test pass
 and descendant terminated on every run. Record the host context, command, count, exact HEAD, and
 result.
 
-- [ ] **Step 2: Repeat the whole focused file 25 times**
+- [x] **Step 2: Repeat the whole focused file 25 times**
 
 Run:
 
@@ -948,7 +948,7 @@ done
 
 Expected: 25 consecutive file-level passes and no fixture readiness failure.
 
-- [ ] **Step 3: Run the full repository gates**
+- [x] **Step 3: Run the full repository gates**
 
 Run:
 
@@ -964,7 +964,7 @@ Expected: the explicit single-worker full suite, exact toolchain verification, f
 type check, the normal full test suite, build, production lifecycle smoke, and diff hygiene all pass
 at the same HEAD.
 
-- [ ] **Step 4: Update direct matrix evidence and the ledger**
+- [x] **Step 4: Update direct matrix evidence and the ledger**
 
 Update the process-cleanup requirement row or rows with the exact repair SHA and commands. Keep
 status `partial` if independent review, PR CI, protected-main, or artifact proof is still required.

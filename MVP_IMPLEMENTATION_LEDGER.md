@@ -101,14 +101,15 @@ required product outcomes.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
 - Active plan: `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md`.
-- Current checkbox after this checkpoint: Task 6, Step 1, repeat the direct regression test 25 times.
-- Last verification: the direct process-group test, API wiring, Windows routing, and double-cleanup
-  failure contracts pass; Biome, TypeScript, and diff hygiene pass; the unrestricted full preflight
-  file passes 25/25. A fresh Terra/medium reviewer found no defect and independently repeated the
-  real detached leader/descendant test five times successfully.
-- Next safe command: outside the managed sandbox, repeat
-  `mise exec node@24.18.0 -- corepack pnpm vitest run scripts/preflight.test.ts -t "terminates a ready detached process group" --pool=threads --maxWorkers=1`
-  25 times, then continue Task 6's full local gate.
+- Current checkbox after this checkpoint: Task 7, Step 1, run fresh specification-compliance review.
+- Last verification at exact code checkpoint `5cd12d57027435506b5fb97fd8a47757cf55b875`:
+  the direct real process-group test passed 25/25; the complete preflight file passed 25/25; the
+  explicit single-worker repository suite passed 129/129; `make verify-agent`, `make build`,
+  `make smoke-production`, and diff hygiene passed. These subprocess-sensitive runs used the
+  unrestricted host because the managed sandbox is known to suppress inherited child output.
+- Next safe command: dispatch Task 7's fresh read-only specification-compliance reviewer with the
+  exact base `81271c278c47a96e2882888e20c577449c5f69b8`, current head, raw branch diff, approved designs,
+  plan, matrix, ledger, and Task 6 verification evidence.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
@@ -205,6 +206,7 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | Row 1 control-plane checkpoint | Connected GitHub reconfirmed merged PR #25, protected `main` `81271c278c47a96e2882888e20c577449c5f69b8`, successful jobs in runs `31158318354` and `31158319951`, unexpired exact-SHA artifact `8986025122`, and no open PR for `fix/block-0-process-test-flake`; Markdownlint and diff hygiene passed |
 | 2026-08-08 | Row 1 process-cleanup RED checkpoint | One bounded Terra/medium worker changed only `scripts/preflight.test.ts`; TypeScript and the pre-refactor API group-wiring characterization passed, while all three new helper contracts failed only at the expected missing-export assertion; root inspected the diff, reproduced the exact three failures, and confirmed diff hygiene |
 | 2026-08-08 | Row 1 process-cleanup GREEN checkpoint | The minimal helper extraction preserves timeout semantics while making POSIX process-group cleanup, Windows routing, and double-failure suppression directly testable; focused contracts, Biome, TypeScript, and diff hygiene passed; the unrestricted preflight file passed 25/25; fresh Terra/medium review found no defect and repeated the direct fixture 5/5 |
+| 2026-08-08 | Row 1 repeatability and full local gate | At exact code checkpoint `5cd12d57027435506b5fb97fd8a47757cf55b875`, the unrestricted host passed the real direct process-group test 25/25 and the complete preflight file 25/25; the explicit single-worker repository suite and canonical `make verify-agent` each passed 11 files and 129 tests; build and production lifecycle smoke passed at `http://127.0.0.1:39993`; diff hygiene passed |
 
 ## Open Decisions and Risks
 
