@@ -49,15 +49,17 @@ describe("SQLite persistence", () => {
 
     const initialDatabase = openDatabase(path);
     initialDatabase.exec("CREATE TABLE entries (value TEXT NOT NULL)");
-    initialDatabase.prepare("INSERT INTO entries (value) VALUES (?)").run("saved");
+    initialDatabase
+      .prepare("INSERT INTO entries (value) VALUES (?)")
+      .run("saved");
     closeDatabase(initialDatabase);
 
     const reopenedDatabase = openDatabase(path);
 
     expect(
-      reopenedDatabase
-        .prepare("SELECT value FROM entries")
-        .get() as { value: string },
+      reopenedDatabase.prepare("SELECT value FROM entries").get() as {
+        value: string;
+      },
     ).toEqual({ value: "saved" });
   });
 });
