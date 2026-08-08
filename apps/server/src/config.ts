@@ -87,10 +87,27 @@ function assertContained(repositoryRoot: string, candidate: string): void {
 
 function assertPrivateDirectory(path: string, mode: number, uid: number): void {
   if (typeof process.getuid !== "function") return;
-  if (uid !== process.getuid() || (mode & 0o022) !== 0) {
+  if (uid !== process.getuid() || (mode & 0o077) !== 0) {
     throw new WorkspaceRootError(
       `workspace storage directory is not private: ${path}`,
     );
+  }
+}
+
+function assertSafeRepositoryRoot(
+  path: string,
+  isDirectory: boolean,
+  mode: number,
+  uid: number,
+): void {
+  if (!isDirectory) {
+    throw new WorkspaceRootError("repository root must be a directory");
+  }
+  if (
+    typeof process.getuid === "function" &&
+    (uid !== process.getuid() || (mode & 0o022) !== 0)
+  ) {
+    throw new WorkspaceRootError(`repository root is not safe: ${path}`);
   }
 }
 
@@ -102,6 +119,13 @@ export async function deriveLocalPaths(
   resolveWorkspaceRoot(repositoryRoot, configuredWorkspaceRoot);
 
   const canonicalRepositoryRoot = await realpath(repositoryRoot);
+  const repositoryMetadata = await lstat(canonicalRepositoryRoot);
+  assertSafeRepositoryRoot(
+    canonicalRepositoryRoot,
+    repositoryMetadata.isDirectory(),
+    repositoryMetadata.mode,
+    repositoryMetadata.uid,
+  );
   const workspaceRoot = resolveWorkspaceRoot(
     canonicalRepositoryRoot,
     configuredWorkspaceRoot,

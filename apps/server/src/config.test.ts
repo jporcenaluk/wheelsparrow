@@ -184,6 +184,45 @@ describe("deriveLocalPaths", () => {
     ).resolves.toEqual(expectedLocalPaths(resolve(repositoryRoot)));
   });
 
+  test.skipIf(process.platform === "win32")(
+    "accepts a repository root without group or world write access",
+    async () => {
+      const repositoryRoot = await mkdtemp(
+        join(tmpdir(), "wheelsparrow-paths-"),
+      );
+      temporaryDirectories.push(repositoryRoot);
+      await chmod(repositoryRoot, 0o755);
+      const paths = expectedLocalPaths(repositoryRoot);
+
+      await expect(
+        deriveLocalPaths(repositoryRoot, ".wheelsparrow/workspaces"),
+      ).resolves.toEqual(paths);
+      await expect(prepareLocalPaths(paths)).resolves.toEqual(paths);
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "rejects a group- or world-writable repository root before storage creation",
+    async () => {
+      for (const mode of [0o775, 0o777]) {
+        const repositoryRoot = await mkdtemp(
+          join(tmpdir(), "wheelsparrow-paths-"),
+        );
+        temporaryDirectories.push(repositoryRoot);
+        await chmod(repositoryRoot, mode);
+        const paths = expectedLocalPaths(repositoryRoot);
+
+        await expect(
+          deriveLocalPaths(repositoryRoot, ".wheelsparrow/workspaces"),
+        ).rejects.toThrow(WorkspaceRootError);
+        expect((await lstat(repositoryRoot)).mode & 0o777).toBe(mode);
+        await expect(access(paths.dataRoot)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      }
+    },
+  );
+
   test("canonicalizes a symbolic-link repository root alias", async ({
     skip,
   }) => {
@@ -450,6 +489,33 @@ describe("prepareLocalPaths", () => {
       await chmod(paths.logsRoot, 0o700);
 
       await expect(prepareLocalPaths(paths)).resolves.toEqual(paths);
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "refuses existing storage directories accessible to group or other before mutation",
+    async () => {
+      const repositoryRoot = await mkdtemp(
+        join(tmpdir(), "wheelsparrow-paths-"),
+      );
+      temporaryDirectories.push(repositoryRoot);
+      const paths = expectedLocalPaths(repositoryRoot);
+      await mkdir(paths.dataRoot, { mode: 0o700 });
+
+      for (const mode of [0o711, 0o750]) {
+        await chmod(paths.dataRoot, mode);
+
+        await expect(prepareLocalPaths(paths)).rejects.toThrow(
+          WorkspaceRootError,
+        );
+        expect((await lstat(paths.dataRoot)).mode & 0o777).toBe(mode);
+        await expect(access(paths.workspaceRoot)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(access(paths.logsRoot)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      }
     },
   );
 

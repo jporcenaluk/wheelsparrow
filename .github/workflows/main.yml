@@ -27,18 +27,33 @@ jobs:
           make smoke-production
       - name: Package exact revision
         run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          printf '%s\n' "$GITHUB_SHA" > REVISION
           ARTIFACT_PATH="wheelsparrow-${GITHUB_SHA}.tar.gz"
           tar -czf "$ARTIFACT_PATH" \
             .node-version \
+            REVISION \
+            Makefile \
             package.json \
             pnpm-lock.yaml \
             pnpm-workspace.yaml \
+            tsconfig.base.json \
             apps/server/package.json \
+            apps/server/src \
+            apps/server/tsconfig.json \
             apps/server/dist \
             apps/web/package.json \
+            apps/web/index.html \
+            apps/web/src \
+            apps/web/tsconfig.json \
+            apps/web/vite.config.ts \
             apps/web/dist \
             packages/contracts/package.json \
+            packages/contracts/prepare.mjs \
+            packages/contracts/src \
+            packages/contracts/tsconfig.json \
             packages/contracts/dist \
+            migrations \
             wheelsparrow.yaml \
             scripts/production-smoke.mjs
       - name: Verify packaged artifact
@@ -47,9 +62,9 @@ jobs:
           PACKAGE_DIR="$RUNNER_TEMP/wheelsparrow-${GITHUB_SHA}"
           mkdir -p "$PACKAGE_DIR"
           tar -xzf "$ARTIFACT_PATH" -C "$PACKAGE_DIR"
-          cd "$PACKAGE_DIR"
-          pnpm install --prod --frozen-lockfile --ignore-scripts
-          node scripts/production-smoke.mjs
+          test "$(cat "$PACKAGE_DIR/REVISION")" = "$GITHUB_SHA"
+          pnpm --dir "$PACKAGE_DIR" install --prod --frozen-lockfile
+          node "$PACKAGE_DIR/scripts/production-smoke.mjs"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheelsparrow-${{ github.sha }}

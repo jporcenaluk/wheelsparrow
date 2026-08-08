@@ -1,4 +1,11 @@
-import { chmodSync, lstatSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+} from "node:fs";
 import Database from "better-sqlite3";
 import { Kysely, SqliteDialect } from "kysely";
 
@@ -38,9 +45,9 @@ function validateExistingSqliteTarget(path: string): boolean {
     if (currentUid !== undefined && status.uid !== currentUid) {
       throw new Error(`SQLite path is not owned by the current user: ${path}`);
     }
-    if ((status.mode & 0o022) !== 0) {
+    if ((status.mode & 0o077) !== 0) {
       throw new Error(
-        `SQLite path must not be group- or world-writable: ${path}`,
+        `SQLite path must be private to the current user: ${path}`,
       );
     }
   }
@@ -62,6 +69,26 @@ function normalizeJournalMode(value: unknown): string {
   return value.toLowerCase();
 }
 
+function makeNewDatabasePrivate(path: string): void {
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const status = fstatSync(descriptor);
+    if (!status.isFile()) {
+      throw new Error(`SQLite path must be a regular file: ${path}`);
+    }
+    const currentUid = process.getuid?.();
+    if (currentUid !== undefined && status.uid !== currentUid) {
+      throw new Error(`SQLite path is not owned by the current user: ${path}`);
+    }
+    fchmodSync(descriptor, 0o600);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 export function openDatabase(
   path: string,
   options: OpenDatabaseOptions = {},
@@ -74,7 +101,7 @@ export function openDatabase(
     const databaseExisted = validateExistingDatabaseFiles(path);
     native = new Database(path);
     if (!databaseExisted && process.platform !== "win32")
-      chmodSync(path, 0o600);
+      makeNewDatabasePrivate(path);
     validateExistingSqliteTarget(path);
     native.pragma("busy_timeout = 5000");
     native.pragma("foreign_keys = ON");
@@ -100,7 +127,22 @@ export function openDatabase(
         `SQLite journal mode ${journalMode} is unsafe for Wheelsparrow`,
       );
     }
-    if (journalMode !== "wal") options.onJournalModeFallback?.(journalMode);
+    if (journalMode !== "wal") {
+      if (options.onJournalModeFallback !== undefined) {
+        options.onJournalModeFallback(journalMode);
+      } else {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: "sqlite_journal_mode_fallback",
+            journalMode,
+            level: "warn",
+          })}\n`,
+        );
+      }
+    }
+    // SQLite creates WAL sidecars while negotiating journal mode. Re-check
+    // each live file now that a newly-created database has been made private.
+    validateExistingDatabaseFiles(path);
 
     db = new Kysely<DatabaseSchema>({
       dialect: new SqliteDialect({ database: native }),

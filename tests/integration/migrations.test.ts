@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { openDatabase } from "../../apps/server/src/database/connection.js";
 import { migrateDatabase } from "../../apps/server/src/database/migrate.js";
@@ -59,6 +59,17 @@ async function close(
 ): Promise<void> {
   await connection.close();
   connections.delete(connection);
+}
+
+async function expectPrivateSqliteFile(path: string): Promise<void> {
+  const status = await lstat(path);
+
+  expect(status.isFile()).toBe(true);
+  expect(status.isSymbolicLink()).toBe(false);
+  if (process.platform !== "win32") {
+    if (process.getuid !== undefined) expect(status.uid).toBe(process.getuid());
+    expect(status.mode & 0o077).toBe(0);
+  }
 }
 
 async function addMigration(
@@ -1248,6 +1259,54 @@ describe("immutable SQLite migrations", () => {
     expect(fallbackModes).toEqual(["delete"]);
   });
 
+  test("emits one bounded structured stderr warning for a safe non-WAL fallback without a callback", async () => {
+    const { databasePath } = await createTemporaryDatabase();
+    const write = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+
+    try {
+      const connection = openDatabase(databasePath, {
+        requestJournalMode: (native) =>
+          native.pragma("journal_mode = DELETE", { simple: true }) as string,
+      });
+      connections.add(connection);
+
+      expect(connection.journalMode).toBe("delete");
+      expect(write).toHaveBeenCalledOnce();
+      expect(JSON.parse(String(write.mock.calls[0]?.[0]))).toEqual({
+        event: "sqlite_journal_mode_fallback",
+        journalMode: "delete",
+        level: "warn",
+      });
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  test("uses the supplied non-WAL fallback callback without a duplicate default warning", async () => {
+    const { databasePath } = await createTemporaryDatabase();
+    const write = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    const fallbackModes: string[] = [];
+
+    try {
+      const connection = openDatabase(databasePath, {
+        onJournalModeFallback: (actualMode: string) =>
+          fallbackModes.push(actualMode),
+        requestJournalMode: (native) =>
+          native.pragma("journal_mode = DELETE", { simple: true }) as string,
+      });
+      connections.add(connection);
+
+      expect(fallbackModes).toEqual(["delete"]);
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   test.each(["OFF", "MEMORY"])(
     "rejects unsafe injected %s journal mode and leaves the file reopenable",
     async (unsafeMode) => {
@@ -1306,13 +1365,13 @@ describe("immutable SQLite migrations", () => {
   );
 
   test.each(["", "-wal", "-shm"])(
-    "rejects a group- or world-writable existing SQLite%s file on POSIX",
+    "rejects a group- or world-readable existing SQLite%s file on POSIX",
     async (suffix) => {
       if (process.platform === "win32") return;
       const { databasePath } = await createTemporaryDatabase();
       const candidate = `${databasePath}${suffix}`;
       await writeFile(candidate, "", { mode: 0o600 });
-      await chmod(candidate, 0o666);
+      await chmod(candidate, 0o644);
       let opened: ReturnType<typeof openDatabase> | undefined;
       let error: unknown;
 
@@ -1325,23 +1384,32 @@ describe("immutable SQLite migrations", () => {
 
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message).toMatch(
-        /permission|group|world|writable/i,
+        /permission|group|world|private|readable/i,
       );
     },
   );
 
+  test("creates private database, WAL, and shared-memory files on POSIX", async () => {
+    if (process.platform === "win32") return;
+    const { databasePath } = await createTemporaryDatabase();
+    const connection = open(databasePath);
+
+    connection.native.exec(
+      "CREATE TABLE sidecar_probe (value TEXT); BEGIN IMMEDIATE; INSERT INTO sidecar_probe VALUES ('active');",
+    );
+
+    await Promise.all(
+      [databasePath, `${databasePath}-wal`, `${databasePath}-shm`].map(
+        expectPrivateSqliteFile,
+      ),
+    );
+  });
+
   test("creates a private regular database file owned by the current POSIX user", async () => {
     const { databasePath } = await createTemporaryDatabase();
     open(databasePath);
-    const status = await lstat(databasePath);
 
-    expect(status.isFile()).toBe(true);
-    expect(status.isSymbolicLink()).toBe(false);
-    if (process.platform !== "win32") {
-      if (process.getuid !== undefined)
-        expect(status.uid).toBe(process.getuid());
-      expect(status.mode & 0o022).toBe(0);
-    }
+    await expectPrivateSqliteFile(databasePath);
   });
 
   test("exposes Kysely transactions on the same native storage handle", async () => {

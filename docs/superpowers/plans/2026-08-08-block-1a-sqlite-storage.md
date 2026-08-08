@@ -204,30 +204,30 @@ integration tests.
 **Files:** `.github/workflows/ci.yml`, `.github/workflows/main.yml`, workflow policy tests,
 artifact/smoke scripts as needed.
 
-- [ ] Add a narrow macOS native-storage job that installs with the pinned Node/pnpm toolchain and runs
+- [x] Add a narrow macOS native-storage job that installs with the pinned Node/pnpm toolchain and runs
   the real SQLite migration suite plus Task 4's real two-child contention, release, and force-kill/
   reacquire ownership tests; retain Linux as the canonical full gate. Pin every action by SHA and use
   least privilege.
-- [ ] Define the archive honestly as an installable local source bundle for a supported host, not a
+- [x] Define the archive honestly as an installable local source bundle for a supported host, not a
   self-contained platform binary. Package `migrations/` and manifests; replace blanket
   `--ignore-scripts` with the explicit pnpm lifecycle allowlist so the supported host installs or
   builds `better-sqlite3` while arbitrary transitive scripts stay disabled; the lock package loads its
   shipped native addon without lifecycle execution.
-- [ ] Add semantic workflow tests proving Linux and macOS native install/load/migration coverage,
+- [x] Add semantic workflow tests proving Linux and macOS native install/load/migration coverage,
   migration packaging, strict frozen production install, and exact-revision smoke. Recreate/extract
   the source bundle locally, install on a supported host, and run the same production proof from the
   extracted directory. Do not claim offline or cross-platform binary portability.
-- [ ] Record the resolved native transitive graph, package licenses/integrity, and lifecycle scripts in
+- [x] Record the resolved native transitive graph, package licenses/integrity, and lifecycle scripts in
   review evidence. Prove the frozen production install permits builds only for `better-sqlite3` and
   that `fs-native-extensions` needs no lifecycle-script exemption.
-- [ ] Run action/workflow policy checks, full verification, build, production smoke, and diff hygiene.
+- [x] Run action/workflow policy checks, full verification, build, production smoke, and diff hygiene.
 
 ## Task 8: Review, publish, merge, and bind exact evidence
 
-- [ ] Run a fresh Terra/medium requirements review against the listed matrix rows and normative text.
-- [ ] Run fresh Terra/medium quality/security reviews over the whole branch. Accept findings only after
+- [x] Run a fresh Terra/medium requirements review against the listed matrix rows and normative text.
+- [x] Run fresh Terra/medium quality/security reviews over the whole branch. Accept findings only after
   reproducing them; repair with RED/GREEN tests and invalidate stale evidence after any code change.
-- [ ] At the exact reviewed head run frozen install, `make verify-agent`, build, production smoke,
+- [x] At the exact reviewed head run frozen install, `make verify-agent`, build, production smoke,
   extracted-artifact smoke, Markdownlint, repository policy, and diff hygiene.
 - [ ] Root commits and pushes the exact reviewed branch, opens a non-draft Conventional Commit PR,
   records its exact head, and waits for all present exact-head checks including Linux and macOS.

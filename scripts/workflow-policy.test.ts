@@ -13,7 +13,11 @@ type WorkflowStep = {
   uses?: string;
   with?: Record<string, unknown>;
 };
-type WorkflowJob = { name?: string; steps?: WorkflowStep[] };
+type WorkflowJob = {
+  name?: string;
+  "runs-on"?: string;
+  steps?: WorkflowStep[];
+};
 
 const checkout = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd";
 const setupNode = "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e";
@@ -25,6 +29,8 @@ const approvedActions: Record<
 > = {
   "pr-title.yml": [],
   "ci.yml": [
+    { reference: checkout, release: "v6.0.2" },
+    { reference: setupNode, release: "v6.4.0" },
     { reference: checkout, release: "v6.0.2" },
     { reference: setupNode, release: "v6.4.0" },
   ],
@@ -73,6 +79,17 @@ function runCommands(step: WorkflowStep | undefined) {
     .split("\n")
     .map((command) => command.trim())
     .filter(Boolean);
+}
+
+function job(workflow: Record<string, unknown>, identifier: string) {
+  const jobs = workflow.jobs as Record<string, WorkflowJob>;
+  const result = jobs[identifier];
+  expect(result, `missing ${identifier} job`).toBeDefined();
+  return result as WorkflowJob;
+}
+
+function commandText(steps: WorkflowStep[]) {
+  return steps.flatMap(runCommands).join("\n");
 }
 
 function commentedActionUses(
@@ -186,7 +203,68 @@ describe("workflow policy", () => {
     }
   });
 
-  it("packages a revision-bound, runnable main artifact and verifies it before upload", () => {
+  it("proves native storage on macOS with the pinned toolchain and real process coverage", () => {
+    const { workflow } = readWorkflow("ci.yml");
+    const nativeStorage = job(workflow, "native-storage");
+    const steps = nativeStorage.steps ?? [];
+    const commands = commandText(steps);
+
+    expect(nativeStorage.name).toBe("native-storage");
+    expect(nativeStorage["runs-on"]).toMatch(/^macos-/);
+    expect(steps.find((step) => step.uses === checkout)?.with).toMatchObject({
+      "persist-credentials": false,
+    });
+    expect(steps.find((step) => step.uses === setupNode)?.with).toMatchObject({
+      "node-version-file": ".node-version",
+    });
+    expect(commands).toContain("corepack enable");
+    expect(commands).toMatch(/pnpm install --frozen-lockfile/);
+    expect(commands).not.toContain("--ignore-scripts");
+
+    const workspace = parse(
+      readFileSync(resolve(root, "pnpm-workspace.yaml"), "utf8"),
+    ) as { allowBuilds?: Record<string, boolean> };
+    const server = JSON.parse(
+      readFileSync(resolve(root, "apps/server/package.json"), "utf8"),
+    ) as { dependencies?: Record<string, string> };
+    expect(workspace.allowBuilds).toEqual({
+      "better-sqlite3": true,
+      esbuild: true,
+    });
+    expect(server.dependencies).toMatchObject({
+      "better-sqlite3": "13.0.3",
+      "fs-native-extensions": "1.5.0",
+    });
+    expect(server.dependencies).not.toHaveProperty("esbuild");
+
+    const nativeTestStep = steps.find(
+      (step) => step.name === "Native SQLite and ownership",
+    );
+    expect(nativeTestStep).toBeDefined();
+    const nativeTestCommands = runCommands(nativeTestStep);
+    expect(nativeTestCommands.join("\n")).toContain(
+      "apps/server/src/database/sqlite-persistence.test.ts",
+    );
+    expect(nativeTestCommands.join("\n")).toContain(
+      "tests/integration/migrations.test.ts",
+    );
+    expect(nativeTestCommands.join("\n")).toContain(
+      "tests/integration/ownership.test.ts",
+    );
+    const ownershipContract = readFileSync(
+      resolve(root, "tests/integration/ownership.test.ts"),
+      "utf8",
+    );
+    for (const behavior of [
+      "reports a typed conflict from a second process while the holder remains live",
+      "permits a successor after normal release",
+      "permits an immediate successor after a holder is SIGKILLed",
+    ]) {
+      expect(ownershipContract).toContain(behavior);
+    }
+  });
+
+  it("packages an installable, revision-bound source bundle and proves the extracted revision", () => {
     const { workflow } = readWorkflow("main.yml");
     const jobs = workflow.jobs as Record<string, WorkflowJob>;
     const buildJob = jobs["build-artifact"];
@@ -216,32 +294,57 @@ describe("workflow policy", () => {
     expect(packageIndex).toBeGreaterThanOrEqual(0);
     expect(verifyIndex).toBeGreaterThan(packageIndex);
     expect(uploadIndex).toBeGreaterThan(verifyIndex);
-    expect(runCommands(steps[packageIndex])).toEqual([
-      `ARTIFACT_PATH="wheelsparrow-${githubShaShell}.tar.gz"`,
-      'tar -czf "$ARTIFACT_PATH" \\',
-      ".node-version \\",
-      "package.json \\",
-      "pnpm-lock.yaml \\",
-      "pnpm-workspace.yaml \\",
-      "apps/server/package.json \\",
-      "apps/server/dist \\",
-      "apps/web/package.json \\",
-      "apps/web/dist \\",
-      "packages/contracts/package.json \\",
-      "packages/contracts/dist \\",
-      "wheelsparrow.yaml \\",
+    const packageText = runCommands(steps[packageIndex]).join("\n");
+    expect(packageText).toContain(`wheelsparrow-${githubShaShell}.tar.gz`);
+    for (const requiredPath of [
+      ".node-version",
+      "REVISION",
+      "package.json",
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      "tsconfig.base.json",
+      "apps/server/package.json",
+      "apps/server/src",
+      "apps/server/tsconfig.json",
+      "apps/server/dist",
+      "apps/web/package.json",
+      "apps/web/index.html",
+      "apps/web/src",
+      "apps/web/tsconfig.json",
+      "apps/web/vite.config.ts",
+      "apps/web/dist",
+      "packages/contracts/package.json",
+      "packages/contracts/prepare.mjs",
+      "packages/contracts/src",
+      "packages/contracts/tsconfig.json",
+      "packages/contracts/dist",
+      "migrations",
+      "wheelsparrow.yaml",
       "scripts/production-smoke.mjs",
-    ]);
+    ]) {
+      expect(packageText).toContain(requiredPath);
+    }
+    expect(packageText).toContain(
+      'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+    );
+    expect(packageText).toMatch(/(?:printf|git rev-parse).*REVISION/);
 
-    expect(runCommands(steps[verifyIndex])).toEqual([
+    const verificationText = runCommands(steps[verifyIndex]).join("\n");
+    expect(verificationText).toContain(
       `ARTIFACT_PATH="wheelsparrow-${githubShaShell}.tar.gz"`,
-      `PACKAGE_DIR="$RUNNER_TEMP/wheelsparrow-${githubShaShell}"`,
-      'mkdir -p "$PACKAGE_DIR"',
-      'tar -xzf "$ARTIFACT_PATH" -C "$PACKAGE_DIR"',
-      'cd "$PACKAGE_DIR"',
-      "pnpm install --prod --frozen-lockfile --ignore-scripts",
-      "node scripts/production-smoke.mjs",
-    ]);
+    );
+    expect(verificationText).toContain("tar -xzf");
+    expect(verificationText).toContain(
+      'test "$(cat "$PACKAGE_DIR/REVISION")" = "$GITHUB_SHA"',
+    );
+    expect(verificationText).toContain(
+      'pnpm --dir "$PACKAGE_DIR" install --prod --frozen-lockfile',
+    );
+    expect(verificationText).not.toContain("--ignore-scripts");
+    expect(verificationText).not.toContain('cd "$PACKAGE_DIR"');
+    expect(verificationText).toContain(
+      'node "$PACKAGE_DIR/scripts/production-smoke.mjs"',
+    );
     expect(steps[uploadIndex]?.uses).toBe(uploadArtifact);
     expect(steps[uploadIndex]?.with).toEqual({
       name: `wheelsparrow-${"$"}{{ github.sha }}`,

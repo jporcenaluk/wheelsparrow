@@ -30,7 +30,7 @@ and marks the ticket done only when the evidence matches.
   `docs/superpowers/specs/2026-08-08-mvp-delivery-control-design.md`.
 - Complete traceability matrix: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`, covering the normative
   sources at `81271c278c47a96e2882888e20c577449c5f69b8`; current content SHA-256
-  `8a8df599d4e09b086e16256636b6fb75eea37a0d102ea8e4059dbb4ddb948e89`; 341 rows
+  `f769506003be84bc40d0b4f3fb9f924eb8a0baa37878c292e631210665dc3cda`; 341 rows
   (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77).
 - PR #3 is a stale, broad reference quarry. It is not an implementation base.
 - The untracked files in the root checkout belong to an earlier broad implementation attempt. They
@@ -84,7 +84,7 @@ required product outcomes.
 | Order | Outcome | Depends on | Status | Worktree and branch | Plan | Pull request | Merge SHA |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Deterministic Block 0 process-cleanup repair and control-plane setup | PR #25 foundation | `merged` | `.worktrees/block0-flake`; `fix/block-0-process-test-flake` | `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md` | [#26](https://github.com/jporcenaluk/wheelsparrow/pull/26) | `64951a3edc3de50bdc8007becde965308c5d3040` |
-| 2 | SQLite storage, migrations, and single-process ownership | 1 | `in_progress` | `.worktrees/block1a-storage`; `feat/block-1a-storage` | `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md` | — | — |
+| 2 | SQLite storage, migrations, and single-process ownership | 1 | `review` | `.worktrees/block1a-storage`; `feat/block-1a-storage` | `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md` | — | — |
 | 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `pending` | — | — | — | — |
 | 4 | GitHub discovery and claim through a verified local candidate | 3 | `pending` | — | — | — | — |
 | 5 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 4 | `pending` | — | — | — | — |
@@ -99,18 +99,19 @@ required product outcomes.
 - Active slice: merge-train row 2, Block 1A durable SQLite storage.
 - Active worktree: `/home/jporc/wheelsparrow/.worktrees/block1a-storage`.
 - Branch: `feat/block-1a-storage`.
-- Observed HEAD before this ledger edit: `07fc32f`.
+- Observed HEAD before this ledger edit: `3c1463e8c68dd2e2043cb2a1a862ef6394ea76b5`.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
 - Active plan: `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md`.
-- Current checkbox after this checkpoint: Task 7, Step 1, add the narrow macOS native-storage CI job.
-- Last verification: pinned Node 24.18.0 `make verify-agent` passed formatting, Markdownlint, all
-  TypeScript projects, 14 test files, and 249 tests; the production build passed; and the post-build
-  production lifecycle smoke passed. Its focused contract passed 9/9, and fresh quality and safety
-  rereviews returned `QUALITY APPROVED` and `SAFETY APPROVED`.
-- Next safe command: delegate Task 7 workflow-policy RED tests for the macOS native-storage job and
-  installable source-bundle contract; retain Linux as the canonical full gate and do not claim an
-  offline or cross-platform binary artifact.
+- Current checkbox after this checkpoint: Task 8, Step 4, commit and publish the exact reviewed branch.
+- Last verification: at exact executable head `3c1463e8c68dd2e2043cb2a1a862ef6394ea76b5`, unrestricted
+  Node 24.18.0 `make verify-agent` passed formatting, Markdownlint, frozen install, all TypeScript
+  projects, and 15 test files / 264 tests; `make build`, `make smoke-production`, and diff hygiene
+  passed. A fresh reconstructed source bundle performed a frozen production-only install and passed
+  the extracted production smoke. The managed sandbox suppresses piped child stdout/stderr and rejects
+  loopback binds, so its empty-output and `EPERM` failures are not used as product evidence.
+- Next safe command: commit this ledger checkpoint, inspect the exact branch diff/status, push the
+  reviewed branch, and open a non-draft Block 1A pull request.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
@@ -137,6 +138,14 @@ required product outcomes.
 - Treat `workspace_root` as a relative descendant of the repository root. Reject absolute paths,
   traversal, and symlink components before mutation; this keeps preflight from creating or changing
   permissions outside the repository-owned local data root.
+- The supported local filesystem threat model is one trusted operator UID and a canonical repository
+  path whose ancestors are controlled by that operator or the host system and cannot be replaced by
+  another UID. Within that boundary, the repository root must be current-UID-owned and not
+  group/world-writable, storage directories must be `0700`, SQLite files must be private, and the
+  content-free lock must be current-UID-owned and not group/world-writable. The application rejects
+  traversal, symlinks, unsafe permissions, and cross-UID disclosure inside this stable boundary.
+  Hostile same-UID processes and attacker-controlled ancestor directories are excluded because Node's
+  path-based filesystem APIs cannot make those environments safe without descriptor-relative I/O.
 - Product behavior wins over technology and delivery mechanics. Technology and delivery constraints
   remain binding unless they make the product behavior impossible; any such conflict requires a
   normative documentation change before code.
@@ -218,10 +227,16 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | Row 2 lock dependency pre-adoption proof | `fs-native-extensions@1.5.0` (integrity `sha512-nuZLFm9mGCxvyi7Llww/J4OyifKCS21nEUTAmnlTZp3FObPOvA32aCedCmt4Z+8yk+caqfClNaSCfn/P7T7FLQ==`) was published 2026-04-13 and resolves to `require-addon@1.2.0`, `which-runtime@1.4.0`, `bare-addon-resolve@1.10.1`, `bare-module-resolve@1.12.4`, and `bare-semver@1.1.0`; all six packages are Apache-2.0 with no install lifecycle script, so no pnpm build exemption is needed. An unrestricted Node 24.18.0 Linux probe proved holder `true`, simultaneous contender `false`, and successor `true` after forced holder exit |
 | 2026-08-08 | Row 2 dependency GREEN | RED commit `acd1661` failed only on the missing `better-sqlite3` import; `db4a0f2` pins `better-sqlite3@13.0.3`, `kysely@0.29.4`, `fs-native-extensions@1.5.0`, and `@types/better-sqlite3@9.6.0`. Frozen install ran only the allowlisted `better-sqlite3` rebuild; real-file persistence passed 1/1, repository policy 6/6, server typecheck, targeted Biome, and diff hygiene passed |
 | 2026-08-08 | Row 2 safe-path GREEN | RED commit `bc9d88c` produced six async failures only at the missing `deriveLocalPaths` API; `67125c6` canonicalizes the repository root, rejects shallow/escaping/symlink/non-directory/unsafe-permission storage paths, permits missing descendants without mutation, and derives the one private local layout. The complete config file passed 20/20 with server typecheck, targeted Biome, and diff hygiene |
-| 2026-08-08 | Row 2 ownership GREEN | RED commit `e7b4a47`, implementation commit `db4e59c`, hardening commit `e2bb55a`, and path-boundary commit `17809d6` establish one OS advisory whole-file lock with typed contention, hard-error causality, private regular-file validation, idempotent release, and crash-safe reacquisition. Root's unrestricted Node 24.18.0 suite passed 9/9, including separate live holder and contender children; targeted Biome, server typecheck, diff hygiene, and fresh ownership rereview passed with `APPROVED` |
+| 2026-08-08 | Row 2 ownership GREEN | RED commit `e7b4a47`, implementation commit `db4e59c`, hardening commit `e2bb55a`, and path-boundary commit `17809d6` establish one OS advisory whole-file lock with typed contention, hard-error causality, current-UID regular-file validation with no group/world write access, idempotent release, and crash-safe reacquisition. Root's unrestricted Node 24.18.0 suite passed 9/9, including separate live holder and contender children; targeted Biome, server typecheck, diff hygiene, and fresh ownership rereview passed with `APPROVED` |
 | 2026-08-08 | Row 2 immutable SQLite GREEN | RED/hardening commits `6c251e0`, `901cbdb`, `70ac7a3`, and `fc9b21d` plus production commit `c51536f` establish one real SQLite/Kysely handle, canonical immutable migrations, six exact operational tables, restart-safe schema/ledger atomicity, bounded JSON, evidence-preserving constraints, canonical hashes, safe target files, fatal UTF-8 preflight, and await-idempotent close. Root passed 62/62 twice plus both TypeScript configurations, targeted Biome, and diff hygiene; fresh reviewers returned `SCHEMA APPROVED`, `TESTS APPROVED`, `SPEC COMPLIANT`, and `QUALITY APPROVED` |
 | 2026-08-08 | Row 2 lifecycle composition GREEN | Lifecycle RED commits `044978b`, `b606bf9`, and `915242d` plus production commit `577131a` establish complete directory preflight before mutation, private path creation/revalidation, strict existing-lock validation, configuration -> ownership -> SQLite migration -> listener ordering, a shared idempotent close, and startup-phase serialization that defers reverse cleanup until any in-flight acquire/open/migrate/build/listen operation settles. Root passed 59/59 lifecycle/path tests, the unrestricted native ownership suite 10/10, both TypeScript configurations, targeted Biome, and diff hygiene; fresh reviewers returned `SPEC COMPLIANT`, `QUALITY APPROVED`, and `SECURITY APPROVED` after signal-race, force-deadline, handler-removal, and permissive-lock repairs. |
 | 2026-08-08 | Row 2 production lifecycle smoke checkpoint | Commit `07fc32f` runs the built server from an immutable bundle root against a guarded OS-temporary repository fixture, interrupts startup after ownership and database open, verifies private SQLite state and the canonical migration ledger, rejects a live ownership contender before URL announcement, checks health/readiness/UI/assets, shuts down cleanly, and restarts against the same durable state. Focused smoke contracts passed 9/9; pinned Node 24.18.0 `make verify-agent` passed 14 files and 249 tests; production build and post-build smoke passed; fresh reviewers returned `QUALITY APPROVED` and `SAFETY APPROVED`. |
+| 2026-08-08 | Row 2 native dependency audit | `better-sqlite3@13.0.3` is MIT, integrity `sha512-RbOBxmLBG8uvFUc15X9+9SFemKcQ0WBuISBVkpuiaUB2qblC8UWlHEjdWVoZ8AdhSwmoEgsiXKfopX0CQxaACQ==`, and resolves to MIT `node-addon-api@8.9.1` integrity `sha512-4eUQWVPCUUUiBjLnHS3cXWeC6ryoPUc0U3rP7IuzapoGbzMqd/r6KKO0clr0b+snQhsrueFEhCZDdK+LK7hxKg==`; its `binding.gyp` makes pnpm enforce the explicit build allowance even though its manifest has no install script. `fs-native-extensions@1.5.0` is Apache-2.0, integrity `sha512-nuZLFm9mGCxvyi7Llww/J4OyifKCS21nEUTAmnlTZp3FObPOvA32aCedCmt4Z+8yk+caqfClNaSCfn/P7T7FLQ==`, and resolves through Apache-2.0 `require-addon@1.2.0` (`sha512-VNPDZlYgIYQwWp9jMTzljx+k0ZtatKlcvOhktZ/anNPI3dQ9NXk7cq2U4iJ1wd9IrytRnYhyEocFWbkdPb+MYA==`), `bare-addon-resolve@1.10.1` (`sha512-F/SD2du8keuYSb4xipnGz5j2E6yhNdHA8ZVxtHae6h2uOrpBIjjbhXvjzKZbr5XUOzqBzh/i8GVFycj2DlFQIA==`), `bare-module-resolve@1.12.4` (`sha512-xcfgg2u7HqgJiBmah71O9vvdFAgHCvkqC/WSC2O7Bbgosoc1eC/BWe/6IDJ4OsfKlkxuvC/TDWXC+oH5yeW8mA==`), `bare-semver@1.1.0` (`sha512-1Hw5qJ7hXdVt3uPUqjeFTuxyvBUJauvz5A1I2jk8gzjZMHp04n//6nV9MDbG9CMw78JHY2lGV0w6s//LrASm2w==`), and `which-runtime@1.4.0` (`sha512-0ugbP4CJW4e2D20jvEcC4973dCgIaHI4Rw1PT+26U9zEve7FyYdWAIwUnoeOYvoCfn+wXHoHTKb1KhkYlb60Pw==`); none has an install lifecycle script, so no allowance is present. `esbuild` retains its existing development/build-only allowance and is absent from the server production closure. Removing the SQLite allowance reproduced `ERR_PNPM_IGNORED_BUILDS`; restoring the exact `better-sqlite3` plus `esbuild` policy made frozen install pass. |
+| 2026-08-08 | Row 2 native CI and artifact GREEN | Workflow RED commits `fd67f58`, `3c8b982`, `a6c91e5`, and `ce6b4df` plus GREEN commits `f7c724a`, `45c200b`, and `4ca048d` add a narrow pinned macOS job for real SQLite persistence, immutable migrations, live contender/release/SIGKILL ownership recovery, and an exact-SHA supported-host archive containing source, built output, manifests, migrations, and its revision. The archive performs a frozen production-only install without blanket script suppression and runs the same production proof from outside its directory; an idempotent fail-closed contracts prepare helper skips packaged output and builds only source checkouts. Root passed the corrected native suite 73/73, full gate 258/258, build, source smoke, exact extracted install/smoke, and diff hygiene. Fresh reviewers returned `TEST CONTRACT APPROVED`, `QUALITY APPROVED`, `SECURITY APPROVED`, `SPEC COMPLIANT`, and `ARTIFACT APPROVED` after lifecycle, exact-revision, caller-CWD, and missing-migration repairs. |
+| 2026-08-08 | Row 2 final storage-boundary repair | Final review accepted and repaired world-traversable `0711` storage, readable SQLite sidecars, an unsafe writable repository-root boundary, and silent safe journal fallback. Commit `fb964a2` requires a current-UID, non-group/world-writable canonical repository root, `0700` storage directories, descriptor-anchored `0600` database creation, and private live database/WAL/SHM validation; commit `5f71ba4` emits one bounded nonsecret JSON warning when production uses an allowlisted non-WAL fallback. The caller must provide a stable operator/system-controlled repository ancestor path. Root passed config 34/34 and real migrations 65/65 unrestricted plus both TypeScript checks, Biome, and diff hygiene; focused rereviews returned `QUALITY APPROVED` and `SECURITY APPROVED`. |
+| 2026-08-08 | Row 2 final whole-branch review | Fresh Terra/medium requirements, quality, and security reviewers inspected the complete branch and current evidence. Accepted findings repaired stale matrix rows/hash, unsafe repository/storage permissions and cross-UID disclosure inside the supported stable path boundary, silent journal fallback, and overclaimed lock privacy. The final working content received `REQUIREMENTS APPROVED`, `QUALITY APPROVED`, and `SECURITY APPROVED`; CI-dependent native rows remain explicitly partial until exact-head GitHub Linux/macOS evidence exists. |
+| 2026-08-08 | M0 tracker reconciliation | [Issue #5](https://github.com/jporcenaluk/wheelsparrow/issues/5) was closed as completed with a comment binding its M0 acceptance criteria to merged PR #25 (`81271c278c47a96e2882888e20c577449c5f69b8`) and the subsequent deterministic repair/control-plane PR #26 (`64951a3edc3de50bdc8007becde965308c5d3040`). |
+| 2026-08-08 | Row 2 exact-head local and artifact gate | At `3c1463e8c68dd2e2043cb2a1a862ef6394ea76b5`, unrestricted Node 24.18.0 `make verify-agent` passed 15 files / 264 tests, `make build` and `make smoke-production` passed, and diff hygiene passed. A reconstructed exact-head source bundle then passed frozen production-only installation and extracted production smoke. |
 
 ## Open Decisions and Risks
 
