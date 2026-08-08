@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import { type FileHandle, lstat, open } from "node:fs/promises";
 import { createRequire } from "node:module";
 
@@ -52,17 +52,34 @@ export class OwnershipHandle {
   }
 }
 
-async function rejectExistingSymbolicLink(lockPath: string): Promise<void> {
-  try {
-    if ((await lstat(lockPath)).isSymbolicLink()) {
+function validateLockStatus(lockPath: string, status: Stats): void {
+  if (status.isSymbolicLink() || !status.isFile()) {
+    throw new Error(`Ownership lock path must be a regular file: ${lockPath}`);
+  }
+
+  if (process.platform !== "win32") {
+    const currentUid = process.getuid?.();
+    if (currentUid !== undefined && status.uid !== currentUid) {
       throw new Error(
-        `Ownership lock path must not be a symbolic link: ${lockPath}`,
+        `Ownership lock path is not owned by the current user: ${lockPath}`,
       );
     }
+    if ((status.mode & 0o022) !== 0) {
+      throw new Error(
+        `Ownership lock path must not be group- or world-writable: ${lockPath}`,
+      );
+    }
+  }
+}
+
+async function validateExistingLockTarget(lockPath: string): Promise<boolean> {
+  try {
+    validateLockStatus(lockPath, await lstat(lockPath));
   } catch (error: unknown) {
-    if (isMissingPathError(error)) return;
+    if (isMissingPathError(error)) return false;
     throw error;
   }
+  return true;
 }
 
 function isMissingPathError(error: unknown): boolean {
@@ -81,7 +98,7 @@ function noFollowFlag(): number {
 export async function acquireOwnership(
   lockPath: string,
 ): Promise<OwnershipHandle> {
-  await rejectExistingSymbolicLink(lockPath);
+  const lockExisted = await validateExistingLockTarget(lockPath);
 
   const file = await open(
     lockPath,
@@ -90,14 +107,9 @@ export async function acquireOwnership(
   );
 
   try {
-    const status = await file.stat();
-    if (!status.isFile()) {
-      throw new Error(
-        `Ownership lock path must be a regular file: ${lockPath}`,
-      );
-    }
+    validateLockStatus(lockPath, await file.stat());
 
-    await file.chmod(0o600);
+    if (!lockExisted && process.platform !== "win32") await file.chmod(0o600);
 
     if (!tryLock(file.fd, 0, 0, { shared: false })) {
       throw new OwnershipConflictError(lockPath);

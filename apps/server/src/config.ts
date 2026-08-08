@@ -1,4 +1,4 @@
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, realpath } from "node:fs/promises";
 import {
   dirname,
   isAbsolute,
@@ -147,6 +147,48 @@ export async function deriveLocalPaths(
     lockPath: join(dataRoot, "wheelsparrow.lock"),
     logsRoot: join(dataRoot, "logs"),
   };
+}
+
+async function validateStorageDirectory(path: string): Promise<boolean> {
+  try {
+    const metadata = await lstat(path);
+    if (metadata.isSymbolicLink()) {
+      throw new WorkspaceRootError(
+        "workspace storage path must not contain symbolic links",
+      );
+    }
+    if (!metadata.isDirectory()) {
+      throw new WorkspaceRootError(
+        "workspace storage path components must be directories",
+      );
+    }
+    assertPrivateDirectory(path, metadata.mode, metadata.uid);
+    return true;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw cause;
+  }
+}
+
+export async function prepareLocalPaths(
+  paths: LocalPaths,
+): Promise<LocalPaths> {
+  const directories = [paths.dataRoot, paths.workspaceRoot, paths.logsRoot];
+
+  // Validate every existing target before this function creates anything. This
+  // keeps an unsafe later target from causing an earlier missing one to appear.
+  const existing = await Promise.all(
+    directories.map((directory) => validateStorageDirectory(directory)),
+  );
+  for (const [index, directory] of directories.entries()) {
+    if (existing[index] === false) {
+      await mkdir(directory, { mode: 0o700, recursive: true });
+      if (process.platform !== "win32") await chmod(directory, 0o700);
+    }
+  }
+
+  await Promise.all(directories.map(validateStorageDirectory));
+  return paths;
 }
 
 function sanitizedError(cause: unknown): Error {
