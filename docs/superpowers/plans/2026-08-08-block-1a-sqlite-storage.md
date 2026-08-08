@@ -181,16 +181,16 @@ integration tests.
 
 **Files:** `apps/server/src/main.ts`, `apps/server/src/main.test.ts`, production smoke support as needed.
 
-- [ ] Write failing orchestration tests that observe configuration/path validation, private directory
+- [x] Write failing orchestration tests that observe configuration/path validation, private directory
   creation, revalidation, ownership, database open/migrate, listener, reverse-order cleanup, and
   causal errors. Prove the listener is never attempted after ownership or migration failure. When
   migration fails after open, assert transaction rollback, database close once, ownership release,
   and immediate successful reopen.
-- [ ] Refactor `start` behind narrow injected lifecycle functions while preserving the production entry
+- [x] Refactor `start` behind narrow injected lifecycle functions while preserving the production entry
   point, loopback binding, readiness semantics, URL announcement, and bounded signal shutdown.
   Register one idempotent lifecycle owner before acquisition and remove process-global signal handlers
   after failed/test lifecycles.
-- [ ] Create data/workspace/log directories with private permissions, revalidate paths, acquire
+- [x] Create data/workspace/log directories with private permissions, revalidate paths, acquire
   ownership, open/migrate, and then construct/listen. Close database and release ownership after the
   app closes; best-effort cleanup must not replace the initiating failure.
 - [ ] Extend production smoke to use an isolated temporary repository/data root and prove the SQLite
