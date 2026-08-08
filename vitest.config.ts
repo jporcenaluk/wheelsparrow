@@ -7,6 +7,7 @@ export default defineConfig({
       "apps/**/*.test.tsx",
       "packages/**/*.test.ts",
       "scripts/**/*.test.ts",
+      "tests/**/*.test.ts",
     ],
     coverage: {
       reporter: ["text", "json-summary"],
