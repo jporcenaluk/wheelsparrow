@@ -103,16 +103,17 @@ required product outcomes.
 - Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
   `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
 - Active plan: `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md`.
-- Current checkbox after this checkpoint: Task 5, Step 1, specify immutable migration and connection
+- Current checkbox after this checkpoint: Task 6, Step 1, specify lifecycle composition and failure
   behavior.
 - Last verification: exact dependencies and strict native allowlist passed frozen installation;
   the real SQLite persistence test passed 1/1, repository policy passed 6/6, safe-path configuration
-  passed 25/25, and the unrestricted Linux ownership suite passed 9/9 under Node 24.18.0, including
-  release, forced-exit recovery, and distinct holder/contender children. Server TypeScript, targeted
-  Biome checks, and diff hygiene passed.
-- Next safe command: finish the reviewed Task 5 migration RED contract, reproduce RED at root, commit
-  it separately, then delegate connection/migration/schema GREEN to one bounded Terra/medium builder.
-- Current owner: root orchestrator; one bounded migration-test worker is active.
+  passed 25/25, the unrestricted Linux ownership suite passed 9/9, and the immutable migration suite
+  passed 62/62 twice under Node 24.18.0. Server and test TypeScript, targeted Biome, and diff hygiene
+  passed. Fresh schema, test-contract, specification, and adversarial quality reviews all approved.
+- Next safe command: delegate Task 6 lifecycle RED tests using the audited narrow dependency boundary
+  and returned idempotent service handle; preserve current Fastify behavior and do not introduce a
+  generic lifecycle framework.
+- Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
 ## Resolved Requirement Questions
@@ -220,6 +221,7 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | Row 2 dependency GREEN | RED commit `acd1661` failed only on the missing `better-sqlite3` import; `db4a0f2` pins `better-sqlite3@13.0.3`, `kysely@0.29.4`, `fs-native-extensions@1.5.0`, and `@types/better-sqlite3@9.6.0`. Frozen install ran only the allowlisted `better-sqlite3` rebuild; real-file persistence passed 1/1, repository policy 6/6, server typecheck, targeted Biome, and diff hygiene passed |
 | 2026-08-08 | Row 2 safe-path GREEN | RED commit `bc9d88c` produced six async failures only at the missing `deriveLocalPaths` API; `67125c6` canonicalizes the repository root, rejects shallow/escaping/symlink/non-directory/unsafe-permission storage paths, permits missing descendants without mutation, and derives the one private local layout. The complete config file passed 20/20 with server typecheck, targeted Biome, and diff hygiene |
 | 2026-08-08 | Row 2 ownership GREEN | RED commit `e7b4a47`, implementation commit `db4e59c`, hardening commit `e2bb55a`, and path-boundary commit `17809d6` establish one OS advisory whole-file lock with typed contention, hard-error causality, private regular-file validation, idempotent release, and crash-safe reacquisition. Root's unrestricted Node 24.18.0 suite passed 9/9, including separate live holder and contender children; targeted Biome, server typecheck, diff hygiene, and fresh ownership rereview passed with `APPROVED` |
+| 2026-08-08 | Row 2 immutable SQLite GREEN | RED/hardening commits `6c251e0`, `901cbdb`, `70ac7a3`, and `fc9b21d` plus production commit `c51536f` establish one real SQLite/Kysely handle, canonical immutable migrations, six exact operational tables, restart-safe schema/ledger atomicity, bounded JSON, evidence-preserving constraints, canonical hashes, safe target files, fatal UTF-8 preflight, and await-idempotent close. Root passed 62/62 twice plus both TypeScript configurations, targeted Biome, and diff hygiene; fresh reviewers returned `SCHEMA APPROVED`, `TESTS APPROVED`, `SPEC COMPLIANT`, and `QUALITY APPROVED` |
 
 ## Open Decisions and Risks
 

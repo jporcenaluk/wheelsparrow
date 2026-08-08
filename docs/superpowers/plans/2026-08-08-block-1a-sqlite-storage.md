@@ -138,13 +138,13 @@ Node core lacks; it is not a general filesystem layer.
 `apps/server/src/database/connection.ts`, `apps/server/src/database/migrate.ts`, and focused real-file
 integration tests.
 
-- [ ] Write failing real-file tests for fresh migration, reopen/no replay, upgrade ordering, transaction
+- [x] Write failing real-file tests for fresh migration, reopen/no replay, upgrade ordering, transaction
   rollback, foreign-key enforcement, WAL/effective fallback reporting and warning, checksum drift,
   missing applied files, duplicate numeric IDs, malformed ASCII/Unicode/case names, forbidden
   transaction/attachment SQL, and retroactive migration insertion.
-- [ ] Define Kysely row types for the six operational tables and migration ledger. Persist JSON as
+- [x] Define Kysely row types for the six operational tables and migration ledger. Persist JSON as
   bounded text; parsing/domain validation belongs to row 3 repositories.
-- [ ] Create `001_initial.sql` with every named `SPEC.md` field family:
+- [x] Create `001_initial.sql` with every named `SPEC.md` field family:
   - `runs`: issue/project identity, bounded intake snapshot, state, revision/ownership,
     timestamps, base/head/merge SHAs, worktree, base/ticket branches, PR number/title/URL, required
     action, and failure;
@@ -160,18 +160,22 @@ integration tests.
   The initial physical schema is intentionally exact: use the column names asserted in
   `tests/integration/migrations.test.ts`; add no speculative scheduler, provider, analytics, or
   workflow-enum columns. Later behavior changes use new immutable migrations instead of editing 001.
-- [ ] Add primary/foreign/unique/index/check constraints that are independent of row 3's still-pending
+- [x] Add primary/foreign/unique/index/check constraints that are independent of row 3's still-pending
   state machine. Index issue/project identity for row 3's state-conditional ownership check, prevent
   cross-run finding-to-step references, and bound persisted JSON to 1 MiB. Do not encode guessed
   workflow enums or unconditional one-run-per-issue uniqueness in the initial migration.
-- [ ] Implement one connection owner around the same native handle/Kysely dialect. Set busy timeout,
+- [x] Implement one connection owner around the same native handle/Kysely dialect. Set busy timeout,
   enable and verify foreign keys, request WAL, retain actual journal mode, expose Kysely transactions,
   and close exactly once.
-- [ ] Validate every migration before opening a transaction. Apply SQL and its SHA-256 ledger row on
+- [x] Validate every migration before opening a transaction. Apply SQL and its SHA-256 ledger row on
   the same native handle inside one synchronous `better-sqlite3` transaction with no `await`; Kysely
   must not create a second migration transaction. Fault-inject after migration execution and ledger
   insertion, reopen, and prove schema/ledger consistency after rollback.
-- [ ] Run the focused migration suite twice, typecheck, lint, and diff hygiene.
+- [x] Run the focused migration suite twice, typecheck, lint, and diff hygiene. Root and independent
+  review runs passed all 62 cases; server and test TypeScript, targeted Biome, and diff hygiene passed.
+  Fresh reviewers returned `SCHEMA APPROVED`, `TESTS APPROVED`, `SPEC COMPLIANT`, and
+  `QUALITY APPROVED` after close-race, encoding, path-target, evidence-hash, and canonical-baseline
+  hardening.
 
 ## Task 6: Compose storage into startup and shutdown
 
