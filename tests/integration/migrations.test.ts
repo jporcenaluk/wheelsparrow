@@ -1,5 +1,15 @@
 import { createHash } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,6 +67,14 @@ async function addMigration(
   sql: string,
 ): Promise<void> {
   await writeFile(join(directory, filename), sql, "utf8");
+}
+
+async function addMigrationBytes(
+  directory: string,
+  filename: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  await writeFile(join(directory, filename), bytes);
 }
 
 async function readMigration(
@@ -766,6 +784,145 @@ describe("immutable SQLite migrations", () => {
     });
   });
 
+  test("accepts canonical run evidence hashes and rejects noncanonical nonnull values", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+    insertRun(connection);
+    const fields = [
+      "base_sha",
+      "head_sha",
+      "approved_head_sha",
+      "observed_base_sha",
+      "merge_sha",
+    ];
+    const assignAll = connection.native.prepare(
+      `UPDATE runs SET ${fields.map((field) => `${field} = ?`).join(", ")} WHERE id = 'run-1'`,
+    );
+
+    expect(() =>
+      assignAll.run(...fields.map(() => "a".repeat(40))),
+    ).not.toThrow();
+    expect(() =>
+      assignAll.run(...fields.map(() => "b".repeat(64))),
+    ).not.toThrow();
+
+    const invalidHashes = [
+      "",
+      "g".repeat(40),
+      "A".repeat(40),
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(63),
+      "a".repeat(65),
+    ];
+    for (const field of fields) {
+      const update = connection.native.prepare(
+        `UPDATE runs SET ${field} = ? WHERE id = 'run-1'`,
+      );
+      for (const invalidHash of invalidHashes)
+        expect(() => update.run(invalidHash)).toThrow(/check/i);
+    }
+  });
+
+  test("accepts canonical approval evidence hashes and rejects noncanonical values", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+    insertRun(connection);
+    connection.native
+      .prepare(
+        `INSERT INTO approvals (
+          id, run_id, operator, approved_head_sha, observed_base_sha,
+          decision, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "approval-1",
+        "run-1",
+        "operator",
+        "a".repeat(40),
+        "b".repeat(64),
+        "approved",
+        "2026-08-08T00:00:00.000Z",
+      );
+    expect(() =>
+      connection.native
+        .prepare(
+          "UPDATE approvals SET approved_head_sha = ?, observed_base_sha = ? WHERE id = ?",
+        )
+        .run("c".repeat(64), "d".repeat(40), "approval-1"),
+    ).not.toThrow();
+
+    const invalidHashes = [
+      "",
+      "g".repeat(40),
+      "A".repeat(40),
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(63),
+      "a".repeat(65),
+    ];
+    for (const field of ["approved_head_sha", "observed_base_sha"]) {
+      const update = connection.native.prepare(
+        `UPDATE approvals SET ${field} = ? WHERE id = 'approval-1'`,
+      );
+      for (const invalidHash of invalidHashes)
+        expect(() => update.run(invalidHash)).toThrow(/check/i);
+    }
+  });
+
+  test("requires lowercase 64-hex prompt hashes and side-effect fingerprints", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+    insertRun(connection);
+    insertStep(connection);
+    connection.native
+      .prepare(
+        `INSERT INTO side_effects (
+          key, run_id, rework_epoch, kind, target_revision, fingerprint,
+          intent_json, status, executor_attempt, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "effect-1",
+        "run-1",
+        0,
+        "test",
+        0,
+        "b".repeat(64),
+        "{}",
+        "pending",
+        0,
+        "2026-08-08T00:00:00.000Z",
+        "2026-08-08T00:00:00.000Z",
+      );
+
+    const invalidHashes = [
+      "",
+      "g".repeat(64),
+      "A".repeat(64),
+      "a".repeat(40),
+      "a".repeat(63),
+      "a".repeat(65),
+    ];
+    for (const [table, field, identity] of [
+      ["steps", "prompt_hash", "step-1"],
+      ["side_effects", "fingerprint", "effect-1"],
+    ]) {
+      const identityColumn = table === "steps" ? "id" : "key";
+      const update = connection.native.prepare(
+        `UPDATE ${table} SET ${field} = ? WHERE ${identityColumn} = ?`,
+      );
+      for (const invalidHash of invalidHashes)
+        expect(() => update.run(invalidHash, identity)).toThrow(/check/i);
+    }
+  });
+
   test.each([
     ["runs", "id"],
     ["steps", "id"],
@@ -897,7 +1054,7 @@ describe("immutable SQLite migrations", () => {
         -1,
         "test",
         0,
-        "fingerprint-0",
+        "0".repeat(64),
         "{}",
         "pending",
         0,
@@ -912,7 +1069,7 @@ describe("immutable SQLite migrations", () => {
         0,
         "test",
         -1,
-        "fingerprint-1",
+        "1".repeat(64),
         "{}",
         "pending",
         0,
@@ -927,7 +1084,7 @@ describe("immutable SQLite migrations", () => {
         0,
         "test",
         0,
-        "fingerprint-2",
+        "2".repeat(64),
         "{}",
         "pending",
         -1,
@@ -1055,7 +1212,7 @@ describe("immutable SQLite migrations", () => {
           1,
           1,
           "pending",
-          "sha256:prompt",
+          "a".repeat(64),
           "gpt-5.6-terra",
           "medium",
           "2026-08-08T00:00:00.000Z",
@@ -1123,6 +1280,70 @@ describe("immutable SQLite migrations", () => {
     );
   });
 
+  test.each(["", "-wal", "-shm"])(
+    "rejects a symbolic-link SQLite%s target before use",
+    async (suffix) => {
+      const { databasePath } = await createTemporaryDatabase();
+      const candidate = `${databasePath}${suffix}`;
+      const target = `${databasePath}${suffix}.target`;
+      await writeFile(target, "target");
+      await symlink(target, candidate);
+
+      expect(() => openDatabase(databasePath)).toThrow(
+        /regular file|symbolic/i,
+      );
+    },
+  );
+
+  test.each(["", "-wal", "-shm"])(
+    "rejects a nonregular SQLite%s target before use",
+    async (suffix) => {
+      const { databasePath } = await createTemporaryDatabase();
+      await mkdir(`${databasePath}${suffix}`);
+
+      expect(() => openDatabase(databasePath)).toThrow(/regular file/i);
+    },
+  );
+
+  test.each(["", "-wal", "-shm"])(
+    "rejects a group- or world-writable existing SQLite%s file on POSIX",
+    async (suffix) => {
+      if (process.platform === "win32") return;
+      const { databasePath } = await createTemporaryDatabase();
+      const candidate = `${databasePath}${suffix}`;
+      await writeFile(candidate, "", { mode: 0o600 });
+      await chmod(candidate, 0o666);
+      let opened: ReturnType<typeof openDatabase> | undefined;
+      let error: unknown;
+
+      try {
+        opened = openDatabase(databasePath);
+      } catch (caught) {
+        error = caught;
+      }
+      if (opened !== undefined) await opened.close();
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(
+        /permission|group|world|writable/i,
+      );
+    },
+  );
+
+  test("creates a private regular database file owned by the current POSIX user", async () => {
+    const { databasePath } = await createTemporaryDatabase();
+    open(databasePath);
+    const status = await lstat(databasePath);
+
+    expect(status.isFile()).toBe(true);
+    expect(status.isSymbolicLink()).toBe(false);
+    if (process.platform !== "win32") {
+      if (process.getuid !== undefined)
+        expect(status.uid).toBe(process.getuid());
+      expect(status.mode & 0o022).toBe(0);
+    }
+  });
+
   test("exposes Kysely transactions on the same native storage handle", async () => {
     const { databasePath } = await createTemporaryDatabase();
     const connection = open(databasePath);
@@ -1158,6 +1379,23 @@ describe("immutable SQLite migrations", () => {
         .addColumn("id", "integer")
         .execute(),
     ).rejects.toThrow(/closed|destroyed|not open/i);
+  });
+
+  test("concurrent close callers resolve only after the native handle is closed", async () => {
+    const { databasePath } = await createTemporaryDatabase();
+    const connection = open(databasePath);
+
+    const firstClose = connection.close();
+    const secondClose = connection.close();
+    await secondClose;
+    const closedWhenSecondResolved = !connection.native.open;
+    await firstClose;
+    connections.delete(connection);
+
+    expect(closedWhenSecondResolved).toBe(true);
+    await expect(firstClose).resolves.toBeUndefined();
+    await expect(secondClose).resolves.toBeUndefined();
+    expect(connection.native.open).toBe(false);
   });
 
   test("does not replay applied migrations after closing and reopening", async () => {
@@ -1317,6 +1555,32 @@ describe("immutable SQLite migrations", () => {
         .prepare("SELECT id FROM schema_migrations ORDER BY id")
         .all(),
     ).toEqual([{ id: 1 }]);
+  });
+
+  test("rejects invalid UTF-8 migration bytes before any schema or ledger mutation", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    await addMigrationBytes(
+      migrationsDirectory,
+      "002_invalid_utf8.sql",
+      Buffer.concat([
+        Buffer.from(
+          "CREATE TABLE must_not_apply (id INTEGER); -- invalid bytes: ",
+          "utf8",
+        ),
+        Buffer.from([0xc3, 0x28]),
+      ]),
+    );
+    const connection = open(databasePath);
+
+    expect(() => migrateDatabase(connection, migrationsDirectory)).toThrow(
+      /utf-8|encoding/i,
+    );
+    expect(
+      connection.native
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all(),
+    ).toEqual([]);
   });
 
   test("rejects duplicate numeric migration identifiers before mutation", async () => {
