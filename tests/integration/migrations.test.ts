@@ -21,6 +21,9 @@ import { migrateDatabase } from "../../apps/server/src/database/migrate.js";
 const repositoryInitialMigration = fileURLToPath(
   new URL("../../migrations/001_initial.sql", import.meta.url),
 );
+const repositoryWorkflowCoordinatorMigration = fileURLToPath(
+  new URL("../../migrations/002_workflow_coordinator.sql", import.meta.url),
+);
 const maximumJsonBytes = 1024 * 1024;
 const temporaryDirectories: string[] = [];
 const connections = new Set<ReturnType<typeof openDatabase>>();
@@ -37,6 +40,13 @@ async function createTemporaryDatabase(): Promise<{
   await cp(
     repositoryInitialMigration,
     join(migrationsDirectory, "001_initial.sql"),
+    {
+      recursive: false,
+    },
+  );
+  await cp(
+    repositoryWorkflowCoordinatorMigration,
+    join(migrationsDirectory, "002_workflow_coordinator.sql"),
     {
       recursive: false,
     },
@@ -224,10 +234,12 @@ function insertRun(
     issue_node_id: "issue-node-1",
     issue_number: 1,
     intake_json: JSON.stringify({ title: "Issue" }),
-    state: "claimed",
+    state: "review",
     revision: 0,
     rework_epoch: 0,
     repair_round: 0,
+    owner_token: null,
+    ownership_released_at: null,
     worktree_path: "/tmp/worktree",
     base_branch: "main",
     created_at: "2026-08-08T00:00:00.000Z",
@@ -239,10 +251,12 @@ function insertRun(
       `INSERT INTO runs (
         id, repository, project_item_id, issue_node_id, issue_number,
         intake_json, state, revision, rework_epoch, repair_round,
+        owner_token, ownership_released_at,
         worktree_path, base_branch, created_at, updated_at
       ) VALUES (
         @id, @repository, @project_item_id, @issue_node_id, @issue_number,
         @intake_json, @state, @revision, @rework_epoch, @repair_round,
+        @owner_token, @ownership_released_at,
         @worktree_path, @base_branch, @created_at, @updated_at
       )`,
     )
@@ -327,7 +341,7 @@ afterEach(async () => {
 });
 
 describe("immutable SQLite migrations", () => {
-  test("migrates a fresh real database to exactly the ledger and six operational tables", async () => {
+  test("migrates a fresh real database to the ledger and operational tables", async () => {
     const { databasePath, migrationsDirectory } =
       await createTemporaryDatabase();
     const connection = open(databasePath);
@@ -346,6 +360,7 @@ describe("immutable SQLite migrations", () => {
       "events",
       "findings",
       "runs",
+      "scheduler_control",
       "schema_migrations",
       "side_effects",
       "steps",
@@ -357,6 +372,20 @@ describe("immutable SQLite migrations", () => {
       "checksum",
       "applied_at",
     ]);
+    expectExactColumns(tableColumns(connection, "scheduler_control"), [
+      "id",
+      "revision",
+      "paused",
+      "stop_after_current",
+      "updated_at",
+    ]);
+    expect(
+      connection.native
+        .prepare(
+          "SELECT id, revision, paused, stop_after_current FROM scheduler_control",
+        )
+        .all(),
+    ).toEqual([{ id: 1, revision: 0, paused: 0, stop_after_current: 0 }]);
     expectExactColumns(tableColumns(connection, "runs"), [
       "id",
       "repository",
@@ -483,6 +512,7 @@ describe("immutable SQLite migrations", () => {
         "findings",
         "approvals",
         "side_effects",
+        "scheduler_control",
       ].map((table) => [
         table,
         tableInfo(connection, table)
@@ -493,6 +523,7 @@ describe("immutable SQLite migrations", () => {
     );
     expect(primaryKeys).toEqual({
       schema_migrations: ["id"],
+      scheduler_control: ["id"],
       runs: ["id"],
       steps: ["id"],
       events: ["id"],
@@ -633,6 +664,12 @@ describe("immutable SQLite migrations", () => {
         "created_at",
         "updated_at",
       ],
+      scheduler_control: [
+        "revision",
+        "paused",
+        "stop_after_current",
+        "updated_at",
+      ],
     };
     for (const [table, columns] of Object.entries(requiredColumns)) {
       const notNullColumns = tableInfo(connection, table)
@@ -662,6 +699,12 @@ describe("immutable SQLite migrations", () => {
     }
 
     expectAffinities(connection, "schema_migrations", ["id"]);
+    expectAffinities(connection, "scheduler_control", [
+      "id",
+      "revision",
+      "paused",
+      "stop_after_current",
+    ]);
     expectAffinities(connection, "runs", [
       "issue_number",
       "revision",
@@ -735,6 +778,286 @@ describe("immutable SQLite migrations", () => {
     );
   });
 
+  test("guards canonical run and side-effect vocabularies through direct SQL", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+
+    insertRun(connection);
+    const canonicalRunStates = [
+      "claiming",
+      "preparing",
+      "rolling_back_claim",
+      "claim_failed",
+      "intaking",
+      "building",
+      "verifying",
+      "reviewing",
+      "repairing",
+      "publishing",
+      "waiting_for_ci",
+      "review",
+      "queued_rework",
+      "returning_to_todo",
+      "merging",
+      "waiting_for_staging",
+      "smoking",
+      "completing",
+      "done",
+      "stopped",
+    ];
+    const updateRunState = connection.native.prepare(
+      "UPDATE runs SET state = ? WHERE id = 'run-1'",
+    );
+    for (const state of canonicalRunStates)
+      expect(() => updateRunState.run(state)).not.toThrow();
+    expect(() => updateRunState.run("made_up")).toThrow(
+      /invalid run state|state vocabulary|check/i,
+    );
+    expect(() => {
+      insertRun(connection, {
+        id: "run-invalid-state",
+        project_item_id: "project-invalid-state",
+        issue_node_id: "issue-invalid-state",
+        state: "made_up",
+      });
+    }).toThrow(/invalid run state|state vocabulary|check/i);
+
+    connection.native
+      .prepare(
+        `INSERT INTO side_effects (
+          key, run_id, rework_epoch, kind, target_revision, fingerprint,
+          intent_json, status, executor_attempt, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "effect-vocabulary",
+        "run-1",
+        0,
+        "test",
+        0,
+        "a".repeat(64),
+        "{}",
+        "pending",
+        0,
+        "2026-08-08T00:00:00.000Z",
+        "2026-08-08T00:00:00.000Z",
+      );
+    const canonicalEffectStatuses = [
+      "pending",
+      "in_flight",
+      "ambiguous",
+      "confirmed",
+      "failed",
+      "cancelled",
+    ];
+    const updateEffectStatus = connection.native.prepare(
+      "UPDATE side_effects SET status = ? WHERE key = 'effect-vocabulary'",
+    );
+    for (const status of canonicalEffectStatuses)
+      expect(() => updateEffectStatus.run(status)).not.toThrow();
+    expect(() => updateEffectStatus.run("made_up")).toThrow(
+      /invalid side.effect status|status vocabulary|check/i,
+    );
+    expect(() =>
+      connection.native
+        .prepare(
+          `INSERT INTO side_effects (
+            key, run_id, rework_epoch, kind, target_revision, fingerprint,
+            intent_json, status, executor_attempt, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "effect-invalid-status",
+          "run-1",
+          0,
+          "test",
+          0,
+          "b".repeat(64),
+          "{}",
+          "made_up",
+          0,
+          "2026-08-08T00:00:00.000Z",
+          "2026-08-08T00:00:00.000Z",
+        ),
+    ).toThrow(/invalid side.effect status|status vocabulary|check/i);
+  });
+
+  test("enforces the scheduler singleton and monotonic revision", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+
+    const update = connection.native.prepare(
+      "UPDATE scheduler_control SET revision = ?, paused = ?, stop_after_current = ? WHERE id = 1",
+    );
+    expect(() => update.run(1, 1, 0)).not.toThrow();
+    expect(() => update.run(1, 0, 1)).not.toThrow();
+    expect(() => update.run(0, 0, 0)).toThrow(/monotonic|revision/i);
+    expect(() => update.run(2, 2, 0)).toThrow(/boolean|paused|check/i);
+    expect(() => update.run(2, 0, 2)).toThrow(
+      /boolean|stop.after.current|check/i,
+    );
+    expect(
+      connection.native
+        .prepare(
+          "SELECT count(*) AS count, min(id) AS id, max(id) AS max_id FROM scheduler_control",
+        )
+        .get(),
+    ).toEqual({ count: 1, id: 1, max_id: 1 });
+    expect(() =>
+      connection.native
+        .prepare(
+          "INSERT INTO scheduler_control (id, revision, paused, stop_after_current, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(2, 0, 0, 0, "2026-08-08T00:00:00.000Z"),
+    ).toThrow(/check|singleton/i);
+    expect(() =>
+      connection.native
+        .prepare("DELETE FROM scheduler_control WHERE id = 1")
+        .run(),
+    ).toThrow(/singleton|scheduler/i);
+  });
+
+  test("enforces one unreleased project owner and one coding slot", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+
+    insertRun(connection, { owner_token: "owner-1", state: "claiming" });
+    expect(() =>
+      insertRun(connection, {
+        id: "run-project-duplicate",
+        issue_node_id: "issue-node-2",
+        issue_number: 2,
+        owner_token: "owner-2",
+      }),
+    ).toThrow(/unique|project/i);
+    expect(() =>
+      insertRun(connection, {
+        id: "run-project-released",
+        issue_node_id: "issue-node-3",
+        issue_number: 3,
+        owner_token: "owner-3",
+        ownership_released_at: "2026-08-08T00:01:00.000Z",
+        state: "review",
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      insertRun(connection, {
+        id: "run-coding-duplicate",
+        project_item_id: "project-item-2",
+        issue_node_id: "issue-node-4",
+        issue_number: 4,
+        state: "building",
+      }),
+    ).toThrow(/unique|coding/i);
+    expect(() =>
+      insertRun(connection, {
+        id: "run-review-slot",
+        project_item_id: "project-item-3",
+        issue_node_id: "issue-node-5",
+        issue_number: 5,
+        state: "review",
+      }),
+    ).not.toThrow();
+
+    const indexNames = (
+      connection.native
+        .prepare("PRAGMA index_list('side_effects')")
+        .all() as Array<{ name: string }>
+    ).map(({ name }) => name);
+    expect(indexNames).toContain("side_effects_unresolved_index");
+    const runIndexNames = (
+      connection.native.prepare("PRAGMA index_list('runs')").all() as Array<{
+        name: string;
+      }>
+    ).map(({ name }) => name);
+    expect(runIndexNames).toContain("runs_active_project_owner_index");
+    expect(runIndexNames).toContain("runs_coding_slot_index");
+  });
+
+  test("rejects updates and deletes from append-only history tables", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+    insertRun(connection);
+    insertStep(connection);
+    connection.native
+      .prepare(
+        "INSERT INTO events (id, run_id, sequence, run_revision, kind, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        "event-1",
+        "run-1",
+        1,
+        0,
+        "test",
+        "test",
+        "2026-08-08T00:00:00.000Z",
+      );
+    connection.native
+      .prepare(
+        `INSERT INTO findings (
+          id, run_id, rework_epoch, review_step_id, stable_key,
+          disposition_sequence, severity, evidence, disposition, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "finding-1",
+        "run-1",
+        0,
+        "step-1",
+        "finding-key",
+        1,
+        "high",
+        "evidence",
+        "open",
+        "2026-08-08T00:00:00.000Z",
+      );
+    connection.native
+      .prepare(
+        `INSERT INTO approvals (
+          id, run_id, operator, approved_head_sha, observed_base_sha,
+          decision, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "approval-1",
+        "run-1",
+        "operator",
+        "a".repeat(40),
+        "b".repeat(64),
+        "approved",
+        "2026-08-08T00:00:00.000Z",
+      );
+
+    for (const [table, primaryKey, id] of [
+      ["steps", "id", "step-1"],
+      ["events", "id", "event-1"],
+      ["findings", "id", "finding-1"],
+      ["approvals", "id", "approval-1"],
+    ] as const) {
+      expect(() =>
+        connection.native
+          .prepare(
+            `UPDATE ${table} SET ${primaryKey} = ${primaryKey} WHERE ${primaryKey} = ?`,
+          )
+          .run(id),
+      ).toThrow(/append.only history/i);
+      expect(() =>
+        connection.native
+          .prepare(`DELETE FROM ${table} WHERE ${primaryKey} = ?`)
+          .run(id),
+      ).toThrow(/append.only history/i);
+    }
+  });
+
   test("indexes durable identities without enforcing active ownership uniqueness", async () => {
     const { databasePath, migrationsDirectory } =
       await createTemporaryDatabase();
@@ -774,6 +1097,7 @@ describe("immutable SQLite migrations", () => {
     insertRun(connection, {
       intake_json: null,
       worktree_path: null,
+      state: "claiming",
     });
 
     expect(
@@ -786,7 +1110,7 @@ describe("immutable SQLite migrations", () => {
         )
         .get("run-1"),
     ).toEqual({
-      state: "claimed",
+      state: "claiming",
       intake_json: null,
       worktree_path: null,
       pull_request_number: null,
@@ -859,14 +1183,6 @@ describe("immutable SQLite migrations", () => {
         "approved",
         "2026-08-08T00:00:00.000Z",
       );
-    expect(() =>
-      connection.native
-        .prepare(
-          "UPDATE approvals SET approved_head_sha = ?, observed_base_sha = ? WHERE id = ?",
-        )
-        .run("c".repeat(64), "d".repeat(40), "approval-1"),
-    ).not.toThrow();
-
     const invalidHashes = [
       "",
       "g".repeat(40),
@@ -877,11 +1193,29 @@ describe("immutable SQLite migrations", () => {
       "a".repeat(65),
     ];
     for (const field of ["approved_head_sha", "observed_base_sha"]) {
-      const update = connection.native.prepare(
-        `UPDATE approvals SET ${field} = ? WHERE id = 'approval-1'`,
+      const insert = connection.native.prepare(
+        `INSERT INTO approvals (
+          id, run_id, operator, approved_head_sha, observed_base_sha,
+          decision, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       );
-      for (const invalidHash of invalidHashes)
-        expect(() => update.run(invalidHash)).toThrow(/check/i);
+      for (const [index, invalidHash] of invalidHashes.entries()) {
+        const approvedHeadSha =
+          field === "approved_head_sha" ? invalidHash : "a".repeat(40);
+        const observedBaseSha =
+          field === "observed_base_sha" ? invalidHash : "b".repeat(64);
+        expect(() =>
+          insert.run(
+            `approval-invalid-${field}-${index}`,
+            "run-1",
+            "operator",
+            approvedHeadSha,
+            observedBaseSha,
+            "approved",
+            "2026-08-08T00:00:00.000Z",
+          ),
+        ).toThrow(/check/i);
+      }
     }
   });
 
@@ -921,17 +1255,24 @@ describe("immutable SQLite migrations", () => {
       "a".repeat(63),
       "a".repeat(65),
     ];
-    for (const [table, field, identity] of [
-      ["steps", "prompt_hash", "step-1"],
-      ["side_effects", "fingerprint", "effect-1"],
-    ]) {
-      const identityColumn = table === "steps" ? "id" : "key";
-      const update = connection.native.prepare(
-        `UPDATE ${table} SET ${field} = ? WHERE ${identityColumn} = ?`,
-      );
-      for (const invalidHash of invalidHashes)
-        expect(() => update.run(invalidHash, identity)).toThrow(/check/i);
-    }
+    const insertInvalidStep = (promptHash: string, index: number): void => {
+      expect(() =>
+        insertStep(connection, {
+          id: `step-invalid-${index}`,
+          prompt_hash: promptHash,
+          attempt: index + 2,
+          status_sequence: index + 2,
+        }),
+      ).toThrow(/check/i);
+    };
+    for (const [index, invalidHash] of invalidHashes.entries())
+      insertInvalidStep(invalidHash, index);
+
+    const updateEffectFingerprint = connection.native.prepare(
+      "UPDATE side_effects SET fingerprint = ? WHERE key = 'effect-1'",
+    );
+    for (const invalidHash of invalidHashes)
+      expect(() => updateEffectFingerprint.run(invalidHash)).toThrow(/check/i);
   });
 
   test.each([
@@ -1473,14 +1814,27 @@ describe("immutable SQLite migrations", () => {
     migrateDatabase(first, migrationsDirectory);
     expect(
       first.native.prepare("SELECT id, name FROM schema_migrations").all(),
-    ).toEqual([{ id: 1, name: "001_initial.sql" }]);
+    ).toEqual([
+      { id: 1, name: "001_initial.sql" },
+      { id: 2, name: "002_workflow_coordinator.sql" },
+    ]);
     await close(first);
 
     const reopened = open(databasePath);
     migrateDatabase(reopened, migrationsDirectory);
     expect(
       reopened.native.prepare("SELECT id, name FROM schema_migrations").all(),
-    ).toEqual([{ id: 1, name: "001_initial.sql" }]);
+    ).toEqual([
+      { id: 1, name: "001_initial.sql" },
+      { id: 2, name: "002_workflow_coordinator.sql" },
+    ]);
+    expect(
+      reopened.native
+        .prepare(
+          "SELECT id, revision, paused, stop_after_current FROM scheduler_control",
+        )
+        .all(),
+    ).toEqual([{ id: 1, revision: 0, paused: 0, stop_after_current: 0 }]);
   });
 
   test("stores the SHA-256 checksum of the exact raw migration bytes", async () => {
@@ -1512,7 +1866,7 @@ describe("immutable SQLite migrations", () => {
     );
     await addMigration(
       migrationsDirectory,
-      "002_two.sql",
+      "003_two.sql",
       "CREATE TABLE two (id INTEGER PRIMARY KEY);",
     );
     const connection = open(databasePath);
@@ -1525,12 +1879,13 @@ describe("immutable SQLite migrations", () => {
         .all(),
     ).toEqual([
       { id: 1, name: "001_initial.sql" },
-      { id: 2, name: "002_two.sql" },
+      { id: 2, name: "002_workflow_coordinator.sql" },
+      { id: 3, name: "003_two.sql" },
       { id: 10, name: "010_ten.sql" },
     ]);
   });
 
-  test("rolls back migration 002 schema and ledger after its ledger insert fails", async () => {
+  test("rolls back migration 003 schema and ledger after its ledger insert fails", async () => {
     const { databasePath, migrationsDirectory } =
       await createTemporaryDatabase();
     const initialConnection = open(databasePath);
@@ -1538,7 +1893,7 @@ describe("immutable SQLite migrations", () => {
     await close(initialConnection);
     await addMigration(
       migrationsDirectory,
-      "002_atomic.sql",
+      "003_atomic.sql",
       "CREATE TABLE must_not_survive (id INTEGER PRIMARY KEY);",
     );
     const connection = open(databasePath);
@@ -1546,7 +1901,7 @@ describe("immutable SQLite migrations", () => {
     expect(() =>
       migrateDatabase(connection, migrationsDirectory, {
         afterLedgerInsert: ({ id }: { id: number }) => {
-          if (id === 2) throw new Error("injected failure");
+          if (id === 3) throw new Error("injected failure");
         },
       }),
     ).toThrow("injected failure");
@@ -1560,7 +1915,7 @@ describe("immutable SQLite migrations", () => {
       reopened.native
         .prepare("SELECT id FROM schema_migrations ORDER BY id")
         .all(),
-    ).toEqual([{ id: 1 }]);
+    ).toEqual([{ id: 1 }, { id: 2 }]);
   });
 
   test("preflights an edited applied migration before applying a later migration", async () => {
@@ -1571,7 +1926,7 @@ describe("immutable SQLite migrations", () => {
     await close(connection);
     await addMigration(
       migrationsDirectory,
-      "002_must_not_apply.sql",
+      "003_must_not_apply.sql",
       "CREATE TABLE must_not_apply (id INTEGER PRIMARY KEY);",
     );
     await replaceMigration(
@@ -1593,7 +1948,7 @@ describe("immutable SQLite migrations", () => {
       reopened.native
         .prepare("SELECT id FROM schema_migrations ORDER BY id")
         .all(),
-    ).toEqual([{ id: 1 }]);
+    ).toEqual([{ id: 1 }, { id: 2 }]);
   });
 
   test("preflights a missing applied migration before applying a later migration", async () => {
@@ -1604,7 +1959,7 @@ describe("immutable SQLite migrations", () => {
     await close(connection);
     await addMigration(
       migrationsDirectory,
-      "002_must_not_apply.sql",
+      "003_must_not_apply.sql",
       "CREATE TABLE must_not_apply (id INTEGER PRIMARY KEY);",
     );
     await rm(join(migrationsDirectory, "001_initial.sql"));
@@ -1622,7 +1977,7 @@ describe("immutable SQLite migrations", () => {
       reopened.native
         .prepare("SELECT id FROM schema_migrations ORDER BY id")
         .all(),
-    ).toEqual([{ id: 1 }]);
+    ).toEqual([{ id: 1 }, { id: 2 }]);
   });
 
   test("rejects invalid UTF-8 migration bytes before any schema or ledger mutation", async () => {
@@ -1630,7 +1985,7 @@ describe("immutable SQLite migrations", () => {
       await createTemporaryDatabase();
     await addMigrationBytes(
       migrationsDirectory,
-      "002_invalid_utf8.sql",
+      "003_invalid_utf8.sql",
       Buffer.concat([
         Buffer.from(
           "CREATE TABLE must_not_apply (id INTEGER); -- invalid bytes: ",
@@ -1754,7 +2109,7 @@ describe("immutable SQLite migrations", () => {
     );
     await addMigration(
       migrationsDirectory,
-      "002_must_not_apply.sql",
+      "003_must_not_apply.sql",
       "CREATE TABLE must_not_apply (id INTEGER);",
     );
 
@@ -1772,7 +2127,7 @@ describe("immutable SQLite migrations", () => {
       reopened.native
         .prepare("SELECT id FROM schema_migrations ORDER BY id")
         .all(),
-    ).toEqual([{ id: 1 }]);
+    ).toEqual([{ id: 1 }, { id: 2 }]);
   });
 
   test("allows transaction and attachment words inside comments and string literals", async () => {
@@ -1780,7 +2135,7 @@ describe("immutable SQLite migrations", () => {
       await createTemporaryDatabase();
     await addMigration(
       migrationsDirectory,
-      "002_legal_words.sql",
+      "003_legal_words.sql",
       `-- BEGIN COMMIT ROLLBACK SAVEPOINT ATTACH DETACH are documentation here
        CREATE TABLE legal_words (value TEXT NOT NULL);
        INSERT INTO legal_words (value)
@@ -1800,7 +2155,7 @@ describe("immutable SQLite migrations", () => {
       connection.native
         .prepare("SELECT id FROM schema_migrations ORDER BY id")
         .all(),
-    ).toEqual([{ id: 1 }, { id: 2 }]);
+    ).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
   });
 
   test.each([
@@ -1814,7 +2169,7 @@ describe("immutable SQLite migrations", () => {
   ])("rejects forbidden SQL statement %s before mutation", async (sql) => {
     const { databasePath, migrationsDirectory } =
       await createTemporaryDatabase();
-    await addMigration(migrationsDirectory, "002_forbidden.sql", sql);
+    await addMigration(migrationsDirectory, "003_forbidden.sql", sql);
     const connection = open(databasePath);
 
     expect(() => migrateDatabase(connection, migrationsDirectory)).toThrow(
@@ -1826,6 +2181,259 @@ describe("immutable SQLite migrations", () => {
         .all(),
     ).toEqual([]);
     expect(tableExists(connection, "must_not_survive")).toBe(false);
+  });
+
+  test("allows trigger-body END while rejecting top-level transaction and ATTACH statements", async () => {
+    const triggerMigration = `CREATE TABLE trigger_probe (value INTEGER);
+      CREATE TRIGGER trigger_probe_guard
+      BEFORE INSERT ON trigger_probe
+      BEGIN
+        SELECT RAISE(ABORT, 'trigger probe');
+      END;`;
+    const valid = await createTemporaryDatabase();
+    await rm(join(valid.migrationsDirectory, "002_workflow_coordinator.sql"));
+    await addMigration(
+      valid.migrationsDirectory,
+      "002_trigger_probe.sql",
+      triggerMigration,
+    );
+    const validConnection = open(valid.databasePath);
+    migrateDatabase(validConnection, valid.migrationsDirectory);
+    expect(tableExists(validConnection, "trigger_probe")).toBe(true);
+    expect(
+      validConnection.native
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trigger_probe_guard'",
+        )
+        .get(),
+    ).toEqual({ name: "trigger_probe_guard" });
+
+    for (const [name, sql] of [
+      ["end", "END;"],
+      ["begin", "BEGIN; CREATE TABLE must_not_apply (id INTEGER);"],
+      ["attach", "ATTACH DATABASE 'other.sqlite' AS other;"],
+    ] as const) {
+      const invalid = await createTemporaryDatabase();
+      await rm(
+        join(invalid.migrationsDirectory, "002_workflow_coordinator.sql"),
+      );
+      await addMigration(invalid.migrationsDirectory, "002_rejected.sql", sql);
+      const invalidConnection = open(invalid.databasePath);
+      expect(() =>
+        migrateDatabase(invalidConnection, invalid.migrationsDirectory),
+      ).toThrow(new RegExp(`forbidden|${name}|transaction|attach`, "i"));
+    }
+  });
+
+  test("rejects INSERT OR REPLACE against append-only rows and scheduler control", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+    insertRun(connection);
+    insertStep(connection);
+    connection.native
+      .prepare(
+        "UPDATE scheduler_control SET revision = ?, paused = ?, stop_after_current = ?, updated_at = ? WHERE id = 1",
+      )
+      .run(7, 1, 1, "2026-08-08T00:07:00.000Z");
+
+    expect(() =>
+      connection.native
+        .prepare(
+          `INSERT OR REPLACE INTO steps (
+            id, run_id, rework_epoch, role, logical_step, attempt,
+            status_sequence, status, prompt_hash, model, reasoning_effort,
+            started_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "step-1",
+          "run-1",
+          0,
+          "reviewer",
+          "review",
+          1,
+          1,
+          "started",
+          "b".repeat(64),
+          "gpt-5.6-terra",
+          "medium",
+          "2026-08-08T00:00:00.000Z",
+        ),
+    ).toThrow(/append.only history/i);
+    expect(
+      connection.native
+        .prepare("SELECT prompt_hash FROM steps WHERE id = 'step-1'")
+        .get(),
+    ).toEqual({ prompt_hash: "a".repeat(64) });
+
+    expect(() =>
+      connection.native
+        .prepare(
+          "INSERT OR REPLACE INTO scheduler_control (id, revision, paused, stop_after_current, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(1, 0, 0, 0, "2026-08-08T00:00:00.000Z"),
+    ).toThrow(/scheduler_control|singleton/i);
+    expect(
+      connection.native
+        .prepare(
+          "SELECT revision, paused, stop_after_current, updated_at FROM scheduler_control WHERE id = 1",
+        )
+        .get(),
+    ).toEqual({
+      revision: 7,
+      paused: 1,
+      stop_after_current: 1,
+      updated_at: "2026-08-08T00:07:00.000Z",
+    });
+  });
+
+  test.each([
+    ["run state", "claimed"],
+    ["side-effect status", "old"],
+  ])(
+    "fails closed when migration 002 encounters a legacy invalid %s",
+    async (_label, invalidValue) => {
+      const { databasePath, migrationsDirectory } =
+        await createTemporaryDatabase();
+      const workflowMigration = await readFile(
+        repositoryWorkflowCoordinatorMigration,
+        "utf8",
+      );
+      await rm(join(migrationsDirectory, "002_workflow_coordinator.sql"));
+      const connection = open(databasePath);
+      migrateDatabase(connection, migrationsDirectory);
+      insertRun(connection, {
+        state: invalidValue === "claimed" ? invalidValue : "review",
+      });
+      connection.native
+        .prepare(
+          `INSERT INTO side_effects (
+            key, run_id, rework_epoch, kind, target_revision, fingerprint,
+            intent_json, status, executor_attempt, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "effect-legacy",
+          "run-1",
+          0,
+          "test",
+          0,
+          "a".repeat(64),
+          "{}",
+          invalidValue === "old" ? invalidValue : "pending",
+          0,
+          "2026-08-08T00:00:00.000Z",
+          "2026-08-08T00:00:00.000Z",
+        );
+      await addMigration(
+        migrationsDirectory,
+        "002_workflow_coordinator.sql",
+        workflowMigration,
+      );
+
+      expect(() => migrateDatabase(connection, migrationsDirectory)).toThrow(
+        /invalid|state|status|check/i,
+      );
+      expect(tableExists(connection, "scheduler_control")).toBe(false);
+      expect(
+        connection.native
+          .prepare("SELECT id FROM schema_migrations ORDER BY id")
+          .all(),
+      ).toEqual([{ id: 1 }]);
+    },
+  );
+
+  test("upgrades and reopens canonical pre-existing rows through migration 002", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const workflowMigration = await readFile(
+      repositoryWorkflowCoordinatorMigration,
+      "utf8",
+    );
+    await rm(join(migrationsDirectory, "002_workflow_coordinator.sql"));
+    const initial = open(databasePath);
+    migrateDatabase(initial, migrationsDirectory);
+    insertRun(initial, { state: "review" });
+    initial.native
+      .prepare(
+        `INSERT INTO side_effects (
+          key, run_id, rework_epoch, kind, target_revision, fingerprint,
+          intent_json, status, executor_attempt, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "effect-canonical",
+        "run-1",
+        0,
+        "test",
+        0,
+        "a".repeat(64),
+        "{}",
+        "pending",
+        0,
+        "2026-08-08T00:00:00.000Z",
+        "2026-08-08T00:00:00.000Z",
+      );
+    await close(initial);
+    await addMigration(
+      migrationsDirectory,
+      "002_workflow_coordinator.sql",
+      workflowMigration,
+    );
+
+    const upgraded = open(databasePath);
+    migrateDatabase(upgraded, migrationsDirectory);
+    expect(
+      upgraded.native
+        .prepare("SELECT id, name FROM schema_migrations ORDER BY id")
+        .all(),
+    ).toEqual([
+      { id: 1, name: "001_initial.sql" },
+      { id: 2, name: "002_workflow_coordinator.sql" },
+    ]);
+    await close(upgraded);
+
+    const reopened = open(databasePath);
+    migrateDatabase(reopened, migrationsDirectory);
+    expect(
+      reopened.native
+        .prepare("SELECT id, state FROM runs WHERE id = 'run-1'")
+        .get(),
+    ).toEqual({ id: "run-1", state: "review" });
+    expect(
+      reopened.native
+        .prepare(
+          "SELECT key, status FROM side_effects WHERE key = 'effect-canonical'",
+        )
+        .get(),
+    ).toEqual({ key: "effect-canonical", status: "pending" });
+    expect(
+      reopened.native
+        .prepare("SELECT id, revision FROM scheduler_control")
+        .get(),
+    ).toEqual({ id: 1, revision: 0 });
+  });
+
+  test("rejects non-integer scheduler revisions without changing the stored value", async () => {
+    const { databasePath, migrationsDirectory } =
+      await createTemporaryDatabase();
+    const connection = open(databasePath);
+    migrateDatabase(connection, migrationsDirectory);
+    const update = connection.native.prepare(
+      "UPDATE scheduler_control SET revision = ? WHERE id = 1",
+    );
+
+    expect(() => update.run("abc")).toThrow(/check|revision|integer/i);
+    expect(() => update.run(1.5)).toThrow(/check|revision|integer/i);
+    expect(
+      connection.native
+        .prepare(
+          "SELECT revision, typeof(revision) AS revision_type FROM scheduler_control WHERE id = 1",
+        )
+        .get(),
+    ).toEqual({ revision: 0, revision_type: "integer" });
   });
 
   test("copies and applies the repository initial migration by its immutable filename", async () => {

@@ -9,6 +9,14 @@ export interface SchemaMigrationsTable {
   applied_at: string;
 }
 
+export interface SchedulerControlTable {
+  id: number;
+  revision: number;
+  paused: number;
+  stop_after_current: number;
+  updated_at: string;
+}
+
 export interface RunsTable {
   id: string;
   repository: string;
@@ -126,6 +134,7 @@ export interface SideEffectsTable {
 
 export interface DatabaseSchema {
   schema_migrations: SchemaMigrationsTable;
+  scheduler_control: SchedulerControlTable;
   runs: RunsTable;
   steps: StepsTable;
   events: EventsTable;

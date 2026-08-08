@@ -78,6 +78,9 @@ function executableTokens(sql: string): string[] {
   const tokens: string[] = [];
   let index = 0;
   let atStatementStart = true;
+  let createTriggerPending = false;
+  let triggerDeclaration = false;
+  let triggerBody = false;
   while (index < sql.length) {
     const character = sql[index];
     const next = sql[index + 1];
@@ -123,16 +126,38 @@ function executableTokens(sql: string): string[] {
       index += 1;
       continue;
     }
-    if (atStatementStart) {
-      const match = /^[A-Za-z]+/.exec(sql.slice(index));
-      if (match?.[0] !== undefined) {
-        tokens.push(match[0].toUpperCase());
+    const match = /^[A-Za-z]+/.exec(sql.slice(index));
+    if (match?.[0] !== undefined) {
+      const token = match[0].toUpperCase();
+      const wasStatementStart = atStatementStart;
+      if (wasStatementStart) {
+        if (!(triggerBody && token === "END")) tokens.push(token);
         atStatementStart = false;
-        index += match[0].length;
-        continue;
       }
-      atStatementStart = false;
+
+      if (wasStatementStart && token === "CREATE") {
+        createTriggerPending = true;
+      } else if (
+        createTriggerPending &&
+        (token === "TEMP" || token === "TEMPORARY")
+      ) {
+        // CREATE TEMP[ORARY] TRIGGER is also a trigger declaration.
+      } else if (createTriggerPending && token === "TRIGGER") {
+        createTriggerPending = false;
+        triggerDeclaration = true;
+      } else if (createTriggerPending) {
+        createTriggerPending = false;
+      }
+
+      if (triggerDeclaration && token === "BEGIN") triggerBody = true;
+      if (triggerBody && wasStatementStart && token === "END") {
+        triggerBody = false;
+        triggerDeclaration = false;
+      }
+      index += match[0].length;
+      continue;
     }
+    atStatementStart = false;
     index += 1;
   }
   return tokens;
