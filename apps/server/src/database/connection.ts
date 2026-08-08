@@ -24,6 +24,7 @@ export interface DatabaseConnection {
   native: Database.Database;
   db: Kysely<DatabaseSchema>;
   foreignKeysEnabled: true;
+  recursiveTriggersEnabled: true;
   journalMode: string;
   close(): Promise<void>;
 }
@@ -108,6 +109,12 @@ export function openDatabase(
     if (native.pragma("foreign_keys", { simple: true }) !== 1) {
       throw new Error("SQLite foreign key enforcement could not be enabled");
     }
+    native.pragma("recursive_triggers = ON");
+    if (native.pragma("recursive_triggers", { simple: true }) !== 1) {
+      throw new Error(
+        "SQLite recursive trigger enforcement could not be enabled",
+      );
+    }
 
     const requested =
       options.requestJournalMode ??
@@ -154,6 +161,7 @@ export function openDatabase(
       native: handle,
       db: kysely,
       foreignKeysEnabled: true,
+      recursiveTriggersEnabled: true,
       journalMode,
       close(): Promise<void> {
         if (closePromise !== undefined) return closePromise;
