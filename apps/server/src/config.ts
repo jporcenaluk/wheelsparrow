@@ -1,5 +1,13 @@
-import { readFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import {
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+  win32,
+} from "node:path";
 
 import {
   type Configuration,
@@ -10,6 +18,20 @@ import { parse } from "yaml";
 
 export class WorkspaceRootError extends Error {
   override name = "WorkspaceRootError";
+}
+
+export interface LocalPaths {
+  repositoryRoot: string;
+  dataRoot: string;
+  workspaceRoot: string;
+  databasePath: string;
+  lockPath: string;
+  logsRoot: string;
+}
+
+export interface LoadedRuntimeConfiguration {
+  configuration: Configuration;
+  paths: LocalPaths;
 }
 
 export function resolveConfigurationPath(repositoryRoot: string): string {
@@ -47,6 +69,84 @@ export function resolveWorkspaceRoot(
     );
   }
   return candidate;
+}
+
+function assertContained(repositoryRoot: string, candidate: string): void {
+  const descendant = relative(repositoryRoot, candidate);
+  if (
+    descendant === "" ||
+    descendant === ".." ||
+    descendant.startsWith(`..${sep}`) ||
+    isAbsolute(descendant)
+  ) {
+    throw new WorkspaceRootError(
+      "workspace root must be a relative descendant",
+    );
+  }
+}
+
+function assertPrivateDirectory(path: string, mode: number, uid: number): void {
+  if (typeof process.getuid !== "function") return;
+  if (uid !== process.getuid() || (mode & 0o022) !== 0) {
+    throw new WorkspaceRootError(
+      `workspace storage directory is not private: ${path}`,
+    );
+  }
+}
+
+export async function deriveLocalPaths(
+  repositoryRoot: string,
+  configuredWorkspaceRoot: string,
+): Promise<LocalPaths> {
+  // Validate the supplied spelling before resolving physical paths.
+  resolveWorkspaceRoot(repositoryRoot, configuredWorkspaceRoot);
+
+  const canonicalRepositoryRoot = await realpath(repositoryRoot);
+  const workspaceRoot = resolveWorkspaceRoot(
+    canonicalRepositoryRoot,
+    configuredWorkspaceRoot,
+  );
+  assertContained(canonicalRepositoryRoot, workspaceRoot);
+
+  const segments = relative(canonicalRepositoryRoot, workspaceRoot).split(sep);
+  if (segments.length < 2) {
+    throw new WorkspaceRootError(
+      "workspace root must have at least two path segments",
+    );
+  }
+
+  const dataRoot = dirname(workspaceRoot);
+  let component = canonicalRepositoryRoot;
+  for (const segment of segments) {
+    component = join(component, segment);
+    try {
+      const metadata = await lstat(component);
+      if (metadata.isSymbolicLink()) {
+        throw new WorkspaceRootError(
+          "workspace storage path must not contain symbolic links",
+        );
+      }
+      if (!metadata.isDirectory()) {
+        throw new WorkspaceRootError(
+          "workspace storage path components must be directories",
+        );
+      }
+      assertPrivateDirectory(component, metadata.mode, metadata.uid);
+      assertContained(canonicalRepositoryRoot, await realpath(component));
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw cause;
+    }
+  }
+
+  return {
+    repositoryRoot: canonicalRepositoryRoot,
+    dataRoot,
+    workspaceRoot,
+    databasePath: join(dataRoot, "wheelsparrow.sqlite3"),
+    lockPath: join(dataRoot, "wheelsparrow.lock"),
+    logsRoot: join(dataRoot, "logs"),
+  };
 }
 
 function sanitizedError(cause: unknown): Error {
@@ -124,4 +224,15 @@ export async function loadConfiguration(
       { cause: sanitizedCause },
     );
   }
+}
+
+export async function loadRuntimeConfiguration(
+  repositoryRoot: string,
+): Promise<LoadedRuntimeConfiguration> {
+  const configuration = await loadConfiguration(repositoryRoot);
+  const paths = await deriveLocalPaths(
+    repositoryRoot,
+    configuration.workspace_root,
+  );
+  return { configuration, paths };
 }
