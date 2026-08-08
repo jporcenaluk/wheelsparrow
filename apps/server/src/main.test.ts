@@ -337,6 +337,7 @@ describe("start", () => {
       "build",
       [
         "not-ready",
+        "app-close",
         "database-close",
         "ownership-release",
         "remove:SIGINT",
