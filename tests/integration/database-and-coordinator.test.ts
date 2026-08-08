@@ -5,6 +5,14 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { openDatabase } from "../../apps/server/src/database/connection.js";
+import {
+  createEffectMutationRepository,
+  EffectConflictError,
+  type EffectInsertResult,
+  EffectNotFoundError,
+  listUnresolvedForReconciliation,
+  StaleEffectError,
+} from "../../apps/server/src/database/effects.js";
 import { migrateDatabase } from "../../apps/server/src/database/migrate.js";
 import {
   CodingSlotOccupiedError,
@@ -16,6 +24,11 @@ import {
   readSchedulerControl,
   StaleRevisionError,
 } from "../../apps/server/src/database/runs.js";
+import {
+  EFFECT_STATUSES,
+  type EffectStatus,
+  InvalidTransitionError,
+} from "../../apps/server/src/workflow/state.js";
 
 const migrationSource = fileURLToPath(
   new URL("../../migrations", import.meta.url),
@@ -1013,5 +1026,876 @@ describe("durable run mutation repository", () => {
           ),
         ),
     ).rejects.toThrow(/non-empty/i);
+  });
+});
+
+describe("durable effect mutation repository", () => {
+  function effectIntent(overrides: Record<string, unknown> = {}) {
+    return {
+      key: "run:run-1:project:todo",
+      kind: "project_todo" as const,
+      targetRevision: 1,
+      intent: { z: "last", a: { y: 2, x: 1 } },
+      ...overrides,
+    };
+  }
+
+  test("canonicalizes intent JSON and replays identical keys without inserting", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    const first = await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          effectIntent(),
+          secondAt,
+        ),
+      );
+
+    expect(first.inserted).toBe(true);
+    expect(first.record.intent).toBe('{"a":{"x":1,"y":2},"z":"last"}');
+    expect(first.record.fingerprint).toMatch(/^[0-9a-f]{64}$/u);
+
+    const replay = await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          effectIntent({ intent: { a: { x: 1, y: 2 }, z: "last" } }),
+          secondAt,
+        ),
+      );
+    expect(replay.inserted).toBe(false);
+    expect(replay.record.key).toBe(first.record.key);
+
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            effectIntent({ targetRevision: 2 }),
+            secondAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(EffectConflictError);
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            effectIntent({ fingerprint: "not-a-fingerprint" }),
+            secondAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(EffectConflictError);
+    expect(
+      connection.native
+        .prepare("SELECT count(*) AS count FROM side_effects WHERE key = ?")
+        .get("run:run-1:project:todo"),
+    ).toEqual({ count: 1 });
+  });
+
+  test("retains own __proto__ JSON keys instead of collapsing them into the prototype", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    const first = await connection.db.transaction().execute((tx) =>
+      createEffectMutationRepository(tx).insertEffectIntent(
+        run,
+        effectIntent({
+          key: "run:run-1:proto",
+          intent: JSON.parse('{"__proto__":{"x":1}}') as unknown,
+        }),
+        firstAt,
+      ),
+    );
+    expect(first.record.intent).toBe('{"__proto__":{"x":1}}');
+
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            effectIntent({ key: "run:run-1:proto", intent: {} }),
+            firstAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(EffectConflictError);
+    expect(first.record.fingerprint).not.toBe(
+      (
+        await connection.db
+          .transaction()
+          .execute((tx) =>
+            createEffectMutationRepository(tx).insertEffectIntent(
+              run,
+              effectIntent({ key: "run:run-1:empty", intent: {} }),
+              firstAt,
+            ),
+          )
+      ).record.fingerprint,
+    );
+  });
+
+  test("replays an identical intent after its run advances, while differing replay conflicts", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    const intent = effectIntent({ key: "run:run-1:advanced-replay" });
+    const first = await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          intent,
+          firstAt,
+        ),
+      );
+    await connection.db.transaction().execute((tx) =>
+      createRunMutationRepository(tx).transitionRun({
+        runId: run.id,
+        expectedRevision: run.revision,
+        trigger: "todo_observed",
+        at: secondAt,
+        summary: { text: "Advance before replay." },
+      }),
+    );
+
+    const replay = await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          intent,
+          secondAt,
+        ),
+      );
+    expect(replay.inserted).toBe(false);
+    expect(replay.record).toEqual(first.record);
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            { ...intent, intent: { changed: true } },
+            secondAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(EffectConflictError);
+    expect(
+      connection.native
+        .prepare("SELECT status, receipt_json FROM side_effects WHERE key = ?")
+        .get(intent.key),
+    ).toEqual({ status: "pending", receipt_json: null });
+  });
+
+  test("requires the passed run snapshot and intent target revision to match the live run", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    const staleSnapshot = { ...run, state: "preparing" as const };
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            staleSnapshot,
+            effectIntent({ key: "run:run-1:stale-state" }),
+            firstAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(StaleEffectError);
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            { ...run, revision: 0 },
+            effectIntent({ key: "run:run-1:stale-revision" }),
+            firstAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(StaleEffectError);
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            effectIntent({ key: "run:run-1:wrong-target", targetRevision: 2 }),
+            firstAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(StaleEffectError);
+    expect(
+      connection.native
+        .prepare("SELECT count(*) AS count FROM side_effects")
+        .get(),
+    ).toEqual({ count: 0 });
+  });
+
+  test("invalid kinds and observation triggers leave the durable effect and run unchanged", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            effectIntent({ key: "run:run-1:bad-kind", kind: "not-a-kind" }),
+            firstAt,
+          ),
+        ),
+    ).rejects.toThrow(/effect kind/i);
+
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          effectIntent(),
+          firstAt,
+        ),
+      );
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).markEffectInFlight(
+          effectIntent().key,
+          "executor-1",
+          secondAt,
+        ),
+      );
+    await expect(
+      connection.db.transaction().execute((tx) =>
+        createEffectMutationRepository(tx).recordEffectObservation(
+          {
+            runId: run.id,
+            expectedRevision: run.revision,
+            effectKey: effectIntent().key,
+            outcome: "confirmed",
+            trigger: "handoff_required",
+            evidence: "Wrong trigger for project_todo.",
+          },
+          secondAt,
+        ),
+      ),
+    ).rejects.toBeInstanceOf(InvalidTransitionError);
+    expect(await readRun(connection.db, run.id)).toMatchObject({
+      state: "claiming",
+      revision: 1,
+    });
+    expect(
+      connection.native
+        .prepare(
+          "SELECT status, receipt_json, reconciliation_evidence FROM side_effects WHERE key = ?",
+        )
+        .get(effectIntent().key),
+    ).toEqual({
+      status: "in_flight",
+      receipt_json: null,
+      reconciliation_evidence: null,
+    });
+  });
+
+  test("enforces every legal and illegal effect lifecycle edge in SQLite", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    const legal: Record<EffectStatus, readonly EffectStatus[]> = {
+      pending: ["in_flight", "failed", "cancelled"],
+      in_flight: ["confirmed", "failed", "ambiguous"],
+      ambiguous: ["confirmed", "failed"],
+      confirmed: [],
+      failed: [],
+      cancelled: [],
+    };
+    for (const from of EFFECT_STATUSES) {
+      for (const to of EFFECT_STATUSES) {
+        const key = `run:run-1:edge:${from}:${to}`;
+        await connection.db
+          .transaction()
+          .execute((tx) =>
+            createEffectMutationRepository(tx).insertEffectIntent(
+              run,
+              effectIntent({ key, kind: "project_review" }),
+              firstAt,
+            ),
+          );
+        connection.native
+          .prepare(
+            "UPDATE side_effects SET status = ?, executor_owner_token = ? WHERE key = ?",
+          )
+          .run(from, from === "in_flight" ? "edge-owner" : null, key);
+
+        const operation = () => {
+          if (to === "in_flight")
+            return connection.db
+              .transaction()
+              .execute((tx) =>
+                createEffectMutationRepository(tx).markEffectInFlight(
+                  key,
+                  "edge-owner",
+                  secondAt,
+                ),
+              );
+          if (to === "cancelled")
+            return connection.db
+              .transaction()
+              .execute((tx) =>
+                createEffectMutationRepository(tx).cancelPendingEffect(
+                  key,
+                  "Cancelled edge.",
+                  secondAt,
+                ),
+              );
+          return connection.db.transaction().execute((tx) =>
+            createEffectMutationRepository(tx).recordEffectObservation(
+              {
+                runId: run.id,
+                expectedRevision: run.revision,
+                effectKey: key,
+                outcome: to as "confirmed" | "failed" | "ambiguous",
+                evidence: "Observed edge.",
+              },
+              secondAt,
+            ),
+          );
+        };
+        if (legal[from].includes(to)) {
+          await expect(operation()).resolves.toMatchObject({ status: to });
+        } else {
+          if (to === "pending") {
+            await expect(operation()).rejects.toThrow();
+          } else {
+            await expect(operation()).rejects.toBeInstanceOf(
+              InvalidTransitionError,
+            );
+          }
+          expect(
+            connection.native
+              .prepare("SELECT status FROM side_effects WHERE key = ?")
+              .get(key),
+          ).toEqual({ status: from });
+        }
+      }
+    }
+  });
+
+  test("serializes concurrent same-key inserts and pending dispatch claims", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    const intent = effectIntent({ key: "run:run-1:concurrent" });
+    const inserts = await Promise.allSettled([
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            intent,
+            firstAt,
+          ),
+        ),
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            intent,
+            firstAt,
+          ),
+        ),
+    ]);
+    expect(
+      inserts.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(2);
+    expect(
+      inserts
+        .filter(
+          (result): result is PromiseFulfilledResult<EffectInsertResult> =>
+            result.status === "fulfilled",
+        )
+        .map((result) => result.value.inserted)
+        .sort(),
+    ).toEqual([false, true]);
+    expect(
+      connection.native
+        .prepare("SELECT count(*) AS count FROM side_effects WHERE key = ?")
+        .get(intent.key),
+    ).toEqual({ count: 1 });
+
+    const claims = await Promise.allSettled([
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markEffectInFlight(
+            intent.key,
+            "owner-a",
+            secondAt,
+          ),
+        ),
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markEffectInFlight(
+            intent.key,
+            "owner-b",
+            secondAt,
+          ),
+        ),
+    ]);
+    expect(
+      claims.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      claims.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    expect(
+      connection.native
+        .prepare(
+          "SELECT status, executor_owner_token FROM side_effects WHERE key = ?",
+        )
+        .get(intent.key),
+    ).toMatchObject({ status: "in_flight" });
+  });
+
+  test("scopes shutdown ambiguity to owner and never restarts an ambiguous effect", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    for (const [key, owner] of [
+      ["run:run-1:owner-a", "owner-a"],
+      ["run:run-1:owner-b", "owner-b"],
+    ] as const) {
+      await connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            effectIntent({ key }),
+            firstAt,
+          ),
+        );
+      await connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markEffectInFlight(
+            key,
+            owner,
+            secondAt,
+          ),
+        );
+    }
+    const changed = await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).markOwnedInFlightAmbiguous(
+          "owner-a",
+          "Owner A stopped before receipt.",
+          secondAt,
+        ),
+      );
+    expect(changed.map((effect) => effect.key)).toEqual(["run:run-1:owner-a"]);
+    expect(
+      connection.native
+        .prepare("SELECT key, status FROM side_effects ORDER BY key")
+        .all(),
+    ).toEqual([
+      { key: "run:run-1:owner-a", status: "ambiguous" },
+      { key: "run:run-1:owner-b", status: "in_flight" },
+    ]);
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markEffectInFlight(
+            "run:run-1:owner-a",
+            "owner-c",
+            secondAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(InvalidTransitionError);
+  });
+
+  test("persists bounded failed and ambiguous receipts and evidence", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    for (const [key, outcome] of [
+      ["run:run-1:failed", "failed"],
+      ["run:run-1:ambiguous", "ambiguous"],
+    ] as const) {
+      await connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            effectIntent({ key, kind: "project_review" }),
+            firstAt,
+          ),
+        );
+      await connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markEffectInFlight(
+            key,
+            "owner-1",
+            secondAt,
+          ),
+        );
+      const effect = await connection.db.transaction().execute((tx) =>
+        createEffectMutationRepository(tx).recordEffectObservation(
+          {
+            runId: run.id,
+            expectedRevision: run.revision,
+            effectKey: key,
+            outcome,
+            receipt: { requestId: key },
+            evidence: `${outcome} evidence`,
+          },
+          secondAt,
+        ),
+      );
+      expect(effect.receipt).toBe(`{"requestId":"${key}"}`);
+      expect(effect.reconciliationEvidence).toBe(`${outcome} evidence`);
+      if (outcome === "failed") expect(effect.failure).toBe("failed evidence");
+    }
+  });
+
+  test("orders unresolved effects by run and key across multiple runs", async () => {
+    const connection = await createDatabase();
+    const firstRun = await createClaim(connection);
+    await connection.db.transaction().execute((tx) =>
+      createRunMutationRepository(tx).transitionRun({
+        runId: firstRun.id,
+        expectedRevision: 1,
+        trigger: "handoff_required",
+        at: secondAt,
+        summary: { text: "Release the coding slot." },
+      }),
+    );
+    const liveFirstRun = await readRun(connection.db, firstRun.id);
+    const secondRun = await createClaim(connection, {
+      id: "run-2",
+      projectItemId: "project-item-2",
+      issueNodeId: "issue-node-2",
+      issueNumber: 2,
+      ownerToken: "owner-token-2",
+    });
+    for (const [run, key] of [
+      [liveFirstRun, "run-1:z"],
+      [liveFirstRun, "run-1:a"],
+      [secondRun, "run-2:y"],
+      [secondRun, "run-2:b"],
+    ] as const) {
+      await connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).insertEffectIntent(
+            run,
+            effectIntent({ key, targetRevision: run.revision }),
+            firstAt,
+          ),
+        );
+    }
+    const unresolved = await listUnresolvedForReconciliation(connection.db);
+    expect(unresolved.map(({ effect }) => effect.key)).toEqual([
+      "run-1:a",
+      "run-1:z",
+      "run-2:b",
+      "run-2:y",
+    ]);
+  });
+
+  test("conditionally claims pending effects and records a revision-checked confirmation", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          effectIntent(),
+          firstAt,
+        ),
+      );
+
+    const inFlight = await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).markEffectInFlight(
+          "run:run-1:project:todo",
+          "executor-1",
+          secondAt,
+        ),
+      );
+    expect(inFlight).toMatchObject({
+      status: "in_flight",
+      executorAttempt: 1,
+      executorOwnerToken: "executor-1",
+      startedAt: secondAt,
+    });
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markEffectInFlight(
+            "run:run-1:project:todo",
+            "executor-2",
+            secondAt,
+          ),
+        ),
+    ).rejects.toThrow(/invalid workflow transition/i);
+
+    const confirmed = await connection.db.transaction().execute((tx) =>
+      createEffectMutationRepository(tx).recordEffectObservation(
+        {
+          runId: run.id,
+          expectedRevision: run.revision,
+          effectKey: "run:run-1:project:todo",
+          outcome: "confirmed",
+          trigger: "todo_observed",
+          receipt: { projectItemId: "project-item-1" },
+          evidence: "Project item is now Todo.",
+        },
+        "2026-08-08T18:02:00.000Z",
+      ),
+    );
+    expect(confirmed).toMatchObject({
+      status: "confirmed",
+      receipt: '{"projectItemId":"project-item-1"}',
+      reconciliationEvidence: "Project item is now Todo.",
+    });
+    expect(await readRun(connection.db, run.id)).toMatchObject({
+      state: "preparing",
+      revision: 2,
+    });
+  });
+
+  test("does not dispatch a pending effect after its target revision is stale", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    const intent = effectIntent({ key: "run:run-1:stale-dispatch" });
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          intent,
+          firstAt,
+        ),
+      );
+    await connection.db.transaction().execute((tx) =>
+      createRunMutationRepository(tx).transitionRun({
+        runId: run.id,
+        expectedRevision: run.revision,
+        trigger: "todo_observed",
+        at: secondAt,
+        summary: { text: "Advance before dispatch." },
+      }),
+    );
+
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markEffectInFlight(
+            intent.key,
+            "executor-1",
+            "2026-08-08T18:02:00.000Z",
+          ),
+        ),
+    ).rejects.toBeInstanceOf(StaleEffectError);
+    expect(
+      connection.native
+        .prepare(
+          "SELECT status, receipt_json, executor_owner_token FROM side_effects WHERE key = ?",
+        )
+        .get(intent.key),
+    ).toEqual({
+      status: "pending",
+      receipt_json: null,
+      executor_owner_token: null,
+    });
+  });
+
+  test("rejects stale callbacks without changing the effect", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          effectIntent(),
+          firstAt,
+        ),
+      );
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).markEffectInFlight(
+          effectIntent().key,
+          "executor-1",
+          secondAt,
+        ),
+      );
+    await connection.db.transaction().execute((tx) =>
+      createRunMutationRepository(tx).transitionRun({
+        runId: run.id,
+        expectedRevision: 1,
+        trigger: "todo_observed",
+        at: "2026-08-08T18:02:00.000Z",
+        summary: { text: "Advance the run before a stale callback." },
+      }),
+    );
+
+    await expect(
+      connection.db.transaction().execute((tx) =>
+        createEffectMutationRepository(tx).recordEffectObservation(
+          {
+            runId: run.id,
+            expectedRevision: 1,
+            effectKey: effectIntent().key,
+            outcome: "confirmed",
+            trigger: "todo_observed",
+            evidence: "Late callback.",
+          },
+          "2026-08-08T18:03:00.000Z",
+        ),
+      ),
+    ).rejects.toBeInstanceOf(StaleEffectError);
+    expect(
+      connection.native
+        .prepare("SELECT status, receipt_json FROM side_effects WHERE key = ?")
+        .get(effectIntent().key),
+    ).toEqual({ status: "in_flight", receipt_json: null });
+  });
+
+  test("marks only owned in-flight effects ambiguous and preserves run state", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          effectIntent(),
+          firstAt,
+        ),
+      );
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).markEffectInFlight(
+          effectIntent().key,
+          "executor-1",
+          secondAt,
+        ),
+      );
+    expect(
+      await connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markOwnedInFlightAmbiguous(
+            "other-owner",
+            "No matching effect.",
+            secondAt,
+          ),
+        ),
+    ).toHaveLength(0);
+    const changed = await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).markOwnedInFlightAmbiguous(
+          "executor-1",
+          "Process exited before receipt.",
+          "2026-08-08T18:03:00.000Z",
+        ),
+      );
+    expect(changed).toHaveLength(1);
+    expect(changed[0]).toMatchObject({
+      status: "ambiguous",
+      reconciliationEvidence: "Process exited before receipt.",
+    });
+    expect(await readRun(connection.db, run.id)).toMatchObject({
+      state: "claiming",
+      revision: 1,
+    });
+  });
+
+  test("cancels only pending effects and lists unresolved records deterministically", async () => {
+    const connection = await createDatabase();
+    const run = await createClaim(connection);
+    const pending = effectIntent();
+    const second = effectIntent({
+      key: "run:run-1:workspace:prepare",
+      kind: "workspace_prepare",
+    });
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          pending,
+          firstAt,
+        ),
+      );
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).insertEffectIntent(
+          run,
+          second,
+          firstAt,
+        ),
+      );
+    await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).markEffectInFlight(
+          second.key,
+          "executor-1",
+          secondAt,
+        ),
+      );
+    const cancelled = await connection.db
+      .transaction()
+      .execute((tx) =>
+        createEffectMutationRepository(tx).cancelPendingEffect(
+          pending.key,
+          "No longer required.",
+          secondAt,
+        ),
+      );
+    expect(cancelled.status).toBe("cancelled");
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).cancelPendingEffect(
+            second.key,
+            "Must not cancel in-flight.",
+            secondAt,
+          ),
+        ),
+    ).rejects.toThrow(/invalid workflow transition/i);
+    const unresolved = await listUnresolvedForReconciliation(connection.db);
+    expect(unresolved.map(({ effect }) => effect.key)).toEqual([second.key]);
+    expect(unresolved[0]?.run).toMatchObject({ id: run.id, state: "claiming" });
+  });
+
+  test("reports missing effects with a typed error", async () => {
+    const connection = await createDatabase();
+    await expect(
+      connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).markEffectInFlight(
+            "missing-effect",
+            "executor-1",
+            firstAt,
+          ),
+        ),
+    ).rejects.toBeInstanceOf(EffectNotFoundError);
   });
 });
