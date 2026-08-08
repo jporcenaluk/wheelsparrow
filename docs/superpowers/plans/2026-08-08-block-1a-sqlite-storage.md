@@ -27,9 +27,10 @@ but does not build a log store.
 
 **Dependencies:** exact eligible releases `better-sqlite3@13.0.3`, `kysely@0.29.4`,
 `fs-native-extensions@1.5.0`, and `@types/better-sqlite3@9.6.0`. Registry timestamps were checked on
-2026-08-08 and satisfy the strict 1,440-minute minimum-release-age policy. Only the two native
-packages may enter the lifecycle-script allowlist. `fs-native-extensions` supplies the narrow
-cross-platform OS advisory-lock primitive that Node core lacks; it is not a general filesystem layer.
+2026-08-08 and satisfy the strict 1,440-minute minimum-release-age policy. Only `better-sqlite3`
+requires a lifecycle-script allowlist entry; the audited `fs-native-extensions` graph has no install
+lifecycle scripts. That package supplies the narrow cross-platform OS advisory-lock primitive that
+Node core lacks; it is not a general filesystem layer.
 
 **Run commands:** execute local Node commands as
 `mise exec node@24.18.0 -- corepack pnpm ...`; CI reads the same version from `.node-version`.
@@ -75,12 +76,12 @@ cross-platform OS advisory-lock primitive that Node core lacks; it is not a gene
 **Files:** `MVP_IMPLEMENTATION_LEDGER.md`, `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`,
 `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md`, this plan.
 
-- [ ] Mark every Block 0 publication step complete and bind it to PR #26, pre-merge head
+- [x] Mark every Block 0 publication step complete and bind it to PR #26, pre-merge head
   `6c2bea8fc4233292e0498e60e1c998360aa460b3`, merge SHA
   `64951a3edc3de50bdc8007becde965308c5d3040`, exact-SHA CI runs `31253147178` and
   `31253147159`, and artifact `9020617150`.
-- [ ] Mark row 1 merged and row 2 in progress; make this plan the only resume point.
-- [ ] Correct raw-log and final-conformance row ownership, update direct evidence without upgrading
+- [x] Mark row 1 merged and row 2 in progress; make this plan the only resume point.
+- [x] Correct raw-log and final-conformance row ownership, update direct evidence without upgrading
   broad requirements on indirect proof, recalculate the matrix SHA-256, lint the documents, and
   commit the durable checkpoint before product code.
 
@@ -88,45 +89,48 @@ cross-platform OS advisory-lock primitive that Node core lacks; it is not a gene
 
 **Files:** `apps/server/package.json`, `pnpm-workspace.yaml`, `pnpm-lock.yaml`, `Makefile`, test config.
 
-- [ ] Add one failing integration probe that imports `better-sqlite3`, opens a temporary real file,
+- [x] Add one failing integration probe that imports `better-sqlite3`, opens a temporary real file,
   writes a value, closes, reopens, and reads it. Confirm RED before dependency installation.
-- [ ] Add the exact dependencies above and allow lifecycle scripts only for `better-sqlite3` and
-  `fs-native-extensions`; preserve strict release quarantine and `esbuild`.
-- [ ] Regenerate the lockfile with pinned pnpm, perform a frozen install, and make the real-file suite
+- [x] Add the exact dependencies above and allow lifecycle scripts only for `better-sqlite3`; preserve
+  strict release quarantine and the existing `esbuild` entry. Keep `fs-native-extensions` out of the
+  allowlist because its audited graph has no install lifecycle script.
+- [x] Regenerate the lockfile with pinned pnpm, perform a frozen install, and make the real-file suite
   part of the canonical `make verify-agent` path rather than an optional test command.
-- [ ] Verify focused RED/GREEN, typecheck, repository policy, lint, and diff hygiene.
+- [x] Verify focused RED/GREEN, typecheck, repository policy, lint, and diff hygiene.
 
 ## Task 3: Derive safe local paths
 
 **Files:** `apps/server/src/config.ts`, `apps/server/src/config.test.ts`.
 
-- [ ] Write failing tests for the canonical `.wheelsparrow/workspaces` layout, one-segment rejection,
+- [x] Write failing tests for the canonical `.wheelsparrow/workspaces` layout, one-segment rejection,
   absolute/traversal rejection, a symlink at every existing path depth, missing descendants, and a
   canonical contained path.
-- [ ] Implement `deriveLocalPaths(repositoryRoot, workspaceRoot)` and
+- [x] Implement `deriveLocalPaths(repositoryRoot, workspaceRoot)` and
   `loadRuntimeConfiguration(repositoryRoot)` using `realpath`/`lstat` containment checks. Return
   absolute `repositoryRoot`, `dataRoot`, `workspaceRoot`, `databasePath`, `lockPath`, and `logsRoot`.
-- [ ] Prove path derivation never creates files or directories; creation belongs to startup after the
+- [x] Prove path derivation never creates files or directories; creation belongs to startup after the
   first validation, followed by revalidation.
-- [ ] Run focused tests, typecheck, lint, and diff hygiene.
+- [x] Run focused tests, typecheck, lint, and diff hygiene.
 
 ## Task 4: Enforce exclusive process ownership
 
 **Files:** create `apps/server/src/database/ownership.ts`; create focused tests beside it.
 
-- [ ] Write failing tests for first acquisition, a second native connection receiving a typed conflict,
+- [x] Write failing tests for first acquisition, a second native connection receiving a typed conflict,
   idempotent release/close, acquisition after release, and acquisition after a real child holder is
   force-killed. Add a real two-child contention test proving no overlapping ownership interval.
-- [ ] Implement `acquireOwnership(lockPath)` by opening one private regular file and calling
+- [x] Implement `acquireOwnership(lockPath)` by opening one private regular file and calling
   `fs-native-extensions.tryLock(fd)` for a whole-file exclusive lock. Open existing-or-create with
   `O_RDWR` and mode `0600`; never truncate, unlink, or recreate the lock file. A false result is the
   only ownership conflict; preserve hard open/lock errors. `release()` unlocks and closes the same
   descriptor exactly once.
-- [ ] Keep this as a consumer-local module, not a generic lock/provider or filesystem framework. The
+- [x] Keep this as a consumer-local module, not a generic lock/provider or filesystem framework. The
   lock file contains no application record; authority is the OS-held descriptor lock, released
   automatically when the process exits. The operator-facing conflict says this advisory lock protects
   cooperating Wheelsparrow processes; it does not claim a hostile same-account security boundary.
-- [ ] Run focused tests repeatedly, typecheck, lint, and diff hygiene.
+- [x] Run focused tests repeatedly, typecheck, lint, and diff hygiene. Root's unrestricted Node
+  24.18.0 run passed all 9 native ownership tests, and a fresh reviewer returned `APPROVED` after the
+  two-child proof was added.
 
 ## Task 5: Open SQLite and run immutable migrations
 
@@ -152,6 +156,9 @@ integration tests.
   - `side_effects`: stable key, run/rework, kind, target revision, fingerprint, intent, status, receipt,
     process/request/PR/workflow identifiers when available, attempt/ownership, timing, failure, and
     reconciliation evidence.
+  The initial physical schema is intentionally exact: use the column names asserted in
+  `tests/integration/migrations.test.ts`; add no speculative scheduler, provider, analytics, or
+  workflow-enum columns. Later behavior changes use new immutable migrations instead of editing 001.
 - [ ] Add primary/foreign/unique/index/check constraints that are independent of row 3's still-pending
   state machine. Do not encode guessed workflow enums in the initial migration.
 - [ ] Implement one connection owner around the same native handle/Kysely dialect. Set busy timeout,
@@ -197,14 +204,15 @@ artifact/smoke scripts as needed.
 - [ ] Define the archive honestly as an installable local source bundle for a supported host, not a
   self-contained platform binary. Package `migrations/` and manifests; replace blanket
   `--ignore-scripts` with the explicit pnpm lifecycle allowlist so the supported host installs or
-  builds the two approved native modules while arbitrary transitive scripts stay disabled.
+  builds `better-sqlite3` while arbitrary transitive scripts stay disabled; the lock package loads its
+  shipped native addon without lifecycle execution.
 - [ ] Add semantic workflow tests proving Linux and macOS native install/load/migration coverage,
   migration packaging, strict frozen production install, and exact-revision smoke. Recreate/extract
   the source bundle locally, install on a supported host, and run the same production proof from the
   extracted directory. Do not claim offline or cross-platform binary portability.
 - [ ] Record the resolved native transitive graph, package licenses/integrity, and lifecycle scripts in
   review evidence. Prove the frozen production install permits builds only for `better-sqlite3` and
-  `fs-native-extensions`.
+  that `fs-native-extensions` needs no lifecycle-script exemption.
 - [ ] Run action/workflow policy checks, full verification, build, production smoke, and diff hygiene.
 
 ## Task 8: Review, publish, merge, and bind exact evidence
