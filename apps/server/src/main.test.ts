@@ -115,6 +115,66 @@ function lifecycleFakes({
   };
   let registerWeb: StartDependencies["registerWeb"];
 
+  const dependencies = {
+    async loadRuntimeConfiguration(repositoryRoot: string) {
+      fail("load-runtime");
+      expect(repositoryRoot).toBe(paths.repositoryRoot);
+      return { configuration: {}, paths };
+    },
+    async prepareLocalPaths(actualPaths: LocalPaths) {
+      fail("prepare-paths");
+      expect(actualPaths).toBe(paths);
+      return actualPaths;
+    },
+    async acquireOwnership(lockPath: string) {
+      fail("acquire");
+      expect(lockPath).toBe(paths.lockPath);
+      await pause("acquire");
+      return ownership;
+    },
+    async openDatabase(databasePath: string) {
+      fail("open");
+      expect(databasePath).toBe(paths.databasePath);
+      await pause("open");
+      return database;
+    },
+    async migrateDatabase(actualDatabase: typeof database, directory: string) {
+      fail("migrate");
+      expect(actualDatabase).toBe(database);
+      expect(directory).toBe(
+        resolve(import.meta.dirname, "../../../migrations"),
+      );
+      await pause("migrate");
+    },
+    async buildApp({ readiness }: { readiness: { isReady(): boolean } }) {
+      fail("build");
+      expect(readiness.isReady()).toBe(false);
+      await pause("build");
+      return app;
+    },
+    createReadinessGate() {
+      let ready = false;
+      return {
+        isReady: () => ready,
+        markReady() {
+          fail("ready");
+          ready = true;
+        },
+        markNotReady() {
+          events.push("not-ready");
+          ready = false;
+        },
+      };
+    },
+    announce(url: string) {
+      fail("announce");
+      expect(url).toBe("http://127.0.0.1:4321");
+    },
+    registerWeb,
+    signalTarget,
+    createCoordinator: undefined as StartDependencies["createCoordinator"],
+    reconcileEffects: undefined as StartDependencies["reconcileEffects"],
+  } satisfies StartDependencies;
   return {
     paths,
     events,
@@ -127,67 +187,7 @@ function lifecycleFakes({
     },
     pausedPhaseHasStarted,
     resumePausedPhase,
-    dependencies: {
-      async loadRuntimeConfiguration(repositoryRoot: string) {
-        fail("load-runtime");
-        expect(repositoryRoot).toBe(paths.repositoryRoot);
-        return { configuration: {}, paths };
-      },
-      async prepareLocalPaths(actualPaths: LocalPaths) {
-        fail("prepare-paths");
-        expect(actualPaths).toBe(paths);
-        return actualPaths;
-      },
-      async acquireOwnership(lockPath: string) {
-        fail("acquire");
-        expect(lockPath).toBe(paths.lockPath);
-        await pause("acquire");
-        return ownership;
-      },
-      async openDatabase(databasePath: string) {
-        fail("open");
-        expect(databasePath).toBe(paths.databasePath);
-        await pause("open");
-        return database;
-      },
-      async migrateDatabase(
-        actualDatabase: typeof database,
-        directory: string,
-      ) {
-        fail("migrate");
-        expect(actualDatabase).toBe(database);
-        expect(directory).toBe(
-          resolve(import.meta.dirname, "../../../migrations"),
-        );
-        await pause("migrate");
-      },
-      async buildApp({ readiness }: { readiness: { isReady(): boolean } }) {
-        fail("build");
-        expect(readiness.isReady()).toBe(false);
-        await pause("build");
-        return app;
-      },
-      createReadinessGate() {
-        let ready = false;
-        return {
-          isReady: () => ready,
-          markReady() {
-            fail("ready");
-            ready = true;
-          },
-          markNotReady() {
-            events.push("not-ready");
-            ready = false;
-          },
-        };
-      },
-      announce(url: string) {
-        fail("announce");
-        expect(url).toBe("http://127.0.0.1:4321");
-      },
-      registerWeb,
-      signalTarget,
-    } satisfies StartDependencies,
+    dependencies,
   };
 }
 
@@ -275,6 +275,168 @@ describe("start", () => {
       "ownership-release",
       "remove:SIGINT",
       "remove:SIGTERM",
+    ]);
+  });
+
+  test("reconciles after migration and closes the coordinator before app resources", async () => {
+    const events: string[] = [];
+    const fake = lifecycleFakes({ events });
+    const coordinator = {
+      async close() {
+        events.push("coordinator-close");
+      },
+    };
+    fake.dependencies.createCoordinator = (database) => {
+      events.push("coordinator");
+      expect(database).toBeDefined();
+      return coordinator;
+    };
+    fake.dependencies.reconcileEffects = (database, actualCoordinator) => {
+      events.push("reconcile");
+      expect(database).toBeDefined();
+      expect(actualCoordinator).toBe(coordinator);
+    };
+
+    const service = await startService(
+      fake.paths.repositoryRoot,
+      fake.dependencies,
+    );
+
+    expect(events).toEqual([
+      "load-runtime",
+      "install:SIGINT",
+      "install:SIGTERM",
+      "prepare-paths",
+      "acquire",
+      "open",
+      "migrate",
+      "coordinator",
+      "reconcile",
+      "build",
+      "listen",
+      "ready",
+      "announce",
+    ]);
+
+    await service.close();
+
+    expect(events.slice(-7)).toEqual([
+      "not-ready",
+      "coordinator-close",
+      "app-close",
+      "database-close",
+      "ownership-release",
+      "remove:SIGINT",
+      "remove:SIGTERM",
+    ]);
+  });
+
+  test("fails closed before building the listener when reconciliation lacks an adapter", async () => {
+    const events: string[] = [];
+    const fake = lifecycleFakes({ events });
+    const reconciliationFailure = new Error(
+      "Startup reconciliation requires a dispatcher",
+    );
+    const coordinator = {
+      async close() {
+        events.push("coordinator-close");
+      },
+    };
+    fake.dependencies.createCoordinator = () => {
+      events.push("coordinator");
+      return coordinator;
+    };
+    fake.dependencies.reconcileEffects = () => {
+      events.push("reconcile");
+      throw reconciliationFailure;
+    };
+
+    await expect(
+      startService(fake.paths.repositoryRoot, fake.dependencies),
+    ).rejects.toBe(reconciliationFailure);
+
+    expect(events).toEqual([
+      "load-runtime",
+      "install:SIGINT",
+      "install:SIGTERM",
+      "prepare-paths",
+      "acquire",
+      "open",
+      "migrate",
+      "coordinator",
+      "reconcile",
+      "not-ready",
+      "coordinator-close",
+      "database-close",
+      "ownership-release",
+      "remove:SIGINT",
+      "remove:SIGTERM",
+    ]);
+  });
+
+  test("rejects a partial coordinator seam before constructing or building", async () => {
+    const events: string[] = [];
+    const fake = lifecycleFakes({ events });
+    let createCalls = 0;
+    fake.dependencies.createCoordinator = () => {
+      createCalls += 1;
+      events.push("coordinator");
+      return {
+        async close() {
+          events.push("coordinator-close");
+        },
+      };
+    };
+
+    await expect(
+      startService(fake.paths.repositoryRoot, fake.dependencies),
+    ).rejects.toThrow(
+      "Coordinator and reconciliation dependencies must be provided together",
+    );
+
+    expect(createCalls).toBe(0);
+    expect(events).toEqual([
+      "load-runtime",
+      "install:SIGINT",
+      "install:SIGTERM",
+      "prepare-paths",
+      "acquire",
+      "open",
+      "migrate",
+      "not-ready",
+      "database-close",
+      "ownership-release",
+      "remove:SIGINT",
+      "remove:SIGTERM",
+    ]);
+  });
+
+  test("removes an installed SIGINT handler when SIGTERM registration fails", async () => {
+    const events: string[] = [];
+    const fake = lifecycleFakes({ events });
+    const registrationFailure = new Error("SIGTERM registration failed");
+    const originalSignalTarget = fake.dependencies.signalTarget;
+    fake.dependencies.signalTarget = {
+      once(signal, listener) {
+        if (signal === "SIGTERM") {
+          events.push("install:SIGTERM");
+          throw registrationFailure;
+        }
+        originalSignalTarget.once(signal, listener);
+      },
+      removeListener: originalSignalTarget.removeListener,
+    };
+
+    await expect(
+      startService(fake.paths.repositoryRoot, fake.dependencies),
+    ).rejects.toBe(registrationFailure);
+
+    expect(events).toEqual([
+      "load-runtime",
+      "install:SIGINT",
+      "install:SIGTERM",
+      "not-ready",
+      "remove:SIGINT",
     ]);
   });
 

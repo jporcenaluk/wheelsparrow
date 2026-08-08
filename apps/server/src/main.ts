@@ -7,17 +7,24 @@ import {
   loadRuntimeConfiguration,
   prepareLocalPaths,
 } from "./config.js";
+import type { DatabaseConnection } from "./database/connection.js";
 import { openDatabase } from "./database/connection.js";
 import { migrateDatabase } from "./database/migrate.js";
 import { acquireOwnership } from "./database/ownership.js";
 import { createReadinessGate, type ReadinessGate } from "./readiness.js";
 import { registerWeb } from "./web.js";
+import { WorkflowCoordinator } from "./workflow/coordinator.js";
+import { reconcileEffects } from "./workflow/reconciliation.js";
 
 interface Ownership {
   release(): Promise<void>;
 }
 
 interface Database {
+  close(): Promise<void>;
+}
+
+export interface Coordinator {
   close(): Promise<void>;
 }
 
@@ -45,6 +52,11 @@ export interface StartDependencies {
   acquireOwnership(lockPath: string): Promise<Ownership>;
   openDatabase(databasePath: string): Database | Promise<Database>;
   migrateDatabase(database: Database, directory: string): void | Promise<void>;
+  /** Construct and recover the workflow coordinator after migrations. */
+  createCoordinator?: ((database: Database) => Coordinator) | undefined;
+  reconcileEffects?:
+    | ((database: Database, coordinator: Coordinator) => void | Promise<void>)
+    | undefined;
   buildApp(options: {
     readiness: ReadinessGate;
     registerWeb?: (app: FastifyInstance) => Promise<void>;
@@ -94,8 +106,10 @@ export async function startService(
   let readiness: ReadinessGate | undefined;
   let ownership: Ownership | undefined;
   let database: Database | undefined;
+  let coordinator: Coordinator | undefined;
   let app: Application | undefined;
-  let handlersInstalled = false;
+  let sigintHandlerInstalled = false;
+  let sigtermHandlerInstalled = false;
   let shutdownRequested = false;
   let closePromise: Promise<void> | undefined;
   let startupSettled = false;
@@ -118,19 +132,25 @@ export async function startService(
         }
       };
 
-      if (handlersInstalled && readiness !== undefined) {
+      if (
+        (sigintHandlerInstalled || sigtermHandlerInstalled) &&
+        readiness !== undefined
+      ) {
         await attempt(() => readiness?.markNotReady());
       }
+      if (coordinator !== undefined) await attempt(() => coordinator?.close());
       if (app !== undefined) await attempt(() => app?.close());
       if (database !== undefined) await attempt(() => database?.close());
       if (ownership !== undefined) await attempt(() => ownership?.release());
-      if (handlersInstalled) {
+      if (sigintHandlerInstalled) {
         await attempt(() =>
           dependencies.signalTarget.removeListener(
             "SIGINT",
             signalHandlers.SIGINT,
           ),
         );
+      }
+      if (sigtermHandlerInstalled) {
         await attempt(() =>
           dependencies.signalTarget.removeListener(
             "SIGTERM",
@@ -165,8 +185,9 @@ export async function startService(
         await dependencies.loadRuntimeConfiguration(repositoryRoot);
       readiness = dependencies.createReadinessGate();
       dependencies.signalTarget.once("SIGINT", signalHandlers.SIGINT);
+      sigintHandlerInstalled = true;
       dependencies.signalTarget.once("SIGTERM", signalHandlers.SIGTERM);
-      handlersInstalled = true;
+      sigtermHandlerInstalled = true;
       await dependencies.prepareLocalPaths(paths);
       stopIfRequested();
       ownership = await dependencies.acquireOwnership(paths.lockPath);
@@ -178,6 +199,21 @@ export async function startService(
         resolveMigrationsDirectory(),
       );
       stopIfRequested();
+      const createCoordinator = dependencies.createCoordinator;
+      const reconcile = dependencies.reconcileEffects;
+      const hasCoordinatorFactory = createCoordinator !== undefined;
+      const hasReconciler = reconcile !== undefined;
+      if (hasCoordinatorFactory !== hasReconciler) {
+        throw new Error(
+          "Coordinator and reconciliation dependencies must be provided together",
+        );
+      }
+      if (hasCoordinatorFactory && hasReconciler) {
+        coordinator = createCoordinator(database);
+        stopIfRequested();
+        await reconcile(database, coordinator);
+        stopIfRequested();
+      }
       app = await dependencies.buildApp(
         process.env.NODE_ENV === "development"
           ? { readiness }
@@ -254,6 +290,17 @@ const productionDependencies: StartDependencies = {
   acquireOwnership,
   openDatabase,
   migrateDatabase,
+  createCoordinator(database) {
+    return new WorkflowCoordinator({
+      connection: database as DatabaseConnection,
+    });
+  },
+  async reconcileEffects(database, coordinator) {
+    await reconcileEffects({
+      connection: database as DatabaseConnection,
+      coordinator: coordinator as WorkflowCoordinator,
+    });
+  },
   buildApp,
   createReadinessGate,
   announce(url) {
