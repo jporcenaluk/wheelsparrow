@@ -1,6 +1,6 @@
 # Wheelsparrow MVP Implementation Ledger
 
-Updated: 2026-08-07
+Updated: 2026-08-08
 
 Active goal thread: `019fd8d9-1c69-7810-82ae-6e6b35c2e2e6`
 
@@ -21,8 +21,15 @@ and marks the ticket done only when the evidence matches.
 
 ## Authority and Scope
 
-- Authoritative base: `main` at `471a668cbd62db919ce914ce1a891d01cc0ea72a`.
+- Authoritative base: protected `main` at `81271c278c47a96e2882888e20c577449c5f69b8`,
+  live-verified on 2026-08-08.
 - Approved product design: `SPEC.md`, `ARCHITECTURE.md`, `TECH_STACK.md`, and `CICD.md` at that SHA.
+- Approved delivery control:
+  `docs/superpowers/specs/2026-08-08-mvp-delivery-control-design.md`.
+- Complete traceability matrix: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`, covering the normative
+  sources at `81271c278c47a96e2882888e20c577449c5f69b8`; content SHA-256
+  `b4b76b326663513f411f7f552f89ca65ad9358e54432cf61dae0ebd9219abbff`; 341 rows
+  (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77).
 - PR #3 is a stale, broad reference quarry. It is not an implementation base.
 - The untracked files in the root checkout belong to an earlier broad implementation attempt. They
   remain untouched until their provenance and reuse value are audited.
@@ -33,15 +40,21 @@ and marks the ticket done only when the evidence matches.
 
 ## Decision Rules
 
-1. Product behavior in `SPEC.md` wins over implementation convenience.
-2. Conflicts among normative documents stop the affected block until the orchestrator resolves and
+1. Prime directive: build a system that reliably orchestrates and tracks agentic work through
+   completion, with clear operator visibility in a slick, clean UI.
+2. Before each task or requirement, ask whether it makes sense, whether a knowledgeable engineer
+   would choose it now, and whether a smaller, safer, or clearer alternative advances the prime
+   directive better. Explicitly reject, defer, or resolve performative requirements rather than
+   implementing them ceremonially.
+3. Product behavior in `SPEC.md` wins over implementation convenience.
+4. Conflicts among normative documents stop the affected block until the orchestrator resolves and
    records them.
-3. No speculative provider framework, workflow engine, package hierarchy, or hosted platform enters
+5. No speculative provider framework, workflow engine, package hierarchy, or hosted platform enters
    the MVP.
-4. Every behavioral block starts with a failing test or an equivalent recorded regression check.
-5. Evidence belongs to an exact commit SHA. A later commit invalidates prior code, review, CI, and
+6. Every behavioral block starts with a failing test or an equivalent recorded regression check.
+7. Evidence belongs to an exact commit SHA. A later commit invalidates prior code, review, CI, and
    approval evidence where the change could affect it.
-6. The root orchestrator alone creates commits, pushes branches, opens or updates pull requests, and
+8. The root orchestrator alone creates commits, pushes branches, opens or updates pull requests, and
    merges to `main`.
 
 ## Agent Hierarchy and Model Routing
@@ -57,49 +70,48 @@ and marks the ticket done only when the evidence matches.
 - Mechanical lane: inventory, formatting, traceability checks, log classification, and narrow test
   review. Prefer a smaller model or lower reasoning effort when representative results preserve
   accuracy.
+- Spawned implementation, inventory, and review lanes use the global default `gpt-5.6-terra` with
+  `medium` reasoning. Root retains authoritative documents, integration, commits, publication,
+  merge, and completion claims. An explicit spawn override requires a later user instruction.
 
-Model and effort choices must follow measured task difficulty. Start at medium effort for bounded
-work, use low effort for latency-sensitive mechanical checks, and reserve high or above for tasks
-where deeper reasoning changes the result.
+## Merge Train
 
-## Delivery Blocks
+This is the only operational delivery order. The useful headless milestone is row 5; rows 6-8 remain
+required product outcomes.
 
-The programme uses nine bounded blocks. B5 is the first useful issue-to-reviewed-PR product; B8
-closes the strict documented MVP.
-
-| Block | Working outcome | Status | Evidence |
-| --- | --- | --- | --- |
-| 0 | Runnable foundation, validated config, pinned toolchain, local gate, initial CI | Awaiting human approval | PR #25; implementation checkpoint `87446b6` |
-| 1 | SQLite records, serialized coordinator, internal transitions, idempotent effects | Pending | Pending |
-| 2 | Deterministic GitHub discovery, eligibility, claim, and stateful fake | Pending | Pending |
-| 3 | Isolated Codex builder, worktree containment, verification, and process control | Pending | Pending |
-| 4 | Fresh independent review, findings, and bounded repair | Pending | Pending |
-| 5 | Commit, push, non-draft PR, exact-SHA CI, and Review handoff | Pending | Pending |
-| 6 | Operator API and browser UI with revision-bound controls and SSE | Pending | Pending |
-| 7 | Approved merge, staging observation, smoke evidence, and Done gate | Pending | Pending |
-| 8 | Full CI/security/main-artifact contract and end-to-end proof | Pending | Pending |
+| Order | Outcome | Depends on | Status | Worktree and branch | Plan | Pull request | Merge SHA |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | Deterministic Block 0 process-cleanup repair and control-plane setup | PR #25 foundation | `in_progress` | `.worktrees/block0-flake`; `fix/block-0-process-test-flake` | `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md` | — | — |
+| 2 | SQLite storage, migrations, and single-process ownership | 1 | `pending` | — | — | — | — |
+| 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `pending` | — | — | — | — |
+| 4 | GitHub discovery and claim through a verified local candidate | 3 | `pending` | — | — | — | — |
+| 5 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 4 | `pending` | — | — | — | — |
+| 6 | Operator API and browser controls | 3 and stable read contract | `pending` | — | — | — | — |
+| 7 | Exact-SHA approval, merge, staging, smoke, and Done transition | 5 and 6 | `pending` | — | — | — | — |
+| 8 | Integration, security, artifact, and requirement-conformance closure | 7 | `pending` | — | — | — | — |
 
 ## Current Resume Point
 
-- Active block: B0, runnable foundation.
-- Active task: babysit PR #25 through exact-SHA approval and protected squash merge.
-- Isolated checkout: `/home/jporc/wheelsparrow/.worktrees/block0`.
-- Branch: `feat/block-0-foundation`, based on approved base `471a668cbd62db919ce914ce1a891d01cc0ea72a`;
-  current implementation checkpoint is `87446b6`.
-- Executable plan: `docs/superpowers/plans/2026-08-06-block-0-runnable-foundation.md` in the
-  isolated checkout.
-- Current owner: bounded implementation agent; the root orchestrator retains commits and protected
-  actions.
-- Completed gate: Task 8 implementation checkpoint `87446b6` includes all six reviewed repairs and
-  passed the combined exact-toolchain local gate.
-- Last implementation checkpoint: `87446b6`.
-- Next gate: push this publication-state ledger checkpoint, require its exact-SHA checks, then obtain
-  the repository-required qualified human approval before squash merge. Repository auto-merge is
-  disabled, so the root orchestrator must perform the merge after approval.
-
-The dependency spine is B0 -> B1 -> B2 -> B3 -> B4 -> B5; B6 may begin after B1 but integrates with
-B5; B7 depends on B5 and B6; B8 closes the programme. Each block must leave `main` runnable and must
-include focused tests, independent review, required CI, merge evidence, and a ledger update.
+- Authoritative remote `main`: `81271c278c47a96e2882888e20c577449c5f69b8`, live-verified through
+  the connected GitHub integration on 2026-08-08.
+- Active slice: merge-train row 1.
+- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block0-flake`.
+- Branch: `fix/block-0-process-test-flake`.
+- Observed HEAD before this ledger edit: `f42fd5ed80c27c40bacafb42793f18cec8ddfeea`.
+- Expected checkout invariant: current HEAD equals the latest commit touching this ledger; verify with
+  `test "$(git rev-parse HEAD)" = "$(git log -1 --format=%H -- MVP_IMPLEMENTATION_LEDGER.md)"`.
+- Active plan: `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md`.
+- Current checkbox after this checkpoint: Task 8, Step 1, reconcile publication state and push the
+  exact reviewed branch.
+- Last verification: fresh whole-branch specification review reports `SPEC COMPLIANT`; fresh
+  subprocess quality review reports `QUALITY APPROVED`; fresh traceability review reports
+  `TRACEABILITY APPROVED`. After accepted document corrections, unrestricted `make verify-agent`
+  passed 11 files and 129 tests, `make build` passed, production lifecycle smoke passed at
+  `http://127.0.0.1:36895`, the five-file Markdownlint gate passed, and diff hygiene passed.
+- Next safe command: run Task 8 Step 1's status, branch-log, branch-diff, and exact-head checks;
+  verify no open PR owns `fix/block-0-process-test-flake`, then push the reviewed branch.
+- Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
+- Blocker: none.
 
 ## Resolved Requirement Questions
 
@@ -128,7 +140,10 @@ include focused tests, independent review, required CI, merge evidence, and a le
   remain binding unless they make the product behavior impossible; any such conflict requires a
   normative documentation change before code.
 
-## SDLC Stage Ledger
+## Historical Setup Checklist
+
+This checklist is immutable historical evidence from the original Block 0 setup. It is not current
+programme status or delivery order; only the merge train and current resume point carry those facts.
 
 - [x] Read the active goal.
 - [x] Verify current local and remote `main` SHA.
@@ -181,6 +196,19 @@ include focused tests, independent review, required CI, merge evidence, and a le
 | 2026-08-07 | B0 final whole-block rereview | A fresh non-author reviewer reported `SPEC COMPLIANT` and `APPROVED`; it explicitly confirmed all six findings closed, effective pnpm configuration `minimumReleaseAge=1440` and `minimumReleaseAgeStrict=true`, focused 104/104 tests, diff hygiene, and no new security, CI, artifact, source/build drift, false-green, scope, or ledger defect |
 | 2026-08-07 | B0 Task 8 implementation checkpoint | Commit `87446b6` records the reviewed configuration, built-asset smoke, strict supply-chain and exact-toolchain repairs, their tests, and the operator README; the subsequent ledger-only checkpoint does not alter executable behavior |
 | 2026-08-07 | B0 PR #25 initial publication | Non-draft [PR #25](https://github.com/jporcenaluk/wheelsparrow/pull/25) targets unchanged base `471a668cbd62db919ce914ce1a891d01cc0ea72a`; initial head `0967bd0ac2a38b97588857e0d233ba450420cb3b` passed `test`, `validate-pr-title`, and `ready-for-review-gate`; GitHub reported mergeable but `REVIEW_REQUIRED`, and enabling auto-merge failed because the repository has auto-merge disabled |
+| 2026-08-08 | Live protected `main` | Connected GitHub commit read reports `81271c278c47a96e2882888e20c577449c5f69b8`; local `github/main` and this branch's merge base agree |
+| 2026-08-08 | PR #25 merge | [PR #25](https://github.com/jporcenaluk/wheelsparrow/pull/25) is merged; head `7df29e602f71fe327a69a5d7fe82f077d68beab6`, protected-main merge SHA `81271c278c47a96e2882888e20c577449c5f69b8` |
+| 2026-08-08 | PR #25 post-merge CI | [CI run 31158318354](https://github.com/jporcenaluk/wheelsparrow/actions/runs/31158318354) job `test` completed successfully at merge SHA `81271c278c47a96e2882888e20c577449c5f69b8` |
+| 2026-08-08 | PR #25 main artifact | [Main artifact run 31158319951](https://github.com/jporcenaluk/wheelsparrow/actions/runs/31158319951) job `build-artifact` completed successfully; artifact `wheelsparrow-81271c278c47a96e2882888e20c577449c5f69b8` ID `8986025122`, digest `sha256:aaaee69333851be4fb1794438ed86a8e82f1db62edf07bb2b2744495dfd328e9`, is unexpired and bound to that SHA |
+| 2026-08-08 | Delivery-control design | Approved design commit `7db4ee1` defines the ledger/matrix/one-plan control plane, merge train, recovery protocol, and agent hierarchy |
+| 2026-08-08 | Row 1 execution-plan review | Xhigh Luna, control-plane, and subprocess reviewers inspected the plan; accepted findings corrected source drift, trace IDs, TDD coverage, process wiring, checkpoint invariants, exact checks, and the one-PR boundary before bootstrap |
+| 2026-08-08 | Requirements matrix | At checkpoint `62b686c`, root integrated four bounded source inventories into 341 reviewed rows (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77) at source revision `81271c278c47a96e2882888e20c577449c5f69b8`; that checkpoint's matrix SHA-256 was `812f47388a15b630f1bd1483bf08cfbaebb1ef656823cf2dd5be2f3229292080`; final Terra/medium review found no open defect |
+| 2026-08-08 | Row 1 control-plane checkpoint | Connected GitHub reconfirmed merged PR #25, protected `main` `81271c278c47a96e2882888e20c577449c5f69b8`, successful jobs in runs `31158318354` and `31158319951`, unexpired exact-SHA artifact `8986025122`, and no open PR for `fix/block-0-process-test-flake`; Markdownlint and diff hygiene passed |
+| 2026-08-08 | Row 1 process-cleanup RED checkpoint | One bounded Terra/medium worker changed only `scripts/preflight.test.ts`; TypeScript and the pre-refactor API group-wiring characterization passed, while all three new helper contracts failed only at the expected missing-export assertion; root inspected the diff, reproduced the exact three failures, and confirmed diff hygiene |
+| 2026-08-08 | Row 1 process-cleanup GREEN checkpoint | The minimal helper extraction preserves timeout semantics while making POSIX process-group cleanup, Windows routing, and double-failure suppression directly testable; focused contracts, Biome, TypeScript, and diff hygiene passed; the unrestricted preflight file passed 25/25; fresh Terra/medium review found no defect and repeated the direct fixture 5/5 |
+| 2026-08-08 | Row 1 repeatability and full local gate | At exact code checkpoint `5cd12d57027435506b5fb97fd8a47757cf55b875`, the unrestricted host passed the real direct process-group test 25/25 and the complete preflight file 25/25; the explicit single-worker repository suite and canonical `make verify-agent` each passed 11 files and 129 tests; build and production lifecycle smoke passed at `http://127.0.0.1:39993`; diff hygiene passed |
+| 2026-08-08 | Row 1 final independent review | Fresh Terra/medium specification review reached `SPEC COMPLIANT`; fresh subprocess review reached `QUALITY APPROVED`; fresh traceability review reached `TRACEABILITY APPROVED` after correcting superseded model routing, current versus historical matrix hashes, one unbound evidence path, and the productless/circular closeout-PR boundary |
+| 2026-08-08 | Row 1 reviewed local proof | Unrestricted `make verify-agent` passed 11 files and 129 tests; build and production lifecycle smoke passed at `http://127.0.0.1:36895`; the five-file Markdownlint gate and diff hygiene passed at the reviewed working content |
 
 ## Open Decisions and Risks
 
@@ -192,11 +220,9 @@ include focused tests, independent review, required CI, merge evidence, and a le
   cleanup.
 - The root checkout's untracked legacy artifacts overlap likely future paths; implementation needs an
   isolated worktree or connector-backed branch that cannot overwrite them.
-- The current ruleset lacks required status checks and resolved-conversation enforcement. B0 must add
-  real workflows before the ruleset can safely require their stable names.
-- PR #25 cannot merge until a qualified human approves its latest head. Auto-merge is disabled for
-  the repository, so the orchestrator must recheck exact-SHA CI and merge state after approval and
-  then invoke the authorized squash merge manually.
+- The last recorded ruleset lacked required status checks and resolved-conversation enforcement.
+  Re-read live protection before every merge and require all present exact-head workflows to pass
+  even when the ruleset does not name them.
 - No authorized disposable live-smoke target, staging environment, or deployment exists.
 - The staging contract belongs to target repositories. Tests must prove the orchestration contract
   with a stateful fake even when no real disposable target is authorized.
