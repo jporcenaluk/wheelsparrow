@@ -12,5 +12,6 @@ const ownership = await acquireOwnership(lockPath);
 process.stdout.write("READY\n");
 
 await once(process.stdin, "data");
+process.stdin.destroy();
 await ownership.release();
 process.stdout.write("RELEASED\n");
