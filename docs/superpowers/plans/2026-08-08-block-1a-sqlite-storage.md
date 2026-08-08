@@ -145,8 +145,9 @@ integration tests.
 - [ ] Define Kysely row types for the six operational tables and migration ledger. Persist JSON as
   bounded text; parsing/domain validation belongs to row 3 repositories.
 - [ ] Create `001_initial.sql` with every named `SPEC.md` field family:
-  - `runs`: issue/project identity, state, revision/ownership, timestamps, base/head/merge SHAs, branch,
-    PR, required action, and failure;
+  - `runs`: issue/project identity, bounded intake snapshot, state, revision/ownership,
+    timestamps, base/head/merge SHAs, worktree, base/ticket branches, PR number/title/URL, required
+    action, and failure;
   - `steps`: run, role, logical step, attempt/status, prompt hash, model/reasoning effort, timing, exit
     result, summary, and raw-log reference nullable for row 4;
   - `events`: ordered run sequence/revision, kind, summary/details, log reference, and timestamp;
@@ -160,7 +161,9 @@ integration tests.
   `tests/integration/migrations.test.ts`; add no speculative scheduler, provider, analytics, or
   workflow-enum columns. Later behavior changes use new immutable migrations instead of editing 001.
 - [ ] Add primary/foreign/unique/index/check constraints that are independent of row 3's still-pending
-  state machine. Do not encode guessed workflow enums in the initial migration.
+  state machine. Index issue/project identity for row 3's state-conditional ownership check, prevent
+  cross-run finding-to-step references, and bound persisted JSON to 1 MiB. Do not encode guessed
+  workflow enums or unconditional one-run-per-issue uniqueness in the initial migration.
 - [ ] Implement one connection owner around the same native handle/Kysely dialect. Set busy timeout,
   enable and verify foreign keys, request WAL, retain actual journal mode, expose Kysely transactions,
   and close exactly once.
