@@ -298,6 +298,87 @@ describe("atomic review findings settlement", () => {
     await coordinator.close();
   });
 
+  test("requires the repairable review outcome and nonempty findings", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const cases = [
+      {
+        id: "run-empty-findings",
+        outcome: "failed" as const,
+        trigger: "review_needs_repair" as const,
+        findings: [] as const,
+      },
+      {
+        id: "run-omitted-findings",
+        outcome: "failed" as const,
+        trigger: "review_needs_repair" as const,
+      },
+      {
+        id: "run-approved-findings",
+        outcome: "confirmed" as const,
+        trigger: "review_approved" as const,
+        findings: "included" as const,
+      },
+      {
+        id: "run-human-findings",
+        outcome: "failed" as const,
+        trigger: "handoff_required" as const,
+        findings: "included" as const,
+      },
+    ];
+
+    for (const item of cases) {
+      const run = await enterReviewing(coordinator, connection, item.id);
+      const effect = await reviewEffect(coordinator, run);
+      const step = reviewStep(run);
+      const finding = reviewFinding(run, step.id);
+      const findings =
+        item.findings === "included"
+          ? [finding]
+          : item.findings === undefined
+            ? undefined
+            : item.findings;
+
+      await expect(
+        coordinator.settleExecution({
+          runId: run.id,
+          expectedRevision: run.revision,
+          effectKey: effect.key,
+          outcome: item.outcome,
+          trigger: item.trigger,
+          evidence: "Invalid findings outcome contract.",
+          at,
+          step,
+          ...(findings === undefined ? {} : { findings }),
+        }),
+      ).rejects.toThrow(/findings|review_needs_repair|nonempty/u);
+
+      expect(
+        connection.native
+          .prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?")
+          .get(run.id),
+      ).toEqual({ count: 0 });
+      expect(
+        connection.native
+          .prepare("SELECT COUNT(*) AS count FROM findings WHERE run_id = ?")
+          .get(run.id),
+      ).toEqual({ count: 0 });
+      expect(
+        connection.native
+          .prepare("SELECT status FROM side_effects WHERE key = ?")
+          .get(effect.key),
+      ).toEqual({ status: "in_flight" });
+      await coordinator.transition({
+        runId: run.id,
+        expectedRevision: run.revision,
+        trigger: "handoff_required",
+        at,
+        summary: { text: "Release the test run after rejecting the contract." },
+      });
+    }
+    await coordinator.close();
+  });
+
   test("rolls back step, findings, facts, and effect transition for a stale callback", async () => {
     const connection = await createDatabase();
     const coordinator = new WorkflowCoordinator({ connection });

@@ -240,6 +240,83 @@ describe("contained Git worktree boundary", () => {
     ).rejects.toThrow(/symbolic|symlink|contained|outside/u);
   });
 
+  test("rejects an untracked file replaced during the Git diff read", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    const path = join(prepared.path, "race.txt");
+    const outside = join(repositoryRoot, "race-secret.txt");
+    await writeFile(path, "safe\n", "utf8");
+    await writeFile(outside, "secret\n", "utf8");
+    let replaced = false;
+    const racingGit = async (cwd: string, args: readonly string[]) => {
+      const output = await realGit(cwd, args);
+      if (!replaced && args.includes("--no-index")) {
+        replaced = true;
+        await rm(path);
+        await symlink(outside, path);
+      }
+      return output;
+    };
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: racingGit,
+      }),
+    ).rejects.toThrow(/changed|symbolic|symlink|outside/u);
+  });
+
+  test("bounds the number of untracked files before launching per-file diffs", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await Promise.all(
+      Array.from({ length: 129 }, (_, index) =>
+        writeFile(join(prepared.path, `untracked-${index}.txt`), "x\n", "utf8"),
+      ),
+    );
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/more than 128|untracked/u);
+  });
+
   test("rejects a raw diff that exceeds its bounded readback limit", async () => {
     const { repositoryRoot } = await temporaryGitRepository();
     const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");

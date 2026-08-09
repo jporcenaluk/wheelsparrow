@@ -620,13 +620,20 @@ export class WorkflowCoordinator {
             throw new RangeError(
               `A settlement may append at most ${maximumSettlementFindings} findings.`,
             );
-          if (command.findings.length > 0 && command.step === undefined)
+          if (
+            command.outcome !== "failed" ||
+            command.trigger !== "review_needs_repair" ||
+            command.findings.length === 0
+          )
+            throw new TypeError(
+              "Findings require failed review_needs_repair with nonempty findings.",
+            );
+          if (command.step === undefined)
             throw new TypeError("Findings require an appended review step.");
           if (
-            command.findings.length > 0 &&
-            (currentEffect.kind !== "agent_review" ||
-              command.step?.role !== "reviewer" ||
-              command.step.logicalStep !== "review")
+            currentEffect.kind !== "agent_review" ||
+            command.step?.role !== "reviewer" ||
+            command.step.logicalStep !== "review"
           )
             throw new TypeError(
               "Findings require an agent_review effect and reviewer review step.",
@@ -643,7 +650,13 @@ export class WorkflowCoordinator {
               );
             await repository.appendFinding(finding);
           }
-        }
+        } else if (
+          command.outcome === "failed" &&
+          command.trigger === "review_needs_repair"
+        )
+          throw new TypeError(
+            "review_needs_repair requires a nonempty findings array.",
+          );
         if (command.facts !== undefined)
           await repository.updateExecutionFacts({
             runId: command.runId,
