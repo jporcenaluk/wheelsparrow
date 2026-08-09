@@ -21,9 +21,8 @@ and marks the ticket done only when the evidence matches.
 
 ## Authority and Scope
 
-- Authoritative implementation base: Block 2 merge commit
-  `5c53b95c2293bf65b1154ed03b696c176c2ec9bc`, present as local `origin/main`; live protected-main
-  status will be re-queried before this block is published.
+- Authoritative implementation base: Block 4 merge commit
+  `558b4d54af18db185ef5a637ca635ae0f896abba`, verified from `origin/main` before Block 5 work.
 - Approved product design: `SPEC.md`, `ARCHITECTURE.md`, `TECH_STACK.md`, and `CICD.md`; their
   content is unchanged from source revision `81271c278c47a96e2882888e20c577449c5f69b8` through the
   current protected-main SHA.
@@ -31,7 +30,7 @@ and marks the ticket done only when the evidence matches.
   `docs/superpowers/specs/2026-08-08-mvp-delivery-control-design.md`.
 - Complete traceability matrix: `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`, covering the normative
   sources at `81271c278c47a96e2882888e20c577449c5f69b8`; current content SHA-256
-  `f769506003be84bc40d0b4f3fb9f924eb8a0baa37878c292e631210665dc3cda`; 341 rows
+  `a72131134ddccd97e4a41d40d4a28e80935e789ac1e58f29761d72a737b428a0`; 341 rows
   (`ARCH` 40, `SPEC` 132, `STACK` 92, `CICD` 77).
 - PR #3 is a stale, broad reference quarry. It is not an implementation base.
 - The untracked files in the root checkout belong to an earlier broad implementation attempt. They
@@ -89,29 +88,32 @@ required product outcomes.
 | 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-1b-coordinator.md` | [#28](https://github.com/jporcenaluk/wheelsparrow/pull/28) | `d79b3810ee7a53bf9d37bd191b6b7471bda55538` |
 | 4 | GitHub discovery and claim through a verified local candidate | 3 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-2-github-discovery.md` | [#29](https://github.com/jporcenaluk/wheelsparrow/pull/29) | `5c53b95c2293bf65b1154ed03b696c176c2ec9bc` |
 | 5 | Contained worktree, builder, verification, and durable execution | 4 | `merged` | `.worktrees/block3-builder`; `feat/block-3-builder` | `docs/superpowers/plans/2026-08-09-block-3-builder-workspaces.md` | [#30](https://github.com/jporcenaluk/wheelsparrow/pull/30) | `3410fbfa6384fad8d8f1898f4212ca13d55d875b` |
-| 6 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 5 | `review` | `.worktrees/block4-review`; `feat/block-4-review-main` | `docs/superpowers/plans/2026-08-09-block-4-review-repair.md` | — | — |
-| 7 | Operator API and browser controls | 3 and stable read contract | `pending` | — | — | — | — |
-| 8 | Exact-SHA approval, merge, staging, smoke, and Done transition | 6 and 7 | `pending` | — | — | — | — |
-| 9 | Integration, security, artifact, and requirement-conformance closure | 8 | `pending` | — | — | — | — |
+| 6 | Independent review and bounded repair | 5 | `merged` | `.worktrees/block4-review`; `feat/block-4-review-main` | `docs/superpowers/plans/2026-08-09-block-4-review-repair.md` | [#31](https://github.com/jporcenaluk/wheelsparrow/pull/31) | `558b4d54af18db185ef5a637ca635ae0f896abba` |
+| 7 | Contained publication, exact-head CI, and Review handoff | 6 | `review` | `.worktrees/block5-publication`; `feat/block-5-publication` | `docs/superpowers/plans/2026-08-09-block-5-publication.md` | — | — |
+| 8 | Operator API and browser controls | 3 and stable read contract | `pending` | — | — | — | — |
+| 9 | Exact-SHA approval, merge, staging, smoke, and Done transition | 7 and 8 | `pending` | — | — | — | — |
+| 10 | Integration, security, artifact, and requirement-conformance closure | 9 | `pending` | — | — | — | — |
 
 ## Current Resume Point
 
 - Branch base: protected `main` at
-  `3410fbfa6384fad8d8f1898f4212ca13d55d875b`.
-- Active slice: merge-train row 6, Block 4 independent review and bounded repair.
-- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block4-review`.
-- Branch: `feat/block-4-review-main`.
+  `558b4d54af18db185ef5a637ca635ae0f896abba`.
+- Active slice: merge-train row 7, Block 5 contained publication and exact-head CI.
+- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block5-publication`.
+- Branch: `feat/block-5-publication`.
 - Observed executable head before this ledger edit:
-  `dc7386c9a8dcffdb18cb581243ca2f00c227680a`.
-- Active plan: `docs/superpowers/plans/2026-08-09-block-4-review-repair.md`; review, repair,
-  prompt, raw-diff, and finding-persistence code is complete locally, with publication evidence
-  still pending.
-- Focused local evidence: the Block 4 review/persistence/raw-diff suites passed 69/69 tests and
-  `mise exec node@24.18.0 -- make test-prompts` passed 55/55; the pinned production build passed.
-- Publication state: Block 4 has no PR, CI, or merge evidence. Do not treat local evidence as
-  protected-main or exact-head CI evidence.
-- Next safe command: publish a non-draft Block 4 PR, then observe exact-head CI before any merge
-  decision.
+  `1279229`.
+- Active plan: `docs/superpowers/plans/2026-08-09-block-5-publication.md`; contained Git
+  publication, strict repository-bound PR/check receipts, durable PR identity, exact-head CI, and
+  bounded repair sequencing are complete locally.
+- Local evidence: host-executed unit suite passed 35 files / 760 tests; prompt suite passed 55/55;
+  TypeScript, Biome, `git diff --check`, production build, and production smoke passed. Fresh
+  specification/adversarial reviews drove repair-loop regressions; a final follow-up review
+  approved the corrected head.
+- Publication state: Block 5 has no remote PR, GitHub CI, or merge evidence yet. Local fake-backed
+  exact-head checks do not substitute for protected-main evidence.
+- Next safe command: push the exact reviewed branch, open a non-draft Block 5 PR, and observe CI
+  for that exact head before any merge decision.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 

@@ -10,42 +10,42 @@
 
 ---
 
-### Task 1: Contained commit and push edge
+## Task 1: Contained commit and push edge
 
 **Files:** `apps/server/src/workspaces/git.ts`, `apps/server/src/workspaces/git.test.ts`
 
-- [ ] Add a failing temporary-Git test for revalidated staging, conventional ticket commit, non-force push, exact returned branch/base/head receipt, empty-change rejection, and push failure.
-- [ ] Add `commitAndPushRunWorktree()` using only bounded `GitRunner` calls after `inspectRunWorktree()`; reject changed identity and never force push.
-- [ ] Run `pnpm vitest run apps/server/src/workspaces/git.test.ts`; commit the contained edge.
+- [x] Add a failing temporary-Git test for revalidated staging, conventional ticket commit, non-force push, exact returned branch/base/head receipt, empty-change rejection, and push failure.
+- [x] Add `commitAndPushRunWorktree()` using only bounded `GitRunner` calls after `inspectRunWorktree()`; reject changed identity and never force push.
+- [x] Run `pnpm vitest run apps/server/src/workspaces/git.test.ts`; commit the contained edge.
 
-### Task 2: Concrete GitHub publication boundary and fake
+## Task 2: Concrete GitHub publication boundary and fake
 
 **Files:** `apps/server/src/github/publication.ts`, `apps/server/src/github/publication.test.ts`, `tests/fakes/github.ts`
 
-- [ ] Add failing fake-backed tests for linked non-draft PR create/reread, duplicate keys, pending/green/failure required checks, and head drift.
-- [ ] Define typed PR/check receipts and one repository-bound gateway; the fake records mutation IDs and exact heads.
-- [ ] Run the boundary tests; commit.
+- [x] Add failing fake-backed tests for linked non-draft PR create/reread, duplicate keys, pending/green/failure required checks, and head drift.
+- [x] Define typed PR/check receipts and one repository-bound gateway; the fake records mutation IDs and exact heads.
+- [x] Run the boundary tests; commit.
 
-### Task 3: Coordinator publication facts
+## Task 3: Coordinator publication facts
 
 **Files:** `apps/server/src/database/runs.ts`, `apps/server/src/workflow/coordinator.ts`, focused tests
 
-- [ ] Add failing atomic-settlement tests for validated PR number/title/URL/base/head facts and stale rollback.
-- [ ] Add a narrow publication facts patch accepted only from the coordinator transaction.
-- [ ] Run focused SQLite tests; commit.
+- [x] Add failing atomic-settlement tests for validated PR number/title/URL/base/head facts and stale rollback.
+- [x] Add a narrow publication facts patch accepted only from the coordinator transaction.
+- [x] Run focused SQLite tests; commit.
 
-### Task 4: Publication and exact-CI workflow
+## Task 4: Publication and exact-CI workflow
 
 **Files:** `apps/server/src/workflow/publication.ts`, `apps/server/src/workflow/publication.test.ts`
 
-- [ ] Add real-SQLite failing tests for intent-before-edge, idempotent replay, exact PR receipt, pending observation, green Review handoff, head drift, repairable/exhausted CI failures, and fail-closed ambiguity.
-- [ ] Implement coordinator-owned publish/check sequencing with rework-qualified effect/step keys and bounded receipts.
-- [ ] Run focused workflow tests; commit.
+- [x] Add real-SQLite failing tests for intent-before-edge, idempotent replay, exact PR receipt, pending observation, green Review handoff, head drift, repairable/exhausted CI failures, and fail-closed ambiguity.
+- [x] Implement coordinator-owned publish/check sequencing with rework-qualified effect/step keys and bounded receipts.
+- [x] Run focused workflow tests; commit.
 
-### Task 5: Whole-block evidence
+## Task 5: Whole-block evidence
 
 **Files:** `MVP_IMPLEMENTATION_LEDGER.md`, `docs/delivery/MVP_REQUIREMENTS_MATRIX.md`
 
-- [ ] Reconcile only proven Block 5 requirements and leave Blocks 6–8 pending.
-- [ ] Run `make verify-agent`, `make test-prompts`, `make build`, `make smoke-production`, and `git diff --check`.
-- [ ] Request fresh specification and quality reviews; publish a non-draft PR only after both approve.
+- [x] Reconcile only proven Block 5 requirements and leave Blocks 6–8 pending.
+- [x] Run `make verify-agent`, `make test-prompts`, `make build`, `make smoke-production`, and `git diff --check`.
+- [x] Request fresh specification and quality reviews; publish a non-draft PR only after both approve.
