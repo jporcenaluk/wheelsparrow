@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+
 import type { EffectRecord } from "../database/effects.js";
 import { StaleEffectError } from "../database/effects.js";
 import type { RunRecord } from "../database/runs.js";
@@ -54,14 +56,23 @@ export interface SmokeRunnerRequest {
 
 export interface SmokeRunnerResult {
   readonly outcome: "passed" | "failed";
-  readonly exitCode?: number;
-  readonly durationMs?: number;
+  readonly exitCode?: number | null;
+  readonly durationMs?: number | null;
   /** Human-readable diagnostics; it is redacted and bounded before persistence. */
   readonly output?: string;
 }
 
 export interface SmokeRunner {
   run(request: SmokeRunnerRequest): Promise<SmokeRunnerResult>;
+}
+
+export interface SafeSmokeRunnerOptions {
+  /** Fixed working directory for every invocation. */
+  readonly cwd: string;
+  /** Explicit environment; ambient process variables are never inherited. */
+  readonly env: Readonly<Record<string, string>>;
+  readonly outputLimitBytes?: number;
+  readonly killGraceMs?: number;
 }
 
 type DeliveryCoordinator = Pick<
@@ -158,6 +169,13 @@ export interface DeliveryCapability {
   readonly observer: EffectObserverLike;
 }
 
+export interface DeliveryCapabilityOptions {
+  /** Resolve the durable run for an effect; this is the only safe source for issue/title facts omitted by older intents. */
+  readonly resolveRun?: (
+    effect: EffectRecord,
+  ) => RunRecord | Promise<RunRecord>;
+}
+
 interface ScheduledEffect {
   readonly effect: EffectRecord;
   readonly started: boolean;
@@ -194,6 +212,13 @@ function bounded(value: string): string {
   return result || "Delivery requires human attention.";
 }
 
+function truncateUtf8(value: string, maximumBytes: number): string {
+  let result = value;
+  while (Buffer.byteLength(result, "utf8") > maximumBytes)
+    result = result.slice(0, -1);
+  return result;
+}
+
 function redacted(value: string): string {
   return bounded(value)
     .replace(/(authorization\s*[:=]\s*)([^\s,]+)/giu, "$1[REDACTED]")
@@ -217,6 +242,181 @@ function isStale(error: unknown): boolean {
 
 function isAmbiguous(error: unknown): boolean {
   return isRecord(error) && error.kind === "merge_ambiguous";
+}
+
+function parseArgv(command: string): string[] {
+  if (!text(command, MAX_COMMAND_BYTES))
+    throw new Error("Smoke command is unavailable.");
+  if (/[;&|<>`$()\r\n]/u.test(command))
+    throw new Error("Smoke command contains shell syntax.");
+  const argv: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+  for (const character of command) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote !== undefined) {
+      if (character === quote) quote = undefined;
+      else current += character;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (/\s/u.test(character)) {
+      if (current.length > 0) {
+        argv.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += character;
+  }
+  if (escaped || quote !== undefined)
+    throw new Error("Smoke command quoting is malformed.");
+  if (current.length > 0) argv.push(current);
+  if (argv.length === 0) throw new Error("Smoke command is unavailable.");
+  return argv;
+}
+
+function killProcessTree(
+  child: ReturnType<typeof spawn>,
+  signal: NodeJS.Signals,
+): void {
+  if (child.pid === undefined) return;
+  try {
+    if (process.platform === "win32") child.kill(signal);
+    else process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // The process already exited.
+    }
+  }
+}
+
+/** Production-capable shell-free smoke runner with bounded output and tree cleanup. */
+export function createSafeSmokeRunner(
+  options: SafeSmokeRunnerOptions,
+): SmokeRunner {
+  if (!text(options.cwd, 4 * 1024))
+    throw new TypeError("Smoke runner cwd is required.");
+  const outputLimit = options.outputLimitBytes ?? 16 * 1024;
+  const killGraceMs = options.killGraceMs ?? 250;
+  if (
+    !Number.isSafeInteger(outputLimit) ||
+    outputLimit <= 0 ||
+    outputLimit > 16 * 1024
+  )
+    throw new RangeError(
+      "Smoke output limit must be between 1 and 16384 bytes.",
+    );
+  if (
+    !Number.isSafeInteger(killGraceMs) ||
+    killGraceMs < 0 ||
+    killGraceMs > 5_000
+  )
+    throw new RangeError("Smoke kill grace is outside its safe bound.");
+  const fixedEnv = { ...options.env };
+  return {
+    run(request) {
+      const argv = parseArgv(request.command);
+      if (
+        !Number.isSafeInteger(request.timeoutMs) ||
+        request.timeoutMs <= 0 ||
+        request.timeoutMs > MAX_SMOKE_TIMEOUT_MS
+      )
+        return Promise.reject(
+          new Error("Smoke timeout is outside its safe bound."),
+        );
+      const started = Date.now();
+      return new Promise<SmokeRunnerResult>((resolve, reject) => {
+        let timedOut = false;
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let killTimer: ReturnType<typeof setTimeout> | undefined;
+        let stdout = "";
+        let stderr = "";
+        const append = (
+          value: string,
+          existing: string,
+          other: string,
+        ): string => {
+          const remaining =
+            outputLimit -
+            Buffer.byteLength(existing, "utf8") -
+            Buffer.byteLength(other, "utf8");
+          if (remaining <= 0) return existing;
+          return existing + truncateUtf8(value, remaining);
+        };
+        let child: ReturnType<typeof spawn>;
+        try {
+          child = spawn(argv[0] as string, argv.slice(1), {
+            cwd: options.cwd,
+            env: fixedEnv,
+            shell: false,
+            detached: process.platform !== "win32",
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+        } catch (error) {
+          reject(new Error(redacted(errorMessage(error))));
+          return;
+        }
+        child.stdout?.setEncoding("utf8");
+        child.stderr?.setEncoding("utf8");
+        child.stdout?.on("data", (value: string) => {
+          stdout = append(value, stdout, stderr);
+        });
+        child.stderr?.on("data", (value: string) => {
+          stderr = append(value, stderr, stdout);
+        });
+        const finish = (result: SmokeRunnerResult): void => {
+          if (settled) return;
+          settled = true;
+          if (timer !== undefined) clearTimeout(timer);
+          if (killTimer !== undefined) clearTimeout(killTimer);
+          resolve(result);
+        };
+        child.once("error", (error) => {
+          if (timedOut) return;
+          if (settled) return;
+          settled = true;
+          if (timer !== undefined) clearTimeout(timer);
+          reject(new Error(redacted(errorMessage(error))));
+        });
+        child.once("close", (code) => {
+          const output = redacted(
+            `${stdout}${stderr.length > 0 ? `\n${stderr}` : ""}`,
+          );
+          finish({
+            outcome: timedOut || code !== 0 ? "failed" : "passed",
+            exitCode: timedOut ? null : code,
+            durationMs: Date.now() - started,
+            output: timedOut ? `${output}\nSmoke timed out.` : output,
+          });
+        });
+        timer = setTimeout(() => {
+          if (settled) return;
+          timedOut = true;
+          killProcessTree(child, "SIGTERM");
+          killTimer = setTimeout(
+            () => killProcessTree(child, "SIGKILL"),
+            killGraceMs,
+          );
+        }, request.timeoutMs);
+      });
+    },
+  };
 }
 
 function configError(configuration: DeliveryConfiguration): string | undefined {
@@ -449,83 +649,6 @@ async function failEffect(
   }
 }
 
-async function quarantine(
-  coordinator: DeliveryCoordinator,
-  run: RunRecord,
-  effect: EffectRecord,
-  reason: string,
-  now: () => string,
-): Promise<DeliveryStageResult> {
-  if (coordinator.quarantineEffect === undefined)
-    return failEffect(
-      coordinator,
-      run,
-      effect,
-      "delivery_failed",
-      reason,
-      { kind: "ambiguous" },
-      now,
-    );
-  try {
-    await coordinator.quarantineEffect({
-      runId: run.id,
-      expectedRevision: run.revision,
-      effectKey: effect.key,
-      outcome: "ambiguous",
-      trigger: null,
-      evidence: bounded(reason),
-      at: now(),
-    });
-    const advanced = { ...run, revision: run.revision + 1 };
-    let transitionError: unknown;
-    for (
-      let revision = advanced.revision;
-      revision <= advanced.revision + 2;
-      revision += 1
-    ) {
-      try {
-        const next = await coordinator.transition({
-          runId: advanced.id,
-          expectedRevision: revision,
-          trigger: "handoff_required",
-          summary: { text: bounded(reason) },
-          requiredAction: bounded(
-            `${reason} The effect is quarantined for reconciliation; no external retry is allowed.`,
-          ),
-          at: now(),
-        });
-        return { kind: "human", run: next, reason: bounded(reason) };
-      } catch (error) {
-        transitionError = error;
-        if (!isStale(error)) break;
-      }
-    }
-    // The merging state deliberately has no generic handoff transition:
-    // preserving an ambiguous effect is the safe Review/reconciliation
-    // boundary. The next coordinator restart observes it; no mutation is
-    // repeated here.
-    void transitionError;
-    return {
-      kind: "human",
-      run: advanced,
-      reason: bounded(
-        `${reason} The effect remains quarantined for reconciliation; no external retry is allowed.`,
-      ),
-    };
-  } catch (error) {
-    if (isStale(error)) return { kind: "stale", run };
-    return failEffect(
-      coordinator,
-      run,
-      effect,
-      "delivery_failed",
-      reason,
-      { kind: "ambiguous" },
-      now,
-    );
-  }
-}
-
 /** Execute the coordinator-owned exact merge edge. */
 export async function executeMergeStage(
   input: ExecuteMergeStageInput,
@@ -588,6 +711,7 @@ export async function executeMergeStage(
   }
 
   let merged: MergeReceipt;
+  let mutationAttempted = false;
   try {
     const { effectKey: _effectKey, ...candidateRequest } = request;
     const observed = assertMergeCandidateReceipt(
@@ -595,18 +719,21 @@ export async function executeMergeStage(
     );
     verifyCandidate(observed, candidateRequest);
     const method = selectMergeMethod(observed);
+    mutationAttempted = true;
     const receipt = assertMergeReceipt(
       await input.gateway.mergePullRequest({ ...request, method }),
     );
     verifyMergeReceipt(receipt, candidateRequest, method);
     merged = receipt;
   } catch (error) {
-    if (isAmbiguous(error))
-      return quarantine(
+    if (mutationAttempted || isAmbiguous(error))
+      return failEffect(
         input.coordinator,
         input.run,
         scheduled.effect,
-        `Merge mutation outcome is ambiguous: ${errorMessage(error)}`,
+        "delivery_failed",
+        `Merge mutation outcome is ambiguous; the effect is not retried: ${redacted(errorMessage(error))}`,
+        { kind: "ambiguous_merge" },
         now,
       );
     return failEffect(
@@ -636,11 +763,13 @@ export async function executeMergeStage(
     });
   } catch (error) {
     if (isStale(error)) return { kind: "stale", run: input.run };
-    return quarantine(
+    return failEffect(
       input.coordinator,
       input.run,
       scheduled.effect,
-      `Merge receipt was obtained but durable settlement failed: ${errorMessage(error)}`,
+      "delivery_failed",
+      `Merge receipt was obtained but durable settlement failed; the external outcome is ambiguous and the effect will not be retried: ${redacted(errorMessage(error))}`,
+      { kind: "ambiguous_merge_settlement", mergeSha: merged.mergeSha },
       now,
     );
   }
@@ -868,20 +997,24 @@ function smokeReceipt(result: SmokeRunnerResult): SmokeReceipt {
     (result.outcome !== "passed" && result.outcome !== "failed")
   )
     throw new Error("Smoke runner returned an invalid outcome.");
+  const exitCode = result.exitCode;
   if (
-    result.exitCode !== undefined &&
-    (!Number.isSafeInteger(result.exitCode) || result.exitCode < 0)
+    exitCode !== undefined &&
+    exitCode !== null &&
+    (!Number.isSafeInteger(exitCode) || exitCode < 0)
   )
     throw new Error("Smoke runner returned an invalid exit code.");
+  const durationMs = result.durationMs;
   if (
-    result.durationMs !== undefined &&
-    (!Number.isSafeInteger(result.durationMs) || result.durationMs < 0)
+    durationMs !== undefined &&
+    durationMs !== null &&
+    (!Number.isSafeInteger(durationMs) || durationMs < 0)
   )
     throw new Error("Smoke runner returned an invalid duration.");
   return {
     outcome: result.outcome,
-    exitCode: result.exitCode ?? null,
-    durationMs: result.durationMs ?? null,
+    exitCode: exitCode ?? null,
+    durationMs: durationMs ?? null,
     summary:
       result.output === undefined
         ? `Smoke ${result.outcome}.`
@@ -951,11 +1084,13 @@ export async function executeSmokeStage(
     });
     receipt = smokeReceipt(result);
   } catch (runnerError) {
-    return quarantine(
+    return failEffect(
       input.coordinator,
       input.run,
       scheduled.effect,
-      `Smoke execution outcome is ambiguous: ${errorMessage(runnerError)}`,
+      "delivery_failed",
+      `Smoke execution outcome is ambiguous and will not be rerun: ${redacted(errorMessage(runnerError))}`,
+      { kind: "ambiguous_smoke" },
       now,
     );
   }
@@ -987,11 +1122,13 @@ export async function executeSmokeStage(
     });
   } catch (settleError) {
     if (isStale(settleError)) return { kind: "stale", run: input.run };
-    return quarantine(
+    return failEffect(
       input.coordinator,
       input.run,
       scheduled.effect,
-      `Smoke passed but durable settlement failed: ${errorMessage(settleError)}`,
+      "delivery_failed",
+      `Smoke passed but durable settlement failed; the external outcome is ambiguous and will not be rerun: ${redacted(errorMessage(settleError))}`,
+      { kind: "ambiguous_smoke_settlement" },
       now,
     );
   }
@@ -1157,11 +1294,13 @@ export async function executeProjectDoneStage(
     return { kind: "done", run: settled.run, item };
   } catch (error) {
     if (isStale(error)) return { kind: "stale", run: input.run };
-    return quarantine(
+    return failEffect(
       input.coordinator,
       input.run,
       scheduled.effect,
-      `Done projection receipt was obtained but durable settlement failed: ${errorMessage(error)}`,
+      "delivery_failed",
+      `Done projection receipt was obtained but durable settlement failed; the external outcome is ambiguous and will not be retried: ${redacted(errorMessage(error))}`,
+      { kind: "ambiguous_done_settlement" },
       now,
     );
   }
@@ -1169,6 +1308,7 @@ export async function executeProjectDoneStage(
 
 function mergeIntentRequest(
   effect: EffectRecord,
+  run?: RunRecord,
 ): (MergeCandidateRequest & { readonly effectKey: string }) | undefined {
   const intent = parseStrictIntent(effect, "merge", [
     "repository",
@@ -1180,31 +1320,56 @@ function mergeIntentRequest(
     "headSha",
     "expectedTitle",
     "baseBranch",
+    "issueNumber",
   ]);
+  if (intent === undefined) return undefined;
+  const issueNumber = positiveInteger(intent.issueNumber)
+    ? intent.issueNumber
+    : run?.issueNumber;
+  const expectedTitle = text(intent.expectedTitle, 2_000)
+    ? intent.expectedTitle
+    : run?.pullRequestTitle;
+  const baseBranch = text(intent.baseBranch, 512)
+    ? intent.baseBranch
+    : run?.baseBranch;
   if (
-    intent === undefined ||
     !text(intent.repository, 256) ||
     !positiveInteger(intent.pullRequestNumber) ||
     !text(intent.pullRequestNodeId, 256) ||
-    !text(intent.expectedTitle, 2_000) ||
-    !text(intent.baseBranch, 512) ||
+    !positiveInteger(issueNumber) ||
+    !text(expectedTitle, 2_000) ||
+    !text(baseBranch, 512) ||
     !SHA_PATTERN.test(String(intent.baseSha)) ||
     !SHA_PATTERN.test(String(intent.headSha)) ||
     !BRANCH_PATTERN.test(String(intent.branch))
   )
     return undefined;
-  return {
+  const request = {
     repository: intent.repository,
     number: intent.pullRequestNumber,
-    issueNumber: 1,
+    issueNumber,
     nodeId: intent.pullRequestNodeId,
-    expectedTitle: intent.expectedTitle,
-    expectedBaseBranch: intent.baseBranch,
+    expectedTitle,
+    expectedBaseBranch: baseBranch,
     expectedBaseSha: intent.baseSha as string,
     expectedHeadBranch: intent.branch as string,
     expectedHeadSha: intent.headSha as string,
     effectKey: effect.key,
   };
+  if (
+    run !== undefined &&
+    (request.repository !== run.repository ||
+      request.number !== run.pullRequestNumber ||
+      request.issueNumber !== run.issueNumber ||
+      request.nodeId !== run.pullRequestNodeId ||
+      request.expectedTitle !== run.pullRequestTitle ||
+      request.expectedBaseBranch !== run.baseBranch ||
+      request.expectedBaseSha !== run.baseSha ||
+      request.expectedHeadBranch !== run.branch ||
+      request.expectedHeadSha !== run.headSha)
+  )
+    return undefined;
+  return request;
 }
 
 async function dispatchEffect(
@@ -1212,14 +1377,27 @@ async function dispatchEffect(
   gateway: GitHubDeliveryGateway,
   configuration: DeliveryConfiguration,
   smokeRunner: SmokeRunner,
+  resolveRun?: DeliveryCapabilityOptions["resolveRun"],
 ): Promise<unknown> {
   if (effect.kind === "merge") {
-    const request = mergeIntentRequest(effect);
+    let run: RunRecord | undefined;
+    if (resolveRun !== undefined) {
+      try {
+        run = await resolveRun(effect);
+      } catch {
+        return {
+          outcome: "failed",
+          evidence: `Durable run facts were unavailable for merge ${effect.key}.`,
+        };
+      }
+    }
+    const request = mergeIntentRequest(effect, run);
     if (request === undefined)
       return {
         outcome: "failed",
         evidence: `Invalid merge intent for ${effect.key}.`,
       };
+    let mutationAttempted = false;
     try {
       const { effectKey: _effectKey, ...candidateRequest } = request;
       const candidate = assertMergeCandidateReceipt(
@@ -1227,6 +1405,7 @@ async function dispatchEffect(
       );
       verifyCandidate(candidate, candidateRequest);
       const method = selectMergeMethod(candidate);
+      mutationAttempted = true;
       const receipt = assertMergeReceipt(
         await gateway.mergePullRequest({ ...request, method }),
       );
@@ -1238,10 +1417,10 @@ async function dispatchEffect(
         evidence: `Merge ${effect.key} confirmed.`,
       };
     } catch (error) {
-      if (isAmbiguous(error))
+      if (mutationAttempted || isAmbiguous(error))
         return {
           outcome: "ambiguous",
-          evidence: `Merge ${effect.key} is ambiguous and requires reconciliation.`,
+          evidence: `Merge ${effect.key} is ambiguous and requires reconciliation; it will not be retried.`,
         };
       return {
         outcome: "failed",
@@ -1275,8 +1454,8 @@ async function dispatchEffect(
         await gateway.observeStaging(
           assertObserveStagingRequest({
             repository: intent.repository,
-            workflow: configuration.workflow,
-            environment: configuration.environment,
+            workflow: intent.workflow,
+            environment: intent.environment,
             mergeSha: intent.mergeSha,
           }),
         ),
@@ -1337,7 +1516,11 @@ async function dispatchEffect(
         ? {
             outcome: "confirmed",
             trigger: "smoke_succeeded",
-            receipt,
+            receipt: strictSmokeReceipt(
+              receipt,
+              intent.command,
+              intent.mergeSha as string,
+            ),
             evidence: `Smoke ${effect.key} passed.`,
           }
         : {
@@ -1403,7 +1586,7 @@ async function dispatchEffect(
 async function observeEffect(
   effect: EffectRecord,
   gateway: GitHubDeliveryGateway,
-  configuration: DeliveryConfiguration,
+  _configuration: DeliveryConfiguration,
 ): Promise<unknown> {
   if (effect.kind === "merge")
     return {
@@ -1436,8 +1619,8 @@ async function observeEffect(
       const observation = assertStagingObservation(
         await gateway.observeStaging({
           repository: intent.repository as string,
-          workflow: configuration.workflow,
-          environment: configuration.environment,
+          workflow: intent.workflow as string,
+          environment: intent.environment as string,
           mergeSha: intent.mergeSha as string,
         }),
       );
@@ -1521,10 +1704,17 @@ export function createDeliveryCapability(
   gateway: GitHubDeliveryGateway,
   configuration: DeliveryConfiguration,
   smokeRunner: SmokeRunner,
+  options: DeliveryCapabilityOptions = {},
 ): DeliveryCapability {
   return {
     dispatcher: async (effect) =>
-      dispatchEffect(effect, gateway, configuration, smokeRunner),
+      dispatchEffect(
+        effect,
+        gateway,
+        configuration,
+        smokeRunner,
+        options.resolveRun,
+      ),
     observer: async (effect) => observeEffect(effect, gateway, configuration),
   };
 }

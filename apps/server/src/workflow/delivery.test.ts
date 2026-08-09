@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { FakeGitHubDeliveryGateway } from "../../../../tests/fakes/github.js";
 import { openDatabase } from "../database/connection.js";
+import type { EffectRecord } from "../database/effects.js";
 import { migrateDatabase } from "../database/migrate.js";
 import { createRunMutationRepository, readRun } from "../database/runs.js";
 import type {
@@ -15,6 +16,8 @@ import type {
 } from "../github/delivery.js";
 import { WorkflowCoordinator } from "./coordinator.js";
 import {
+  createDeliveryCapability,
+  createSafeSmokeRunner,
   executeMergeStage,
   executeProjectDoneStage,
   executeSmokeStage,
@@ -285,7 +288,7 @@ describe("coordinator-owned delivery stages", () => {
     await coordinator.close();
   });
 
-  test("ambiguous merge is quarantined and restart does not merge again", async () => {
+  test("ambiguous merge reaches Review and restart does not merge again", async () => {
     const connection = await createDatabase();
     const gateway = new FakeGitHubDeliveryGateway({
       repository: "octo/widget",
@@ -313,7 +316,7 @@ describe("coordinator-owned delivery stages", () => {
       configuration: deliveryConfiguration(),
       now: () => at,
     });
-    expect(result).toMatchObject({ kind: "human", run: { state: "merging" } });
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
     expect(gateway.mergeMutations()).toHaveLength(0);
     const replay = await executeMergeStage({
       coordinator,
@@ -322,7 +325,7 @@ describe("coordinator-owned delivery stages", () => {
       configuration: deliveryConfiguration(),
       now: () => at,
     });
-    expect(replay.kind).toBe("human");
+    expect(replay.kind).toBe("stale");
     expect(gateway.mergeMutations()).toHaveLength(0);
     await coordinator.close();
   });
@@ -503,5 +506,229 @@ describe("coordinator-owned delivery stages", () => {
     });
     expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
     await coordinator.close();
+  });
+
+  test("startup merge dispatch derives the non-default issue from the durable run", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubDeliveryGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+      staging: { workflow: "deploy-staging.yml", environment: "staging" },
+    });
+    gateway.seedPullRequest(candidate());
+    const coordinator = new WorkflowCoordinator({ connection });
+    const review = await enterReview(connection, coordinator);
+    const approval = await coordinator.approveMerge({
+      runId: review.id,
+      expectedRevision: review.revision,
+      operator: "operator@example.test",
+      approvedHeadSha: headSha,
+      observedBaseSha: baseSha,
+      dispatch: false,
+      at,
+    });
+    const effect = await coordinator.createEffectIntent({
+      runId: approval.run.id,
+      expectedRevision: approval.run.revision,
+      key: `run:${approval.run.id}:startup-merge`,
+      kind: "merge",
+      intent: {
+        repository: approval.run.repository,
+        pullRequestNumber: approval.run.pullRequestNumber,
+        pullRequestNodeId: approval.run.pullRequestNodeId,
+        pullRequestUrl: approval.run.pullRequestUrl,
+        branch: approval.run.branch,
+        baseSha,
+        headSha,
+      },
+      dispatch: false,
+      at,
+    });
+    const capability = createDeliveryCapability(
+      gateway,
+      deliveryConfiguration(),
+      {
+        run: async () => ({
+          outcome: "passed" as const,
+          exitCode: 0,
+          durationMs: 1,
+        }),
+      },
+      { resolveRun: () => approval.run },
+    );
+    const dispatched = await capability.dispatcher(effect.effect);
+    expect(dispatched).toMatchObject({
+      outcome: "confirmed",
+      trigger: "merge_observed",
+    });
+    expect(gateway.mergeMutations()).toHaveLength(1);
+    await coordinator.close();
+  });
+
+  test("staging startup dispatch uses durable intent despite configuration drift", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubDeliveryGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+      staging: { workflow: "deploy-staging.yml", environment: "staging" },
+    });
+    gateway.seedPullRequest(candidate());
+    const coordinator = new WorkflowCoordinator({ connection });
+    const review = await enterReview(connection, coordinator);
+    const approval = await coordinator.approveMerge({
+      runId: review.id,
+      expectedRevision: review.revision,
+      operator: "operator@example.test",
+      approvedHeadSha: headSha,
+      observedBaseSha: baseSha,
+      dispatch: false,
+      at,
+    });
+    const merged = await executeMergeStage({
+      coordinator,
+      gateway,
+      run: approval.run,
+      configuration: deliveryConfiguration(),
+      now: () => at,
+    });
+    if (merged.kind !== "merged") throw new Error("merge did not complete");
+    gateway.setWorkflowRun(stagingRun(merged.merge.mergeSha));
+    gateway.setDeployment(deployment(merged.merge.mergeSha));
+    const effect = await coordinator.createEffectIntent({
+      runId: merged.run.id,
+      expectedRevision: merged.run.revision,
+      key: `run:${merged.run.id}:config-drift-staging`,
+      kind: "observe_staging",
+      intent: {
+        runId: merged.run.id,
+        reworkEpoch: merged.run.reworkEpoch,
+        repository: merged.run.repository,
+        workflow: "deploy-staging.yml",
+        environment: "staging",
+        mergeSha: merged.merge.mergeSha,
+      },
+      dispatch: false,
+      at,
+    });
+    const capability = createDeliveryCapability(
+      gateway,
+      {
+        ...deliveryConfiguration(),
+        workflow: "other-workflow.yml",
+        environment: "other",
+      },
+      {
+        run: async () => ({
+          outcome: "passed" as const,
+          exitCode: 0,
+          durationMs: 1,
+        }),
+      },
+    );
+    const dispatched = await capability.dispatcher(effect.effect);
+    expect(dispatched).toMatchObject({
+      outcome: "confirmed",
+      trigger: "staging_succeeded",
+    });
+    await coordinator.close();
+  });
+
+  test("safe smoke runner is shell-free and bounded", async () => {
+    const runner = createSafeSmokeRunner({ cwd: process.cwd(), env: {} });
+    const result = await runner.run({
+      command: `${process.execPath} --version`,
+      timeoutMs: 2_000,
+      runId: "smoke-run",
+      mergeSha,
+    });
+    expect(result.outcome).toBe("passed");
+    expect(Buffer.byteLength(result.output ?? "", "utf8")).toBeLessThanOrEqual(
+      16 * 1024,
+    );
+    expect(() =>
+      runner.run({
+        command: `${process.execPath} -e 'process.exit(1)'`,
+        timeoutMs: 2_000,
+        runId: "smoke-run",
+        mergeSha,
+      }),
+    ).toThrow("shell syntax");
+  });
+
+  test("smoke dispatch binds the durable command and merge SHA and rejects malformed receipts", async () => {
+    const effect = {
+      key: "run:smoke-dispatch:smoke",
+      runId: "smoke-dispatch",
+      reworkEpoch: 0,
+      kind: "smoke",
+      targetRevision: 3,
+      fingerprint: "fingerprint",
+      intent: JSON.stringify({
+        runId: "smoke-dispatch",
+        reworkEpoch: 0,
+        repository: "octo/widget",
+        mergeSha,
+        command: "make smoke-durable",
+      }),
+      status: "in_flight",
+      executorAttempt: 1,
+      executorOwnerToken: "owner",
+      receipt: null,
+      processId: null,
+      requestId: null,
+      prNumber: null,
+      prNodeId: null,
+      workflowRunId: null,
+      startedAt: at,
+      completedAt: null,
+      failure: null,
+      reconciliationEvidence: null,
+      createdAt: at,
+      updatedAt: at,
+    } as EffectRecord;
+    const runner: SmokeRunner = {
+      run: vi.fn(async (request) => ({
+        outcome: "passed" as const,
+        exitCode: 0,
+        durationMs: 7,
+        output: request.command,
+      })),
+    };
+    const capability = createDeliveryCapability(
+      new FakeGitHubDeliveryGateway({
+        repository: "octo/widget",
+        requiredChecks: ["test"],
+        staging: { workflow: "deploy-staging.yml", environment: "staging" },
+      }),
+      deliveryConfiguration(),
+      runner,
+    );
+    const dispatched = await capability.dispatcher(effect);
+    expect(dispatched).toMatchObject({
+      outcome: "confirmed",
+      receipt: { command: "make smoke-durable", mergeSha },
+    });
+    expect(runner.run).toHaveBeenCalledWith(
+      expect.objectContaining({ command: "make smoke-durable", mergeSha }),
+    );
+
+    const malformed = createDeliveryCapability(
+      new FakeGitHubDeliveryGateway({
+        repository: "octo/widget",
+        requiredChecks: ["test"],
+        staging: { workflow: "deploy-staging.yml", environment: "staging" },
+      }),
+      deliveryConfiguration(),
+      {
+        run: async () =>
+          ({ outcome: "passed", exitCode: "not-a-number" }) as unknown as {
+            outcome: "passed";
+            exitCode: number;
+          },
+      },
+    );
+    await expect(malformed.dispatcher(effect)).resolves.toMatchObject({
+      outcome: "ambiguous",
+    });
   });
 });
