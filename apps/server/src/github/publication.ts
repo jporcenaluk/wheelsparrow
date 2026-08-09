@@ -13,7 +13,8 @@ const MAX_NODE_ID_BYTES = 256;
 const MAX_URL_BYTES = 2_000;
 const MAX_CHECK_NAME_BYTES = 256;
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
-const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+const REPOSITORY_SEGMENT_PATTERN =
+  /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u;
 const BRANCH_COMPONENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const NODE_ID_PATTERN = /^[A-Za-z0-9_:-]+$/u;
 const CHECK_STATES = ["pending", "success", "failure"] as const;

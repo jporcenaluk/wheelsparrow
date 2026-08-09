@@ -350,6 +350,8 @@ describe("GitHub publication gateway seam", () => {
     ["repository fragment", { repository: "octo/widget#x" }],
     ["repository userinfo", { repository: "octo@widget/repo" }],
     ["repository path delimiter", { repository: "octo/widget/extra" }],
+    ["repository trailing owner punctuation", { repository: "owner-/repo" }],
+    ["repository trailing name punctuation", { repository: "owner/repo_" }],
   ] as const)("rejects %s pull request receipts", (_label, change) => {
     const valid = {
       repository,
@@ -397,4 +399,26 @@ describe("GitHub publication gateway seam", () => {
       }).aggregate,
     ).toBe("head_drift");
   });
+
+  test.each(["owner-/repo", "owner/repo_"])(
+    "rejects a repository segment with trailing punctuation: %s",
+    (unsafeRepository) => {
+      const receipt = {
+        repository: unsafeRepository,
+        number: 1,
+        nodeId: "PR_node_1",
+        url: `https://github.com/${unsafeRepository}/pull/1`,
+        title: "feat: publish the ticket",
+        issueNumber,
+        isDraft: false,
+        baseBranch: "main",
+        baseSha: "a".repeat(40),
+        headBranch: "ticket/42-publish",
+        headSha: "b".repeat(40),
+      };
+      expect(() => assertPullRequestReceipt(receipt)).toThrow(
+        /receipt|repository/i,
+      );
+    },
+  );
 });
