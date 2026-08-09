@@ -725,7 +725,14 @@ describe("durable review and repair sequencing", () => {
           "SELECT status FROM side_effects WHERE run_id = ? AND kind = 'agent_repair'",
         )
         .get(run.id),
-    ).toEqual({ status: "in_flight" });
+    ).toEqual({ status: "ambiguous" });
+    expect(
+      connection.native
+        .prepare(
+          "SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ? AND status = 'in_flight'",
+        )
+        .get(run.id),
+    ).toEqual({ count: 0 });
     await coordinator.close();
   });
 

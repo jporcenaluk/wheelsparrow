@@ -203,13 +203,17 @@ function bounded(value: string): string {
   return result || "Review handoff required.";
 }
 
-async function quarantineReviewEffect(
+type DurableHandoffOutcome =
+  | { kind: "human"; run: RunRecord; reason: string }
+  | { kind: "stale"; run: RunRecord };
+
+async function quarantineEffectAndHandoff(
   input: ReviewRepairInput,
   run: RunRecord,
   effect: EffectRecord,
   reason: string,
   now: () => string,
-): Promise<ReviewStageOutcome> {
+): Promise<DurableHandoffOutcome> {
   const coordinator = input.coordinator as ReviewQuarantineCoordinator;
   if (coordinator.quarantineEffect === undefined) return { kind: "stale", run };
   const evidence = bounded(
@@ -614,7 +618,7 @@ async function settleReviewHandoff(
     return { kind: "human", run: settled.run, reason: safeReason };
   } catch (error) {
     if (isStaleError(error)) return { kind: "stale", run };
-    return quarantineReviewEffect(
+    return quarantineEffectAndHandoff(
       input,
       run,
       effect,
@@ -731,9 +735,10 @@ async function settleReview(
     return { kind: "human", run: settled.run, reason: handoffReason };
   } catch (error) {
     if (isStaleError(error)) return { kind: "stale", run };
-    return handoff(
+    return quarantineEffectAndHandoff(
       input,
       run,
+      effect,
       `Independent review settlement failed closed: ${errorMessage(error)}`,
       now,
     );
@@ -1006,9 +1011,10 @@ async function settleRepairHandoff(
     return { kind: "human", run: settled.run, reason: safeReason };
   } catch (error) {
     if (isStaleError(error)) return { kind: "stale", run };
-    return handoff(
+    return quarantineEffectAndHandoff(
       input,
       run,
+      effect,
       `Repair handoff settlement failed closed: ${errorMessage(error)}`,
       now,
     );
@@ -1300,9 +1306,10 @@ async function executeRepairStage(
       return { kind: "human", run: settled.run, reason: handoffReason };
     } catch (error) {
       if (isStaleError(error)) return { kind: "stale", run };
-      return handoff(
+      return quarantineEffectAndHandoff(
         effectiveInput,
         run,
+        effect,
         `Repair handoff settlement failed closed: ${errorMessage(error)}`,
         now,
       );
@@ -1391,9 +1398,10 @@ async function executeRepairStage(
     return { kind: "repaired", run: settled.run };
   } catch (error) {
     if (isStaleError(error)) return { kind: "stale", run };
-    return handoff(
+    return quarantineEffectAndHandoff(
       effectiveInput,
       run,
+      effect,
       `Repair settlement failed closed: ${errorMessage(error)}`,
       now,
     );
