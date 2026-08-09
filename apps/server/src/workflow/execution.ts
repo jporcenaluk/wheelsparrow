@@ -17,8 +17,8 @@ const intakeEffectKey = (runId: string): string =>
   `run:${runId}:intake:capture`;
 const builderEffectKey = (runId: string): string =>
   `run:${runId}:agent:builder:attempt:1`;
-const verificationEffectKey = (runId: string): string =>
-  `run:${runId}:verify:attempt:1`;
+const verificationEffectKey = (runId: string, attempt = 1): string =>
+  `run:${runId}:verify:attempt:${attempt}`;
 const shaPattern = /^[0-9a-f]{40}$/u;
 const sha256Pattern = /^[0-9a-f]{64}$/u;
 const maximumTextBytes = 64 * 1024;
@@ -903,8 +903,9 @@ function verificationIntent(
   intake: IntakeCapture,
   workspace: WorkspacePreparationReceipt,
 ): EffectIntentCommand {
+  const attempt = run.repairRound + 1;
   return {
-    key: verificationEffectKey(run.id),
+    key: verificationEffectKey(run.id, attempt),
     kind: "verify",
     intent: {
       runId: run.id,
@@ -912,7 +913,7 @@ function verificationIntent(
       command: intake.verificationCommand,
       expectedHeadSha: workspace.headSha,
       changedFiles: workspace.changedFiles,
-      attempt: 1,
+      attempt,
     },
     dispatch: false,
   };
@@ -946,7 +947,7 @@ interface CapabilityVerificationIntent {
   readonly command: string;
   readonly expectedHeadSha: string;
   readonly changedFiles: readonly string[];
-  readonly attempt: 1;
+  readonly attempt: number;
 }
 
 function canonicalCapabilityJson(value: unknown): string {
@@ -994,8 +995,11 @@ function parseCapabilityIntent(
       ? workspaceEffectKey(effect.runId)
       : kind === "agent_build"
         ? builderEffectKey(effect.runId)
-        : verificationEffectKey(effect.runId);
-  if (effect.kind !== kind || effect.key !== expectedKey)
+        : undefined;
+  if (
+    effect.kind !== kind ||
+    (expectedKey !== undefined && effect.key !== expectedKey)
+  )
     throw new BuilderReceiptError("Effect is not owned by Block 3.");
   let parsed: unknown;
   try {
@@ -1340,7 +1344,8 @@ async function _dispatchVerificationEffect(
       intent.runId !== run.id ||
       intent.worktreePath !== run.worktreePath ||
       intent.expectedHeadSha !== run.headSha ||
-      intent.command !== intake.verificationCommand
+      intent.command !== intake.verificationCommand ||
+      intent.attempt !== run.repairRound + 1
     )
       throw new BuilderReceiptError(
         "Verification intent does not match run facts.",
@@ -1483,6 +1488,17 @@ function parseOwnedCapabilityIntent(
     effect.kind,
     capabilityIntentKeys(effect.kind),
   );
+  if (
+    effect.kind === "verify" &&
+    (typeof parsed.attempt !== "number" ||
+      !Number.isSafeInteger(parsed.attempt) ||
+      parsed.attempt < 1 ||
+      effect.key !==
+        verificationEffectKey(effect.runId, parsed.attempt as number))
+  )
+    throw new BuilderReceiptError(
+      "Verification effect key does not match attempt.",
+    );
   if (effect.kind === "workspace_prepare") {
     if (
       typeof parsed.runId !== "string" ||
@@ -1522,7 +1538,8 @@ function parseOwnedCapabilityIntent(
     typeof parsed.expectedHeadSha !== "string" ||
     !shaPattern.test(parsed.expectedHeadSha) ||
     !validChangedFiles(parsed.changedFiles) ||
-    parsed.attempt !== 1
+    !Number.isSafeInteger(parsed.attempt) ||
+    (parsed.attempt as number) < 1
   )
     throw new BuilderReceiptError("Verification effect intent is invalid.");
   return parsed as unknown as CapabilityVerificationIntent;
@@ -1651,6 +1668,7 @@ async function settleVerificationFailure(
   const boundedReason = boundedFailureReason(
     `${reason} stdout=${stdout} stderr=${stderr}`,
   );
+  const attempt = run.repairRound + 1;
   const trigger =
     run.repairRound >= 2
       ? "verification_failed_exhausted"
@@ -1677,13 +1695,13 @@ async function settleVerificationFailure(
       evidence: boundedReason,
       receipt: failureReceipt,
       step: {
-        id: `run:${run.id}:verify:attempt:1:step`,
+        id: `run:${run.id}:verify:attempt:${attempt}:step`,
         runId: run.id,
         expectedRevision: run.revision,
         reworkEpoch: run.reworkEpoch,
         role: "verifier",
         logicalStep: "verify",
-        attempt: 1,
+        attempt,
         statusSequence: 1,
         status: "failed",
         promptHash: verificationPromptHash(intake.verificationCommand),
@@ -1693,7 +1711,7 @@ async function settleVerificationFailure(
         completedAt: now(),
         exitResultJson: JSON.stringify(failureReceipt),
         summary: { text: boundedReason },
-        rawLogReference: `logs/${run.id}/verifier/attempt-1.jsonl`,
+        rawLogReference: `logs/${run.id}/verifier/attempt-${attempt}.jsonl`,
       },
       at: now(),
     });
@@ -1734,6 +1752,7 @@ async function executeVerificationStage(
   if (verificationEffect === undefined) return { kind: "stale", run };
 
   const startedAt = now();
+  const attempt = run.repairRound + 1;
   let rawResult: unknown;
   try {
     rawResult = await input.verify({
@@ -1820,13 +1839,13 @@ async function executeVerificationStage(
       receipt: verification,
       facts: { headSha: verification.headSha },
       step: {
-        id: `run:${run.id}:verify:attempt:1:step`,
+        id: `run:${run.id}:verify:attempt:${attempt}:step`,
         runId: run.id,
         expectedRevision: run.revision,
         reworkEpoch: run.reworkEpoch,
         role: "verifier",
         logicalStep: "verify",
-        attempt: 1,
+        attempt,
         statusSequence: 1,
         status: "completed",
         promptHash: verificationPromptHash(intake.verificationCommand),
@@ -1836,7 +1855,7 @@ async function executeVerificationStage(
         completedAt,
         exitResultJson: JSON.stringify(verification),
         summary: { text: "Verification passed." },
-        rawLogReference: `logs/${run.id}/verifier/attempt-1.jsonl`,
+        rawLogReference: `logs/${run.id}/verifier/attempt-${attempt}.jsonl`,
       },
       at: completedAt,
     });
