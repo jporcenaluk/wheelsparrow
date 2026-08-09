@@ -1,13 +1,23 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
 import {
+  type InspectRunWorktreeInput,
+  inspectRunWorktree,
   type PrepareRunWorktreeInput,
   prepareRunWorktree,
   realGit,
+  WorktreeBoundaryError,
 } from "./git.js";
 
 const execFile = promisify(execFileCallback);
@@ -106,5 +116,282 @@ describe("contained Git worktree boundary", () => {
     };
 
     await expect(prepareRunWorktree(input)).rejects.toThrow("origin/main");
+  });
+
+  test("revalidates a prepared worktree and returns its current receipt", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    const expected = {
+      path: prepared.path,
+      branch: prepared.branch,
+      baseSha: prepared.baseSha,
+      headSha: prepared.baseSha,
+    };
+
+    const inspected = await inspectRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      expected,
+      git: realGit,
+    });
+
+    expect(inspected).toEqual({
+      ...expected,
+      baseBranch: "main",
+    });
+  });
+
+  test("rejects a receipt whose base is no longer origin/main", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await writeFile(join(repositoryRoot, "README.md"), "advanced\n", "utf8");
+    await runGit(repositoryRoot, "add", "README.md");
+    await runGit(repositoryRoot, "commit", "-m", "advance main");
+    await runGit(repositoryRoot, "push", "origin", "main");
+
+    await expect(
+      inspectRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/origin\/main|base SHA/u);
+  });
+
+  test("rejects when Git reports a different branch for the deterministic path", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await runGit(prepared.path, "branch", "-m", "wheelsparrow/42-other-run");
+
+    await expect(
+      inspectRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/git worktree branch/u);
+  });
+
+  test("rejects a worktree from a different Git repository at the deterministic path", async () => {
+    const { repositoryRoot, remoteRoot } = await temporaryGitRepository();
+    const foreignRoot = await mkdtemp(
+      join(tmpdir(), "wheelsparrow-foreign-git-"),
+    );
+    temporaryDirectories.push(foreignRoot);
+    const foreignRepositoryRoot = join(foreignRoot, "repository");
+    await runGit(
+      foreignRoot,
+      "clone",
+      "-b",
+      "main",
+      remoteRoot,
+      foreignRepositoryRoot,
+    );
+
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const worktreePath = join(workspaceRoot, "42-run-7");
+    await mkdir(workspaceRoot, { recursive: true });
+    const baseSha = await runGit(
+      repositoryRoot,
+      "rev-parse",
+      "refs/remotes/origin/main^{commit}",
+    );
+    await runGit(
+      foreignRepositoryRoot,
+      "worktree",
+      "add",
+      "-b",
+      "wheelsparrow/42-run-7",
+      worktreePath,
+      baseSha,
+    );
+
+    await expect(
+      inspectRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: worktreePath,
+          branch: "wheelsparrow/42-run-7",
+          baseSha,
+          headSha: baseSha,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/configured repository/u);
+  });
+
+  test("rejects an inspected worktree outside the canonical workspace root", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    const outsideRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-outside-"));
+    temporaryDirectories.push(outsideRoot);
+    const expected = {
+      path: join(outsideRoot, "42-run-7"),
+      branch: prepared.branch,
+      baseSha: prepared.baseSha,
+      headSha: prepared.baseSha,
+    };
+
+    await expect(
+      inspectRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected,
+        git: realGit,
+      }),
+    ).rejects.toBeInstanceOf(WorktreeBoundaryError);
+  });
+
+  test("rejects a workspace root that resolves through a symbolic link", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    const linkedWorkspaceRoot = join(repositoryRoot, ".wheelsparrow", "linked");
+    await symlink(workspaceRoot, linkedWorkspaceRoot, "junction");
+
+    await expect(
+      inspectRunWorktree({
+        repositoryRoot,
+        workspaceRoot: linkedWorkspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: join(linkedWorkspaceRoot, "42-run-7"),
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/symbolic link|canonical/u);
+  });
+
+  test.each([
+    ["wrong deterministic path", { path: "wrong-run" }],
+    ["wrong deterministic branch", { branch: "wheelsparrow/42-other-run" }],
+  ])("rejects a %s", async (_, override) => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    const expected = {
+      path: prepared.path,
+      branch: prepared.branch,
+      baseSha: prepared.baseSha,
+      headSha: prepared.baseSha,
+      ...override,
+    };
+
+    await expect(
+      inspectRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected,
+        git: realGit,
+      } as InspectRunWorktreeInput),
+    ).rejects.toThrow(/path|branch|run/u);
+  });
+
+  test.each([
+    ["head", { headSha: "f".repeat(40) }],
+    ["base", { baseSha: "f".repeat(40) }],
+  ])("rejects a receipt with a mismatched %s SHA", async (_, override) => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+
+    await expect(
+      inspectRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+          ...override,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/SHA|base|HEAD/u);
   });
 });
