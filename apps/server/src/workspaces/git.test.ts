@@ -87,6 +87,40 @@ describe("contained Git worktree boundary", () => {
     );
   });
 
+  test("reports tracked and untracked changes relative to the assigned worktree", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await writeFile(join(prepared.path, "README.md"), "changed\n", "utf8");
+    await writeFile(join(prepared.path, "new-file.txt"), "new\n", "utf8");
+
+    const inspected = await inspectRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      expected: {
+        path: prepared.path,
+        branch: prepared.branch,
+        baseSha: prepared.baseSha,
+        headSha: prepared.baseSha,
+      },
+      git: realGit,
+    });
+
+    expect(inspected.changedFiles).toEqual(["README.md", "new-file.txt"]);
+    expect(
+      inspected.changedFiles.every((path) => !path.startsWith("../")),
+    ).toBe(true);
+  });
+
   test("rejects a workspace root outside the repository data root", async () => {
     const { repositoryRoot } = await temporaryGitRepository();
     const outsideRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-outside-"));
@@ -116,6 +150,24 @@ describe("contained Git worktree boundary", () => {
     };
 
     await expect(prepareRunWorktree(input)).rejects.toThrow("origin/main");
+  });
+
+  test("rejects duplicate ownership of a deterministic worktree", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const input: PrepareRunWorktreeInput = {
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    };
+
+    await prepareRunWorktree(input);
+    await expect(prepareRunWorktree(input)).rejects.toBeInstanceOf(
+      WorktreeBoundaryError,
+    );
   });
 
   test("revalidates a prepared worktree and returns its current receipt", async () => {
@@ -148,6 +200,7 @@ describe("contained Git worktree boundary", () => {
     expect(inspected).toEqual({
       ...expected,
       baseBranch: "main",
+      changedFiles: [],
     });
   });
 
@@ -326,6 +379,53 @@ describe("contained Git worktree boundary", () => {
         git: realGit,
       }),
     ).rejects.toThrow(/symbolic link|canonical/u);
+  });
+
+  test("rejects a worktree destination that is a symbolic link", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const outsideRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-outside-"));
+    temporaryDirectories.push(outsideRoot);
+    await mkdir(workspaceRoot, { recursive: true });
+    await symlink(outsideRoot, join(workspaceRoot, "42-run-7"), "junction");
+
+    await expect(
+      inspectRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: join(workspaceRoot, "42-run-7"),
+          branch: "wheelsparrow/42-run-7",
+          baseSha: "0".repeat(40),
+          headSha: "0".repeat(40),
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/symbolic link|canonical/u);
+  });
+
+  test("normalizes Git failures to a typed boundary error", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+
+    await expect(
+      realGit(repositoryRoot, ["definitely-not-a-real-git-subcommand"]),
+    ).rejects.toBeInstanceOf(WorktreeBoundaryError);
+
+    await expect(
+      prepareRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        baseBranch: "main",
+        git: async () => {
+          throw new Error("private remote details must not escape");
+        },
+      }),
+    ).rejects.toBeInstanceOf(WorktreeBoundaryError);
   });
 
   test.each([

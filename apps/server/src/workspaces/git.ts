@@ -1,10 +1,9 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
 
-const execFile = promisify(execFileCallback);
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+const GIT_TIMEOUT_MS = 30_000;
 const shaPattern = /^[0-9a-f]{40}$/u;
 const refPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u;
 const runIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -43,6 +42,8 @@ export interface InspectRunWorktreeInput {
 
 export interface RunWorktreeInspection extends RunWorktreeReceipt {
   readonly baseBranch: "main";
+  /** Paths changed from the assigned worktree's base, relative to that worktree. */
+  readonly changedFiles: readonly string[];
 }
 
 export type GitRunner = (
@@ -50,18 +51,100 @@ export type GitRunner = (
   args: readonly string[],
 ) => Promise<string>;
 
-export const realGit: GitRunner = async (cwd, args) => {
-  const { stdout } = await execFile("git", [...args], {
-    cwd,
-    shell: false,
-    maxBuffer: MAX_OUTPUT_BYTES,
-  });
-  return stdout;
-};
-
 export class WorktreeBoundaryError extends Error {
   override name = "WorktreeBoundaryError";
 }
+
+function terminateGitProcessTree(child: ChildProcess): void {
+  if (child.pid === undefined) return;
+  try {
+    if (process.platform === "win32") child.kill("SIGKILL");
+    else process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Best-effort cleanup must not replace the boundary failure.
+    }
+  }
+}
+
+export const realGit: GitRunner = (cwd, args) =>
+  new Promise((resolveGit, rejectGit) => {
+    const child = spawn("git", [...args], {
+      cwd,
+      detached: process.platform !== "win32",
+      env: process.env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let timedOut = false;
+    let outputExceeded = false;
+    let settled = false;
+
+    const capture = (target: "stdout" | "stderr", chunk: Buffer): void => {
+      const current = target === "stdout" ? stdout : stderr;
+      const available = MAX_OUTPUT_BYTES - current.length;
+      if (available <= 0) {
+        outputExceeded = true;
+        terminateGitProcessTree(child);
+        rejectBoundary();
+        return;
+      }
+      const portion = chunk.subarray(0, available);
+      const next = Buffer.concat([current, portion]);
+      if (target === "stdout") stdout = next;
+      else stderr = next;
+      if (chunk.length > available) {
+        outputExceeded = true;
+        terminateGitProcessTree(child);
+        rejectBoundary();
+      }
+    };
+
+    child.stdout?.on("data", (chunk: Buffer | string) =>
+      capture(
+        "stdout",
+        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"),
+      ),
+    );
+    child.stderr?.on("data", (chunk: Buffer | string) =>
+      capture(
+        "stderr",
+        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"),
+      ),
+    );
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      terminateGitProcessTree(child);
+      rejectBoundary();
+    }, GIT_TIMEOUT_MS);
+
+    const rejectBoundary = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      // Git can include remotes, credentials, or arbitrary hook output in an
+      // exception. Keep the boundary diagnostic deliberately non-sensitive.
+      rejectGit(new WorktreeBoundaryError("Git command failed or timed out"));
+    };
+
+    child.once("error", rejectBoundary);
+    child.once("close", (exitCode) => {
+      if (settled) return;
+      if (timedOut || outputExceeded || exitCode !== 0) {
+        rejectBoundary();
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolveGit(stdout.toString("utf8"));
+    });
+  });
 
 function assertRef(value: string, label: string): void {
   if (
@@ -155,6 +238,24 @@ function requireOutput(value: string, label: string): string {
   return output;
 }
 
+async function runGit(
+  git: GitRunner,
+  cwd: string,
+  args: readonly string[],
+  label: string,
+): Promise<string> {
+  try {
+    const output = await git(cwd, args);
+    if (typeof output !== "string") {
+      throw new Error("Git runner returned a non-string result");
+    }
+    return output;
+  } catch (cause) {
+    if (cause instanceof WorktreeBoundaryError) throw cause;
+    throw new WorktreeBoundaryError(`${label} could not be completed`);
+  }
+}
+
 export async function prepareRunWorktree(
   input: PrepareRunWorktreeInput,
 ): Promise<PreparedWorktree> {
@@ -169,13 +270,22 @@ export async function prepareRunWorktree(
   }
   assertRef(input.baseBranch, "base branch");
 
-  const canonicalRepositoryRoot = await realpath(input.repositoryRoot);
+  const canonicalRepositoryRoot = await canonicalExistingDirectory(
+    input.repositoryRoot,
+    "repository root",
+  );
   const requestedWorkspaceRoot = resolve(input.workspaceRoot);
   await assertSafeWorkspacePath(
     canonicalRepositoryRoot,
     requestedWorkspaceRoot,
   );
   await mkdir(requestedWorkspaceRoot, { recursive: true, mode: 0o700 });
+  // Re-check every component after creation. This closes the gap where a
+  // parent is replaced by a symlink between the preflight and mkdir calls.
+  await assertSafeWorkspacePath(
+    canonicalRepositoryRoot,
+    requestedWorkspaceRoot,
+  );
   const canonicalWorkspaceRoot = await realpath(requestedWorkspaceRoot);
   assertContained(canonicalRepositoryRoot, canonicalWorkspaceRoot);
   if (canonicalWorkspaceRoot !== requestedWorkspaceRoot) {
@@ -192,41 +302,75 @@ export async function prepareRunWorktree(
   assertContained(canonicalWorkspaceRoot, worktreePath);
 
   const git = input.git ?? realGit;
-  await git(canonicalRepositoryRoot, ["fetch", "origin", input.baseBranch]);
+  await runGit(
+    git,
+    canonicalRepositoryRoot,
+    ["fetch", "origin", input.baseBranch],
+    "fetch origin/main",
+  );
   const baseSha = requireOutput(
-    await git(canonicalRepositoryRoot, [
-      "rev-parse",
-      "--verify",
-      `refs/remotes/origin/${input.baseBranch}^{commit}`,
-    ]),
+    await runGit(
+      git,
+      canonicalRepositoryRoot,
+      [
+        "rev-parse",
+        "--verify",
+        `refs/remotes/origin/${input.baseBranch}^{commit}`,
+      ],
+      "resolve origin/main",
+    ),
     "base SHA",
   );
   if (!shaPattern.test(baseSha)) {
     throw new WorktreeBoundaryError("git returned an invalid base SHA");
   }
 
-  await git(canonicalRepositoryRoot, [
-    "worktree",
-    "add",
-    "-b",
-    branch,
+  await runGit(
+    git,
+    canonicalRepositoryRoot,
+    ["worktree", "add", "-b", branch, worktreePath, baseSha],
+    "create worktree",
+  );
+
+  // A worktree may be inspected only when its path itself is a canonical,
+  // non-symlink directory. Git's reported top-level path is not sufficient:
+  // a symlink can make a textual path appear contained while resolving out.
+  const canonicalCreatedPath = await canonicalExistingDirectory(
     worktreePath,
-    baseSha,
-  ]);
+    "created worktree path",
+  );
+  if (canonicalCreatedPath !== worktreePath) {
+    throw new WorktreeBoundaryError("created worktree escaped workspace root");
+  }
 
   const actualPath = requireOutput(
-    await git(worktreePath, ["rev-parse", "--show-toplevel"]),
+    await runGit(
+      git,
+      worktreePath,
+      ["rev-parse", "--show-toplevel"],
+      "verify worktree path",
+    ),
     "worktree path",
   );
   if (resolve(actualPath) !== worktreePath) {
     throw new WorktreeBoundaryError("created worktree escaped workspace root");
   }
   const actualBranch = requireOutput(
-    await git(worktreePath, ["branch", "--show-current"]),
+    await runGit(
+      git,
+      worktreePath,
+      ["branch", "--show-current"],
+      "verify worktree branch",
+    ),
     "worktree branch",
   );
   const actualSha = requireOutput(
-    await git(worktreePath, ["rev-parse", "HEAD"]),
+    await runGit(
+      git,
+      worktreePath,
+      ["rev-parse", "HEAD"],
+      "verify worktree SHA",
+    ),
     "worktree SHA",
   );
   if (actualBranch !== branch || actualSha !== baseSha) {
@@ -271,12 +415,62 @@ async function inspectGit(
   args: readonly string[],
   label: string,
 ): Promise<string> {
-  try {
-    return requireOutput(await git(cwd, args), label);
-  } catch (cause) {
-    if (cause instanceof WorktreeBoundaryError) throw cause;
-    throw new WorktreeBoundaryError(`${label} could not be verified`);
+  return requireOutput(
+    await runGit(git, cwd, args, `${label} verification`),
+    label,
+  );
+}
+
+function assertChangedPathContained(
+  worktreePath: string,
+  changedPath: string,
+): string {
+  if (changedPath.length === 0 || changedPath.includes("\0")) {
+    throw new WorktreeBoundaryError("Git reported an invalid changed path");
   }
+  // Git's -z output uses slash separators even on Windows.
+  const nativePath = changedPath.split("/").join(sep);
+  if (isAbsolute(nativePath)) {
+    throw new WorktreeBoundaryError(
+      "Git reported a changed path outside the worktree",
+    );
+  }
+  const absolutePath = resolve(worktreePath, nativePath);
+  const relativePath = relative(worktreePath, absolutePath);
+  if (
+    relativePath === "" ||
+    relativePath === ".." ||
+    relativePath.startsWith(`..${sep}`) ||
+    isAbsolute(relativePath) ||
+    relativePath !== nativePath
+  ) {
+    throw new WorktreeBoundaryError(
+      "Git reported a changed path outside the worktree",
+    );
+  }
+  return changedPath;
+}
+
+async function inspectChangedFiles(
+  git: GitRunner,
+  worktreePath: string,
+): Promise<readonly string[]> {
+  const trackedOutput = await runGit(
+    git,
+    worktreePath,
+    ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
+    "inspect tracked changes",
+  );
+  const untrackedOutput = await runGit(
+    git,
+    worktreePath,
+    ["ls-files", "--others", "--exclude-standard", "-z"],
+    "inspect untracked changes",
+  );
+  const paths = [...trackedOutput.split("\0"), ...untrackedOutput.split("\0")]
+    .filter((path) => path.length > 0)
+    .map((path) => assertChangedPathContained(worktreePath, path));
+  return [...new Set(paths)].toSorted();
 }
 
 async function inspectGitCommonDirectory(
@@ -414,17 +608,19 @@ export async function inspectRunWorktree(
     );
   }
   try {
-    await git(worktreePath, [
-      "merge-base",
-      "--is-ancestor",
-      input.expected.baseSha,
-      actualHeadSha,
-    ]);
+    await runGit(
+      git,
+      worktreePath,
+      ["merge-base", "--is-ancestor", input.expected.baseSha, actualHeadSha],
+      "verify worktree ancestry",
+    );
   } catch {
     throw new WorktreeBoundaryError(
       "worktree HEAD does not descend from the origin/main base SHA",
     );
   }
+
+  const changedFiles = await inspectChangedFiles(git, worktreePath);
 
   return {
     path: worktreePath,
@@ -432,5 +628,6 @@ export async function inspectRunWorktree(
     baseBranch: "main",
     baseSha: originMainSha,
     headSha: actualHeadSha,
+    changedFiles,
   };
 }
