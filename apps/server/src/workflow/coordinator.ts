@@ -81,6 +81,14 @@ export interface BeginEffectCommand {
   at?: string;
 }
 
+export interface ReleaseEffectForRetryCommand {
+  effectKey: string;
+  runId: string;
+  expectedRevision: number;
+  evidence: string;
+  at?: string;
+}
+
 export interface CancelEffectCommand {
   effectKey: string;
   reason: string;
@@ -804,6 +812,27 @@ export class WorkflowCoordinator {
         });
       this.launchDispatch(inFlight);
       return inFlight;
+    });
+  }
+
+  /** Release a completed pending observation lease for a later poll. */
+  releaseEffectForRetry(
+    command: ReleaseEffectForRetryCommand,
+  ): Promise<EffectRecord> {
+    return this.enqueue(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db
+        .transaction()
+        .execute((tx) =>
+          createEffectMutationRepository(tx).releaseInFlightForRetry(
+            command.effectKey,
+            command.runId,
+            command.expectedRevision,
+            this.ownerToken,
+            command.evidence,
+            at,
+          ),
+        );
     });
   }
 

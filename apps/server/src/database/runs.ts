@@ -27,6 +27,7 @@ const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const gitRefComponentPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const githubPathSegmentPattern =
   /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u;
+const githubNodeIdPattern = /^[A-Za-z0-9_:-]+$/u;
 const runStates = new Set<string>(RUN_STATES);
 const repairableTriggers = new Set<WorkflowTrigger>([
   "verification_failed_repairable",
@@ -92,6 +93,7 @@ export interface RunRecord {
   baseBranch: string;
   branch: string | null;
   pullRequestNumber: number | null;
+  pullRequestNodeId: string | null;
   pullRequestTitle: string | null;
   pullRequestUrl: string | null;
   requiredAction: string | null;
@@ -171,6 +173,7 @@ export interface ExecutionFactsUpdateRequest {
 /** The only run facts a coordinator may persist from a publish receipt. */
 export interface PublicationFactsPatch {
   pullRequestNumber: number;
+  pullRequestNodeId: string;
   pullRequestTitle: string;
   pullRequestUrl: string;
   baseSha: string;
@@ -493,6 +496,7 @@ function mapRun(row: RunsTable): RunRecord {
     baseBranch: row.base_branch,
     branch: row.branch,
     pullRequestNumber: row.pull_request_number,
+    pullRequestNodeId: row.pull_request_node_id,
     pullRequestTitle: row.pull_request_title,
     pullRequestUrl: row.pull_request_url,
     requiredAction: row.required_action,
@@ -861,6 +865,7 @@ export function createRunMutationRepository(
             base_branch: "main",
             branch: null,
             pull_request_number: null,
+            pull_request_node_id: null,
             pull_request_title: null,
             pull_request_url: null,
             required_action: null,
@@ -1054,6 +1059,7 @@ export function createRunMutationRepository(
         throw new TypeError("Publication facts patch must be a plain object.");
       const allowed = new Set([
         "pullRequestNumber",
+        "pullRequestNodeId",
         "pullRequestTitle",
         "pullRequestUrl",
         "baseSha",
@@ -1069,6 +1075,13 @@ export function createRunMutationRepository(
         facts.pullRequestNumber,
         "Pull request number",
       );
+      const pullRequestNodeId = boundedText(
+        facts.pullRequestNodeId,
+        "Pull request node ID",
+        maximumIdentifierBytes,
+      );
+      if (!githubNodeIdPattern.test(pullRequestNodeId))
+        throw new TypeError("Pull request node ID is malformed.");
       const pullRequestTitle = boundedText(
         facts.pullRequestTitle,
         "Pull request title",
@@ -1091,6 +1104,7 @@ export function createRunMutationRepository(
         .updateTable("runs")
         .set({
           pull_request_number: pullRequestNumber,
+          pull_request_node_id: pullRequestNodeId,
           pull_request_title: pullRequestTitle,
           pull_request_url: pullRequestUrl,
           base_sha: baseSha,

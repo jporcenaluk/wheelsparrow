@@ -101,6 +101,7 @@ async function beginPublishEffect(
 function validPublicationFacts() {
   return {
     pullRequestNumber: 123,
+    pullRequestNodeId: "PR_node_123",
     pullRequestTitle: "feat: publish the run",
     pullRequestUrl: "https://github.com/owner/repository/pull/123",
     baseSha,
@@ -195,6 +196,7 @@ describe("atomic publication facts settlement", () => {
         at,
         publicationFacts: {
           pullRequestNumber: 0,
+          pullRequestNodeId: "PR_node_0",
           pullRequestTitle: "feat: invalid",
           pullRequestUrl: "not-a-url",
           baseSha: "not-a-sha",
@@ -410,6 +412,7 @@ describe("atomic publication facts settlement", () => {
         evidence: "Facts are for the wrong effect.",
         publicationFacts: {
           pullRequestNumber: 123,
+          pullRequestNodeId: "PR_node_123",
           pullRequestTitle: "feat: invalid effect",
           pullRequestUrl: "https://github.com/owner/repository/pull/123",
           baseSha,

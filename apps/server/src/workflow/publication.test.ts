@@ -134,7 +134,7 @@ describe("approved publication workflow", () => {
         const row = connection.native
           .prepare("SELECT status FROM side_effects WHERE key = ?")
           .get(
-            `run:${currentRun.id}:rework:${currentRun.reworkEpoch}:publish`,
+            `run:${currentRun.id}:rework:${currentRun.reworkEpoch}:round:${currentRun.repairRound}:publish`,
           ) as { status: string } | undefined;
         statuses.push(row?.status ?? "missing");
         return {
@@ -152,12 +152,31 @@ describe("approved publication workflow", () => {
       run: {
         state: "waiting_for_ci",
         pullRequestNumber: 1,
+        pullRequestNodeId: "PR_node_1",
         pullRequestUrl: "https://github.com/octo/widget/pull/1",
         baseSha,
         headSha: committedHeadSha,
       },
     });
     expect(gateway.publicationMutations()).toHaveLength(1);
+    gateway.setRequiredCheck(1, committedHeadSha, "test", "success");
+    if (result.kind !== "published") throw new Error("publish failed");
+    connection.native
+      .prepare(
+        "DELETE FROM side_effects WHERE run_id = ? AND kind = 'observe_ci'",
+      )
+      .run(result.run.id);
+    const restartedRun = await readRun(connection.db, result.run.id);
+    const restarted = await observePublishedCi({
+      coordinator,
+      run: restartedRun,
+      gateway,
+      now: () => at,
+    });
+    expect(restarted).toMatchObject({
+      kind: "ci_passed",
+      run: { state: "review" },
+    });
     await coordinator.close();
   });
 
@@ -210,7 +229,241 @@ describe("approved publication workflow", () => {
     await coordinator.close();
   });
 
-  test("keeps pending checks in the same waiting state without duplicating the effect", async () => {
+  test("preserves the create receipt when PR reread identity changes", async () => {
+    const connection = await createDatabase();
+    const fake = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const gateway = {
+      createPullRequest: (
+        request: Parameters<typeof fake.createPullRequest>[0],
+      ) => fake.createPullRequest(request),
+      readPullRequest: async (
+        request: Parameters<typeof fake.readPullRequest>[0],
+      ) => ({
+        ...(await fake.readPullRequest(request)),
+        nodeId: "PR_node_changed",
+      }),
+      observeRequiredChecks: (
+        request: Parameters<typeof fake.observeRequiredChecks>[0],
+      ) => fake.observeRequiredChecks(request),
+    };
+    const run = await enterPublishing(connection, coordinator);
+
+    const result = await publishApprovedRun({
+      coordinator,
+      run,
+      gateway,
+      title: "feat: publish issue 42",
+      body: "Closes #42",
+      commitAndPush: async (currentRun) => ({
+        branch: currentRun.branch,
+        baseSha,
+        headSha: committedHeadSha,
+      }),
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    const receiptRow = connection.native
+      .prepare(
+        "SELECT receipt_json FROM side_effects WHERE run_id = ? AND kind = 'publish'",
+      )
+      .get(run.id) as { receipt_json: string };
+    expect(JSON.parse(receiptRow.receipt_json)).toMatchObject({
+      pullRequestNumber: 1,
+      pullRequestNodeId: "PR_node_1",
+      pullRequestUrl: "https://github.com/octo/widget/pull/1",
+    });
+    expect(fake.publicationMutations()).toHaveLength(1);
+    await coordinator.close();
+  });
+
+  test("does not call an edge for a cancelled publication intent", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterPublishing(connection, coordinator);
+    const key = `run:${run.id}:rework:${run.reworkEpoch}:round:${run.repairRound}:publish`;
+    await coordinator.createEffectIntent({
+      runId: run.id,
+      expectedRevision: run.revision,
+      key,
+      kind: "publish",
+      intent: {
+        runId: run.id,
+        reworkEpoch: run.reworkEpoch,
+        repository: run.repository,
+        issueNumber: run.issueNumber,
+        worktreePath: run.worktreePath,
+        branch: run.branch,
+        baseBranch: run.baseBranch,
+        baseSha: run.baseSha,
+        previousHeadSha: run.headSha,
+        title: "feat: publish issue 42",
+        body: "Closes #42",
+      },
+      dispatch: false,
+      at,
+    });
+    await coordinator.cancelEffect({
+      effectKey: key,
+      expectedRevision: run.revision,
+      reason: "Operator cancelled the uncertain publication intent.",
+      at,
+    });
+    let commits = 0;
+    const result = await publishApprovedRun({
+      coordinator,
+      run,
+      gateway,
+      title: "feat: publish issue 42",
+      body: "Closes #42",
+      commitAndPush: async (currentRun) => {
+        commits += 1;
+        return {
+          branch: currentRun.branch,
+          baseSha,
+          headSha: committedHeadSha,
+        };
+      },
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    expect(commits).toBe(0);
+    expect(gateway.publicationMutations()).toHaveLength(0);
+    await coordinator.close();
+  });
+
+  test("hands an ambiguous publication intent to Review without retrying it", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterPublishing(connection, coordinator);
+    const key = `run:${run.id}:rework:${run.reworkEpoch}:round:${run.repairRound}:publish`;
+    const intent = {
+      runId: run.id,
+      reworkEpoch: run.reworkEpoch,
+      repository: run.repository,
+      issueNumber: run.issueNumber,
+      worktreePath: run.worktreePath,
+      branch: run.branch,
+      baseBranch: run.baseBranch,
+      baseSha: run.baseSha,
+      previousHeadSha: run.headSha,
+      title: "feat: publish issue 42",
+      body: "Closes #42",
+    };
+    await coordinator.createEffectIntent({
+      runId: run.id,
+      expectedRevision: run.revision,
+      key,
+      kind: "publish",
+      intent,
+      dispatch: false,
+      at,
+    });
+    await coordinator.beginEffect({
+      effectKey: key,
+      expectedRevision: run.revision,
+      at,
+    });
+    await coordinator.abandonEffect({
+      runId: run.id,
+      expectedRevision: run.revision,
+      effectKey: key,
+      outcome: "ambiguous",
+      evidence: "The publisher stopped before the external receipt arrived.",
+      at,
+    });
+    let commits = 0;
+    const result = await publishApprovedRun({
+      coordinator,
+      run,
+      gateway,
+      title: "feat: publish issue 42",
+      body: "Closes #42",
+      commitAndPush: async (currentRun) => {
+        commits += 1;
+        return {
+          branch: currentRun.branch,
+          baseSha,
+          headSha: committedHeadSha,
+        };
+      },
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    expect(commits).toBe(0);
+    expect(gateway.publicationMutations()).toHaveLength(0);
+    await coordinator.close();
+  });
+
+  test("preserves PR evidence when publication settlement fails once", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    let settlements = 0;
+    const flakyCoordinator = {
+      createEffectIntent: coordinator.createEffectIntent.bind(coordinator),
+      beginEffect: coordinator.beginEffect.bind(coordinator),
+      releaseEffectForRetry:
+        coordinator.releaseEffectForRetry.bind(coordinator),
+      settleExecution: async (
+        command: Parameters<typeof coordinator.settleExecution>[0],
+      ) => {
+        settlements += 1;
+        if (settlements === 1)
+          throw new Error("SQLite commit failed after the PR was reread");
+        return coordinator.settleExecution(command);
+      },
+      quarantineEffect: coordinator.quarantineEffect.bind(coordinator),
+      transition: coordinator.transition.bind(coordinator),
+    };
+    const run = await enterPublishing(connection, coordinator);
+    const result = await publishApprovedRun({
+      coordinator: flakyCoordinator,
+      run,
+      gateway,
+      title: "feat: publish issue 42",
+      body: "Closes #42",
+      commitAndPush: async (currentRun) => ({
+        branch: currentRun.branch,
+        baseSha,
+        headSha: committedHeadSha,
+      }),
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    const receiptRow = connection.native
+      .prepare(
+        "SELECT receipt_json FROM side_effects WHERE run_id = ? AND kind = 'publish'",
+      )
+      .get(run.id) as { receipt_json: string };
+    expect(JSON.parse(receiptRow.receipt_json)).toMatchObject({
+      pullRequestNumber: 1,
+      pullRequestNodeId: "PR_node_1",
+      pullRequestUrl: "https://github.com/octo/widget/pull/1",
+    });
+    expect(settlements).toBe(2);
+    await coordinator.close();
+  });
+
+  test("releases pending observation for a later green poll", async () => {
     const connection = await createDatabase();
     const gateway = new FakeGitHubPublicationGateway({
       repository: "octo/widget",
@@ -242,6 +495,7 @@ describe("approved publication workflow", () => {
       pullRequest: published.pullRequest,
       now: () => at,
     });
+    gateway.setRequiredCheck(1, committedHeadSha, "test", "success");
     const second = await observePublishedCi({
       coordinator,
       run: published.run,
@@ -251,19 +505,73 @@ describe("approved publication workflow", () => {
     });
 
     expect(first.kind).toBe("ci_pending");
-    expect(second.kind).toBe("ci_pending");
-    expect(checkReads).toBe(1);
-    expect(first.run).toMatchObject({
-      state: "waiting_for_ci",
-      revision: published.run.revision,
+    expect(second).toMatchObject({
+      kind: "ci_passed",
+      run: { state: "review" },
     });
+    expect(checkReads).toBe(2);
     expect(
       connection.native
         .prepare(
-          "SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ? AND kind = 'observe_ci'",
+          "SELECT status FROM side_effects WHERE run_id = ? AND kind = 'observe_ci'",
         )
         .get(published.run.id),
-    ).toEqual({ count: 1 });
+    ).toEqual({ status: "confirmed" });
+    await coordinator.close();
+  });
+
+  test("does not duplicate an in-flight check read", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const published = await publish(connection, coordinator, gateway);
+    if (published.kind !== "published") throw new Error("publish failed");
+    let checkReads = 0;
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const observingGateway = {
+      createPullRequest: (
+        request: Parameters<typeof gateway.createPullRequest>[0],
+      ) => gateway.createPullRequest(request),
+      readPullRequest: (
+        request: Parameters<typeof gateway.readPullRequest>[0],
+      ) => gateway.readPullRequest(request),
+      observeRequiredChecks: async (
+        request: Parameters<typeof gateway.observeRequiredChecks>[0],
+      ) => {
+        checkReads += 1;
+        entered();
+        await blocked;
+        return gateway.observeRequiredChecks(request);
+      },
+    };
+
+    const firstPromise = observePublishedCi({
+      coordinator,
+      run: published.run,
+      gateway: observingGateway,
+      now: () => at,
+    });
+    await enteredPromise;
+    const concurrent = await observePublishedCi({
+      coordinator,
+      run: published.run,
+      gateway: observingGateway,
+      now: () => at,
+    });
+    expect(concurrent).toMatchObject({ kind: "ci_pending" });
+    expect(checkReads).toBe(1);
+    release();
+    expect(await firstPromise).toMatchObject({ kind: "ci_pending" });
     await coordinator.close();
   });
 
@@ -291,6 +599,39 @@ describe("approved publication workflow", () => {
       kind: "ci_passed",
       run: { state: "review" },
     });
+    await coordinator.close();
+  });
+
+  test("fails closed when checks are reported for another PR node", async () => {
+    const connection = await createDatabase();
+    const fake = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const published = await publish(connection, coordinator, fake);
+    if (published.kind !== "published") throw new Error("publish failed");
+    const gateway = {
+      createPullRequest: (
+        request: Parameters<typeof fake.createPullRequest>[0],
+      ) => fake.createPullRequest(request),
+      readPullRequest: (request: Parameters<typeof fake.readPullRequest>[0]) =>
+        fake.readPullRequest(request),
+      observeRequiredChecks: async (
+        request: Parameters<typeof fake.observeRequiredChecks>[0],
+      ) => ({
+        ...(await fake.observeRequiredChecks(request)),
+        nodeId: "PR_node_other",
+      }),
+    };
+    const observed = await observePublishedCi({
+      coordinator,
+      run: published.run,
+      gateway,
+      now: () => at,
+    });
+
+    expect(observed).toMatchObject({ kind: "human", run: { state: "review" } });
     await coordinator.close();
   });
 
@@ -414,6 +755,8 @@ describe("approved publication workflow", () => {
           ? Promise.reject(new Error("SQLite unavailable while scheduling CI"))
           : coordinator.createEffectIntent(command),
       beginEffect: coordinator.beginEffect.bind(coordinator),
+      releaseEffectForRetry:
+        coordinator.releaseEffectForRetry.bind(coordinator),
       settleExecution: coordinator.settleExecution.bind(coordinator),
       quarantineEffect: coordinator.quarantineEffect.bind(coordinator),
       transition: coordinator.transition.bind(coordinator),
@@ -438,7 +781,9 @@ describe("approved publication workflow", () => {
     expect(
       connection.native
         .prepare("SELECT status FROM side_effects WHERE key = ?")
-        .get(`run:${run.id}:rework:${run.reworkEpoch}:publish`),
+        .get(
+          `run:${run.id}:rework:${run.reworkEpoch}:round:${run.repairRound}:publish`,
+        ),
     ).toEqual({ status: "confirmed" });
     expect(
       connection.native

@@ -281,6 +281,15 @@ export interface EffectMutationRepository {
     ownerToken: string,
     at: string,
   ): Promise<EffectRecord>;
+  /** Release a completed pending observation lease without advancing the run. */
+  releaseInFlightForRetry(
+    key: string,
+    runId: string,
+    expectedRevision: number,
+    ownerToken: string,
+    evidence: string,
+    at: string,
+  ): Promise<EffectRecord>;
   recordEffectObservation(
     observation: EffectObservation,
     at: string,
@@ -430,6 +439,57 @@ export function createEffectMutationRepository(
         .where("status", "=", "pending")
         .executeTakeFirst();
       if (Number(update.numUpdatedRows) !== 1) throw new StaleEffectError(key);
+      return mapEffect(await readEffectRow(tx, key));
+    },
+
+    async releaseInFlightForRetry(
+      keyInput,
+      runIdInput,
+      expectedRevisionInput,
+      ownerTokenInput,
+      evidenceInput,
+      atInput,
+    ): Promise<EffectRecord> {
+      const key = identifier(keyInput, "Effect key");
+      const runId = identifier(runIdInput, "Run ID");
+      const expectedRevision = nonNegativeInteger(
+        expectedRevisionInput,
+        "Expected revision",
+      );
+      const ownerToken = identifier(ownerTokenInput, "Executor owner token");
+      const evidence = boundedText(
+        evidenceInput,
+        "Retry evidence",
+        maximumEvidenceBytes,
+      );
+      const at = identifier(atInput, "Timestamp");
+      const current = await readEffectRow(tx, key);
+      const run = await readRun(tx, runId);
+      if (
+        current.run_id !== runId ||
+        current.status !== "in_flight" ||
+        current.executor_owner_token !== ownerToken ||
+        run.revision !== expectedRevision
+      )
+        throw new StaleEffectError(key, expectedRevision);
+      const update = await tx
+        .updateTable("side_effects")
+        .set({
+          status: "pending",
+          executor_owner_token: null,
+          started_at: null,
+          completed_at: null,
+          failure: null,
+          reconciliation_evidence: evidence,
+          updated_at: at,
+        })
+        .where("key", "=", key)
+        .where("run_id", "=", runId)
+        .where("status", "=", "in_flight")
+        .where("executor_owner_token", "=", ownerToken)
+        .executeTakeFirst();
+      if (Number(update.numUpdatedRows) !== 1)
+        throw new StaleEffectError(key, expectedRevision);
       return mapEffect(await readEffectRow(tx, key));
     },
 

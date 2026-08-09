@@ -377,6 +377,7 @@ describe("GitHub publication gateway seam", () => {
       number: 1,
       nodeId: "PR_node_1",
       headSha: "b".repeat(40),
+      requiredCheckNames: ["test"],
       requiredChecks: [{ name: "test", state: "success" as const }],
       headDrift: false,
       aggregate: "green" as const,
@@ -398,6 +399,21 @@ describe("GitHub publication gateway seam", () => {
         aggregate: "head_drift",
       }).aggregate,
     ).toBe("head_drift");
+  });
+
+  test("rejects a partial successful list when the provider required set is larger", () => {
+    expect(() =>
+      assertRequiredChecksReceipt({
+        repository,
+        number: 1,
+        nodeId: "PR_node_1",
+        headSha: "b".repeat(40),
+        requiredCheckNames: ["test", "lint"],
+        requiredChecks: [{ name: "test", state: "success" }],
+        headDrift: false,
+        aggregate: "green",
+      }),
+    ).toThrow(/check/i);
   });
 
   test.each(["owner-/repo", "owner/repo_"])(

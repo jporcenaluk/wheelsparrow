@@ -23,6 +23,7 @@ export type PublicationCoordinator = Pick<
   WorkflowCoordinator,
   | "createEffectIntent"
   | "beginEffect"
+  | "releaseEffectForRetry"
   | "settleExecution"
   | "quarantineEffect"
   | "transition"
@@ -174,8 +175,10 @@ function durableFailureReceipt(
 ): Record<string, unknown> {
   return {
     reworkEpoch: run.reworkEpoch,
+    repairRound: run.repairRound,
     worktreePath: run.worktreePath,
     pullRequestNumber: run.pullRequestNumber,
+    pullRequestNodeId: run.pullRequestNodeId,
     pullRequestUrl: run.pullRequestUrl,
     ...details,
     evidence: bounded(reason),
@@ -184,12 +187,12 @@ function durableFailureReceipt(
 }
 
 function effectKey(run: RunRecord, kind: "publish" | "observe-ci"): string {
-  return `run:${run.id}:rework:${run.reworkEpoch}:${kind}`;
+  return `run:${run.id}:rework:${run.reworkEpoch}:round:${run.repairRound}:${kind}`;
 }
 
 function receiptPromptHash(run: RunRecord, kind: string): string {
   return createHash("sha256")
-    .update(`${run.id}:${run.reworkEpoch}:${kind}`, "utf8")
+    .update(`${run.id}:${run.reworkEpoch}:${run.repairRound}:${kind}`, "utf8")
     .digest("hex");
 }
 
@@ -259,6 +262,39 @@ function assertLinkedPullRequest(
   return receipt;
 }
 
+async function handoffScheduledEffect(
+  input: PublishApprovedRunInput | ObservePublishedCiInput,
+  scheduled: ScheduledEffect,
+  reason: string,
+  step: ReturnType<typeof publicationStep> | ReturnType<typeof ciStep>,
+  now: () => string,
+): Promise<PublicationOutcome | CiObservationOutcome> {
+  if (scheduled.effect.status === "ambiguous")
+    return failClosed(
+      input.coordinator,
+      input.run,
+      scheduled.effect,
+      reason,
+      durableFailureReceipt(input.run, reason, { kind: "ambiguous" }),
+      step,
+      now,
+    );
+  try {
+    const handedOff = await input.coordinator.transition({
+      runId: input.run.id,
+      expectedRevision: input.run.revision,
+      trigger: "handoff_required",
+      at: now(),
+      summary: { text: bounded(reason) },
+      requiredAction: bounded(reason),
+    });
+    return { kind: "human", run: handedOff, reason: bounded(reason) };
+  } catch (error) {
+    if (isStale(error)) return { kind: "stale", run: input.run };
+    return { kind: "human", run: input.run, reason: bounded(reason) };
+  }
+}
+
 async function schedule(
   coordinator: PublicationCoordinator,
   run: RunRecord,
@@ -294,9 +330,9 @@ function publicationStep(
   summary: string,
   at: string,
 ) {
-  const attempt = 1;
+  const attempt = run.repairRound + 1;
   return {
-    id: `run:${run.id}:rework:${run.reworkEpoch}:publication:attempt:${attempt}:step`,
+    id: `run:${run.id}:rework:${run.reworkEpoch}:round:${run.repairRound}:publication:attempt:${attempt}:step`,
     runId: run.id,
     expectedRevision: run.revision,
     reworkEpoch: run.reworkEpoch,
@@ -312,7 +348,7 @@ function publicationStep(
     completedAt: at,
     exitResultJson: json(receipt),
     summary: { text: bounded(summary) },
-    rawLogReference: `logs/${run.id}/rework-${run.reworkEpoch}/publication/attempt-${attempt}.jsonl`,
+    rawLogReference: `logs/${run.id}/rework-${run.reworkEpoch}/round-${run.repairRound}/publication/attempt-${attempt}.jsonl`,
   } as const;
 }
 
@@ -323,14 +359,15 @@ function ciStep(
   summary: string,
   at: string,
 ) {
+  const attempt = run.repairRound + 1;
   return {
-    id: `run:${run.id}:rework:${run.reworkEpoch}:ci:attempt:1:step`,
+    id: `run:${run.id}:rework:${run.reworkEpoch}:round:${run.repairRound}:ci:attempt:${attempt}:step`,
     runId: run.id,
     expectedRevision: run.revision,
     reworkEpoch: run.reworkEpoch,
     role: "ci-observer",
     logicalStep: "observe_ci",
-    attempt: 1,
+    attempt,
     statusSequence: 1,
     status,
     promptHash: receiptPromptHash(run, "observe-ci"),
@@ -340,7 +377,7 @@ function ciStep(
     completedAt: at,
     exitResultJson: json(receipt),
     summary: { text: bounded(summary) },
-    rawLogReference: `logs/${run.id}/rework-${run.reworkEpoch}/ci/attempt-1.jsonl`,
+    rawLogReference: `logs/${run.id}/rework-${run.reworkEpoch}/round-${run.repairRound}/ci/attempt-${attempt}.jsonl`,
   } as const;
 }
 
@@ -433,11 +470,35 @@ export async function publishApprovedRun(
       scheduled.effect.status === "failed"
     )
       return { kind: "stale", run: input.run };
-    return { kind: "pending", run: input.run, effectKey: key };
+    if (scheduled.effect.status === "in_flight")
+      return { kind: "pending", run: input.run, effectKey: key };
+    if (
+      scheduled.effect.status === "ambiguous" ||
+      scheduled.effect.status === "cancelled"
+    )
+      return (await handoffScheduledEffect(
+        input,
+        scheduled,
+        `Publication effect ${scheduled.effect.status} requires reconciliation before any external mutation is attempted.`,
+        publicationStep(
+          input.run,
+          "failed",
+          { effectStatus: scheduled.effect.status },
+          "Publication was handed off without retrying an uncertain effect.",
+          now(),
+        ),
+        now,
+      )) as PublicationOutcome;
+    return {
+      kind: "human",
+      run: input.run,
+      reason: "Unknown publication effect status.",
+    };
   }
 
-  let commit: PublicationCommitReceipt;
-  let pullRequest: PullRequestReceipt;
+  let commit: PublicationCommitReceipt | undefined;
+  let pullRequest: PullRequestReceipt | undefined;
+  let createdPullRequest: PullRequestReceipt | undefined;
   try {
     assertPublicationRun(input.run);
     if (
@@ -463,13 +524,18 @@ export async function publishApprovedRun(
       headSha: commit.headSha,
     } as const;
     const created = await input.gateway.createPullRequest(request);
-    const receipt = assertLinkedPullRequest(created, input.run, commit, title);
+    createdPullRequest = assertLinkedPullRequest(
+      created,
+      input.run,
+      commit,
+      title,
+    );
     pullRequest = assertLinkedPullRequest(
       await input.gateway.readPullRequest({
         repository: input.run.repository,
-        number: receipt.number,
+        number: createdPullRequest.number,
         issueNumber: input.run.issueNumber,
-        expectedNodeId: receipt.nodeId,
+        expectedNodeId: createdPullRequest.nodeId,
         expectedTitle: title,
         expectedBaseBranch: input.run.baseBranch,
         expectedBaseSha: commit.baseSha,
@@ -480,6 +546,13 @@ export async function publishApprovedRun(
       commit,
       title,
     );
+    if (
+      pullRequest.number !== createdPullRequest.number ||
+      pullRequest.nodeId !== createdPullRequest.nodeId
+    )
+      throw new Error(
+        "Pull request reread identity does not match the create receipt.",
+      );
   } catch (error) {
     const reason = `Publication failed closed: ${errorMessage(error)}`;
     return (await failClosed(
@@ -487,7 +560,18 @@ export async function publishApprovedRun(
       input.run,
       scheduled.effect,
       reason,
-      durableFailureReceipt(input.run, reason, { kind: "failed" }),
+      durableFailureReceipt(input.run, reason, {
+        kind: "failed",
+        ...(createdPullRequest === undefined
+          ? {}
+          : {
+              pullRequest: createdPullRequest,
+              pullRequestNumber: createdPullRequest.number,
+              pullRequestNodeId: createdPullRequest.nodeId,
+              pullRequestUrl: createdPullRequest.url,
+            }),
+        ...(commit === undefined ? {} : { commit }),
+      }),
       publicationStep(
         input.run,
         "failed",
@@ -499,8 +583,12 @@ export async function publishApprovedRun(
     )) as PublicationOutcome;
   }
 
+  if (commit === undefined || pullRequest === undefined)
+    return { kind: "stale", run: input.run };
+
   const publicationFacts: PublicationFactsPatch = {
     pullRequestNumber: pullRequest.number,
+    pullRequestNodeId: pullRequest.nodeId,
     pullRequestTitle: pullRequest.title,
     pullRequestUrl: pullRequest.url,
     baseSha: pullRequest.baseSha,
@@ -541,7 +629,25 @@ export async function publishApprovedRun(
       input.run,
       scheduled.effect,
       `Publication settlement failed closed: ${errorMessage(error)}`,
-      durableFailureReceipt(input.run, errorMessage(error), { kind: "failed" }),
+      durableFailureReceipt(input.run, errorMessage(error), {
+        kind: "failed",
+        ...(commit === undefined ? {} : { commit }),
+        ...(pullRequest === undefined
+          ? createdPullRequest === undefined
+            ? {}
+            : {
+                pullRequest: createdPullRequest,
+                pullRequestNumber: createdPullRequest.number,
+                pullRequestNodeId: createdPullRequest.nodeId,
+                pullRequestUrl: createdPullRequest.url,
+              }
+          : {
+              pullRequest,
+              pullRequestNumber: pullRequest.number,
+              pullRequestNodeId: pullRequest.nodeId,
+              pullRequestUrl: pullRequest.url,
+            }),
+      }),
       publicationStep(
         input.run,
         "failed",
@@ -608,8 +714,21 @@ export async function observePublishedCi(
   if (input.run.state !== "waiting_for_ci")
     return { kind: "stale", run: input.run };
   const key = effectKey(input.run, "observe-ci");
-  const pullRequestNodeId =
+  const suppliedPullRequestNodeId =
     input.pullRequestNodeId ?? input.pullRequest?.nodeId;
+  if (
+    input.run.pullRequestNodeId !== null &&
+    suppliedPullRequestNodeId !== undefined &&
+    suppliedPullRequestNodeId !== input.run.pullRequestNodeId
+  )
+    return {
+      kind: "human",
+      run: input.run,
+      reason:
+        "The supplied pull request node ID conflicts with the durable PR identity.",
+    };
+  const pullRequestNodeId =
+    input.run.pullRequestNodeId ?? suppliedPullRequestNodeId;
   let scheduled: ScheduledEffect;
   try {
     if (!nonEmptyText(pullRequestNodeId, 256))
@@ -646,8 +765,32 @@ export async function observePublishedCi(
     scheduled.effect.status === "failed"
   )
     return { kind: "stale", run: input.run };
-  if (!scheduled.started)
-    return { kind: "ci_pending", run: input.run, effectKey: key };
+  if (!scheduled.started) {
+    if (scheduled.effect.status === "in_flight")
+      return { kind: "ci_pending", run: input.run, effectKey: key };
+    if (
+      scheduled.effect.status === "ambiguous" ||
+      scheduled.effect.status === "cancelled"
+    )
+      return (await handoffScheduledEffect(
+        input,
+        scheduled,
+        `CI observation effect ${scheduled.effect.status} requires reconciliation before another check read is attempted.`,
+        ciStep(
+          input.run,
+          "failed",
+          { effectStatus: scheduled.effect.status },
+          "CI observation was handed off without retrying an uncertain effect.",
+          now(),
+        ),
+        now,
+      )) as CiObservationOutcome;
+    return {
+      kind: "human",
+      run: input.run,
+      reason: "Unknown CI observation effect status.",
+    };
+  }
 
   let checks: RequiredChecksReceipt;
   try {
@@ -658,19 +801,25 @@ export async function observePublishedCi(
       input.run.headSha === null
     )
       throw new Error("Recorded pull request facts are incomplete.");
+    const intent = JSON.parse(scheduled.effect.intent) as Record<
+      string,
+      unknown
+    >;
+    const intentNodeId = intent.pullRequestNodeId;
+    if (
+      typeof intentNodeId !== "string" ||
+      pullRequestNodeId === undefined ||
+      intentNodeId !== pullRequestNodeId ||
+      input.run.pullRequestNodeId !== intentNodeId
+    )
+      throw new Error(
+        "The CI observation intent is not bound to the durable pull request node ID.",
+      );
     checks = assertRequiredChecksReceipt(
       await input.gateway.observeRequiredChecks({
         repository: input.run.repository,
         number: input.run.pullRequestNumber,
-        nodeId: (() => {
-          const intent = JSON.parse(scheduled.effect.intent) as Record<
-            string,
-            unknown
-          >;
-          if (typeof intent.pullRequestNodeId !== "string")
-            throw new Error("Recorded pull request node ID is unavailable.");
-          return intent.pullRequestNodeId;
-        })(),
+        nodeId: intentNodeId,
         expectedBaseBranch: input.run.baseBranch,
         expectedBaseSha: input.run.baseSha,
         expectedHeadSha: input.run.headSha,
@@ -679,6 +828,7 @@ export async function observePublishedCi(
     if (
       checks.repository !== input.run.repository ||
       checks.number !== input.run.pullRequestNumber ||
+      checks.nodeId !== pullRequestNodeId ||
       checks.headSha !== input.run.headSha ||
       checks.headDrift
     )
@@ -699,7 +849,29 @@ export async function observePublishedCi(
   }
 
   if (checks.aggregate === "pending")
-    return { kind: "ci_pending", run: input.run, checks, effectKey: key };
+    try {
+      await input.coordinator.releaseEffectForRetry({
+        runId: input.run.id,
+        expectedRevision: input.run.revision,
+        effectKey: scheduled.effect.key,
+        evidence:
+          "Required checks remain pending; the observation lease was released for a later poll.",
+        at: now(),
+      });
+      return { kind: "ci_pending", run: input.run, checks, effectKey: key };
+    } catch (error) {
+      if (isStale(error)) return { kind: "stale", run: input.run };
+      const reason = `CI pending lease could not be released: ${errorMessage(error)}`;
+      return (await failClosed(
+        input.coordinator,
+        input.run,
+        scheduled.effect,
+        reason,
+        durableFailureReceipt(input.run, reason, { checks }),
+        ciStep(input.run, "failed", { checks }, reason, now()),
+        now,
+      )) as CiObservationOutcome;
+    }
   if (checks.aggregate === "head_drift") {
     const reason = "CI observation detected pull-request head drift.";
     return (await failClosed(
@@ -733,6 +905,7 @@ export async function observePublishedCi(
         reworkEpoch: input.run.reworkEpoch,
         worktreePath: input.run.worktreePath,
         pullRequestNumber: input.run.pullRequestNumber,
+        pullRequestNodeId: input.run.pullRequestNodeId,
         pullRequestUrl: input.run.pullRequestUrl,
         checks,
         evidence: failed

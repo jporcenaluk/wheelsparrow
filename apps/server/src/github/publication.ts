@@ -105,6 +105,8 @@ export interface RequiredChecksReceipt {
   readonly nodeId: string;
   /** The head SHA actually observed on the PR, never the requested SHA. */
   readonly headSha: string;
+  /** The provider's complete required-check set for this repository/PR. */
+  readonly requiredCheckNames: readonly string[];
   readonly requiredChecks: readonly RequiredCheckReceipt[];
   /** True when the observed PR identity differs from the expected request. */
   readonly headDrift: boolean;
@@ -438,12 +440,19 @@ export function assertRequiredChecksReceipt(
   value: unknown,
 ): RequiredChecksReceipt {
   const receipt = requirePlainInput(value, "Required checks receipt");
+  const requiredCheckNames = isDenseArray(receipt.requiredCheckNames)
+    ? receipt.requiredCheckNames
+    : [];
+  const requiredChecks = isDenseArray(receipt.requiredChecks)
+    ? receipt.requiredChecks
+    : [];
   if (
     !hasOnlyKeys(receipt, [
       "repository",
       "number",
       "nodeId",
       "headSha",
+      "requiredCheckNames",
       "requiredChecks",
       "headDrift",
       "aggregate",
@@ -453,10 +462,17 @@ export function assertRequiredChecksReceipt(
     !nodeId(receipt.nodeId) ||
     !sha(receipt.headSha) ||
     typeof receipt.headDrift !== "boolean" ||
+    !isDenseArray(receipt.requiredCheckNames) ||
+    requiredCheckNames.length === 0 ||
+    requiredCheckNames.length > 128 ||
+    requiredCheckNames.some(
+      (name) => !text(name, "required check name", MAX_CHECK_NAME_BYTES),
+    ) ||
+    new Set(requiredCheckNames).size !== requiredCheckNames.length ||
     !isDenseArray(receipt.requiredChecks) ||
-    receipt.requiredChecks.length === 0 ||
-    receipt.requiredChecks.length > 128 ||
-    receipt.requiredChecks.some((check) => {
+    requiredChecks.length === 0 ||
+    requiredChecks.length > 128 ||
+    requiredChecks.some((check) => {
       if (!isPlainRecord(check)) return true;
       return (
         !hasOnlyKeys(check, ["name", "state"]) ||
@@ -465,10 +481,17 @@ export function assertRequiredChecksReceipt(
       );
     }) ||
     new Set(
-      receipt.requiredChecks.map((check) =>
+      requiredChecks.map((check) =>
         isPlainRecord(check) ? check.name : undefined,
       ),
-    ).size !== receipt.requiredChecks.length ||
+    ).size !== requiredChecks.length ||
+    requiredChecks.length !== requiredCheckNames.length ||
+    requiredCheckNames.some(
+      (name) =>
+        !requiredChecks.some(
+          (check) => isPlainRecord(check) && check.name === name,
+        ),
+    ) ||
     !["pending", "green", "failed", "head_drift"].includes(
       receipt.aggregate as string,
     ) ||
@@ -484,7 +507,8 @@ export function assertRequiredChecksReceipt(
     number: receipt.number,
     nodeId: receipt.nodeId,
     headSha: receipt.headSha,
-    requiredChecks: receipt.requiredChecks.map((check) => ({
+    requiredCheckNames: requiredCheckNames.map((name) => name as string),
+    requiredChecks: requiredChecks.map((check) => ({
       name: (check as Record<string, unknown>).name as string,
       state: (check as Record<string, unknown>).state as RequiredCheckState,
     })),

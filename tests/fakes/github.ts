@@ -730,6 +730,7 @@ export class FakeGitHubPublicationGateway implements GitHubPublicationGateway {
       number: pullRequest.number,
       nodeId: pullRequest.nodeId,
       headSha: pullRequest.headSha,
+      requiredCheckNames: [...this.#requiredCheckNames],
       requiredChecks,
       headDrift: headDrifted,
       aggregate,
@@ -778,6 +779,16 @@ export class FakeGitHubPublicationGateway implements GitHubPublicationGateway {
     const pullRequest = this.#pullRequests.get(number);
     if (pullRequest === undefined) throw new Error("Unknown pull request");
     pullRequest.headSha = headSha;
+    const checkState = this.#checkStates.get(number);
+    if (checkState !== undefined) {
+      checkState.headSha = headSha;
+      checkState.states = new Map();
+    }
+  }
+
+  /** Advance the linked PR head between bounded repair rounds. */
+  advancePullRequestHead(number: number, headSha: string): void {
+    this.setPullRequestHead(number, headSha);
   }
 
   setPullRequestBase(number: number, baseSha: string): void {
