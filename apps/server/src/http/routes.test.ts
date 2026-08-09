@@ -119,7 +119,11 @@ async function createApp() {
   return { app, coordinator, routes, connection };
 }
 
-function insertReviewRun(connection: DatabaseConnection, id = "run-1") {
+function insertReviewRun(
+  connection: DatabaseConnection,
+  id = "run-1",
+  requiredAction = "Approve exact head.",
+) {
   connection.native
     .prepare(
       `INSERT INTO runs (
@@ -150,7 +154,7 @@ function insertReviewRun(connection: DatabaseConnection, id = "run-1") {
       "b".repeat(40),
       "main",
       `codex/${id}`,
-      "Approve exact head.",
+      requiredAction,
       "2026-08-09T10:00:00.000Z",
       "2026-08-09T10:00:00.000Z",
     );
@@ -219,6 +223,28 @@ describe("operator routes", () => {
     expect(queue.json().ready[1].blocked_reason).toBe(
       "blocked_dependency_open",
     );
+  });
+
+  test("redacts credential-shaped required actions in the queue API", async () => {
+    const { app, connection } = await createApp();
+    insertReviewRun(
+      connection,
+      "run-json",
+      '{"token":"SECRET_JSON_API","nested":{"password":"SECRET_NESTED_API"}} ghp_123456789012345678901234567890123456',
+    );
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/operator/queue",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).not.toContain("SECRET_JSON_API");
+    expect(response.body).not.toContain("SECRET_NESTED_API");
+    expect(response.body).not.toContain(
+      "ghp_123456789012345678901234567890123456",
+    );
+    expect(response.json().review[0].required_action).toContain("[REDACTED]");
   });
 
   test("returns a versioned malformed JSON error", async () => {

@@ -65,6 +65,49 @@ describe("operator read projections", () => {
     expect(JSON.stringify(projection)).not.toContain("PVTI_secretish");
   });
 
+  test("redacts credential-shaped values in JSON-ish actions", () => {
+    const secrets = [
+      "SECRET_JSON_TOKEN",
+      "SECRET_JSON_CREDENTIAL",
+      "SECRET_JSON_SECRET",
+      "SECRET_JSON_PASSWORD",
+      "SECRET_JSON_BEARER",
+      "SECRET_NESTED_TOKEN",
+      "SECRET_LABELED_TOKEN",
+      "SECRET_BEARER",
+      "ghp_123456789012345678901234567890123456",
+    ];
+    const requiredAction = [
+      "Safe fact: deployment is ready.",
+      "Keep the token budget at 10.",
+      '{"token":"SECRET_JSON_TOKEN","credential":"SECRET_JSON_CREDENTIAL","secret":"SECRET_JSON_SECRET","password":"SECRET_JSON_PASSWORD","authorization":"Bearer SECRET_JSON_BEARER","nested":{"token":"SECRET_NESTED_TOKEN"}}',
+      "token: SECRET_LABELED_TOKEN",
+      "authorization: Bearer SECRET_BEARER",
+      "ghp_123456789012345678901234567890123456",
+    ].join(" ");
+
+    const projected = projectQueue({
+      scheduler,
+      runs: [{ ...run, requiredAction }],
+    }).review[0].required_action;
+
+    expect(projected).toContain("Safe fact: deployment is ready.");
+    expect(projected).toContain("Keep the token budget at 10.");
+    for (const secret of secrets) expect(projected).not.toContain(secret);
+    expect(projected).toContain("[REDACTED]");
+  });
+
+  test("redacts before applying the bounded text limit", () => {
+    const requiredAction = `{"token":"SECRET_BOUNDED"} ${"safe ".repeat(2_000)}`;
+    const projected = projectQueue({
+      scheduler,
+      runs: [{ ...run, requiredAction }],
+    }).review[0].required_action;
+
+    expect(projected).not.toContain("SECRET_BOUNDED");
+    expect(projected).toHaveLength(4096);
+  });
+
   test("keeps durable-only ready merging deterministic while preserving discovery order", () => {
     const first = { ...run, id: "durable-2", issueNumber: 20 };
     const second = { ...run, id: "durable-1", issueNumber: 10 };

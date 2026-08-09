@@ -23,8 +23,12 @@ import type {
 } from "../database/runs.js";
 
 const MAX_TEXT_LENGTH = 4096;
-const credentialPattern =
-  /\b(?:access[_-]?token|api[_-]?key|authorization|credential|password|private[_-]?key|secret|token)\b(?:\s*[:=]\s*|\s+)(?:"[^"]*"|'[^']*'|\S+)/giu;
+const jsonCredentialPattern =
+  /("(?:access[_ -]?token|api[_ -]?key|authorization|bearer|credential|password|private[_ -]?key|secret|token)"\s*:\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|Bearer\s+\S+|[^\s,}\]]+)/giu;
+const labeledCredentialPattern =
+  /\b(access[_ -]?token|api[_ -]?key|authorization|bearer|credential|password|private[_ -]?key|secret|token)(\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|Bearer\s+\S+|\S+)/giu;
+const githubTokenPattern = /\b(?:gh[opusr]|github_pat)_[A-Za-z0-9_-]+/giu;
+const bearerPattern = /\bBearer\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~+/=-]+)/giu;
 const codingStates = new Set<RunRecord["state"]>([
   "claiming",
   "preparing",
@@ -39,11 +43,35 @@ const codingStates = new Set<RunRecord["state"]>([
   "returning_to_todo",
 ]);
 
+function redactCredentialValue(value: string): string {
+  const quote = value[0];
+  if ((quote === '"' || quote === "'") && value.at(-1) === quote)
+    return `${quote}[REDACTED]${quote}`;
+  return "[REDACTED]";
+}
+
+function redactCredentials(value: string): string {
+  return value
+    .replace(
+      jsonCredentialPattern,
+      (_match, prefix: string, credential: string) =>
+        `${prefix}${redactCredentialValue(credential)}`,
+    )
+    .replace(
+      labeledCredentialPattern,
+      (_match, label: string, separator: string, credential: string) =>
+        `${label}${separator}${redactCredentialValue(credential)}`,
+    )
+    .replace(githubTokenPattern, "[REDACTED]")
+    .replace(bearerPattern, "Bearer [REDACTED]");
+}
+
 function text(value: string, fallback = "Unavailable"): string {
   const candidate = typeof value === "string" ? value.trim() : "";
-  return (candidate.length > 0 ? candidate : fallback)
-    .replace(credentialPattern, "[REDACTED]")
-    .slice(0, MAX_TEXT_LENGTH);
+  return redactCredentials(candidate.length > 0 ? candidate : fallback).slice(
+    0,
+    MAX_TEXT_LENGTH,
+  );
 }
 
 function nullableText(value: string | null): string | null {
