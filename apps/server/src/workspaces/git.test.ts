@@ -17,6 +17,7 @@ import {
   inspectRunWorktree,
   type PrepareRunWorktreeInput,
   prepareRunWorktree,
+  readRunWorktreeDiff,
   realGit,
   WorktreeBoundaryError,
 } from "./git.js";
@@ -120,6 +121,102 @@ describe("contained Git worktree boundary", () => {
     expect(
       inspected.changedFiles.every((path) => !path.startsWith("../")),
     ).toBe(true);
+  });
+
+  test("reads a bounded canonical diff only after revalidating the assigned worktree", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await writeFile(join(prepared.path, "README.md"), "changed\n", "utf8");
+
+    const diff = await readRunWorktreeDiff({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      expected: {
+        path: prepared.path,
+        branch: prepared.branch,
+        baseSha: prepared.baseSha,
+        headSha: prepared.baseSha,
+      },
+      git: realGit,
+    });
+
+    expect(diff).toContain("diff --git a/README.md b/README.md");
+    expect(diff).toContain("+changed");
+    expect(Buffer.byteLength(diff, "utf8")).toBeLessThanOrEqual(256 * 1024);
+  });
+
+  test("rejects a raw diff that exceeds its bounded readback limit", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await writeFile(
+      join(prepared.path, "README.md"),
+      `${"x".repeat(2_000)}\n`,
+      "utf8",
+    );
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        maxBytes: 128,
+        git: realGit,
+      }),
+    ).rejects.toThrow(/raw diff|size|bound/u);
+  });
+
+  test("revalidates worktree identity before reading the diff", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: "b".repeat(40),
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/HEAD|SHA|receipt/u);
   });
 
   test("rejects a workspace root outside the repository data root", async () => {

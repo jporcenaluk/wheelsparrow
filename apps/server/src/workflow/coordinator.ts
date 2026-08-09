@@ -14,6 +14,7 @@ import {
   type CreateClaimInput,
   createRunMutationRepository,
   type ExecutionFactsPatch,
+  type NewFindingRecord,
   type NewStepRecord,
   type RunRecord,
   readRun,
@@ -114,6 +115,8 @@ export interface ExecutionSettlementCommand {
   at?: string;
   facts?: ExecutionFactsPatch;
   step?: NewStepRecord;
+  /** Findings belong to the review step and are appended in this transaction. */
+  findings?: readonly NewFindingRecord[];
 }
 
 export interface ExecutionSettlement {
@@ -190,6 +193,7 @@ const FAILED_EFFECT_TRIGGERS = {
 const WORKFLOW_TRIGGER_SET = new Set<string>(WORKFLOW_TRIGGERS);
 const maximumEvidenceBytes = 4 * 1024;
 const maximumJsonBytes = 1024 * 1024;
+const maximumSettlementFindings = 32;
 // A fixed event kind plus structured effect-key details is durable quarantine
 // state; adapter evidence remains free-form and is never used as a marker.
 const quarantinedEffectEventKind = "effect_quarantined";
@@ -607,6 +611,25 @@ export class WorkflowCoordinator {
           )
             throw new StaleRevisionError(command.expectedRevision);
           await repository.appendStep(command.step);
+        }
+        if (command.findings !== undefined) {
+          if (
+            !Array.isArray(command.findings) ||
+            command.findings.length > maximumSettlementFindings
+          )
+            throw new RangeError(
+              `A settlement may append at most ${maximumSettlementFindings} findings.`,
+            );
+          if (command.findings.length > 0 && command.step === undefined)
+            throw new TypeError("Findings require an appended review step.");
+          for (const finding of command.findings) {
+            if (
+              finding.runId !== command.runId ||
+              finding.expectedRevision !== command.expectedRevision
+            )
+              throw new StaleRevisionError(command.expectedRevision);
+            await repository.appendFinding(finding);
+          }
         }
         if (command.facts !== undefined)
           await repository.updateExecutionFacts({

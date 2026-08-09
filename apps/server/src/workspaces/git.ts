@@ -3,6 +3,7 @@ import { lstat, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+const DEFAULT_RAW_DIFF_MAX_BYTES = 256 * 1024;
 const GIT_TIMEOUT_MS = 30_000;
 const shaPattern = /^[0-9a-f]{40}$/u;
 const refPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u;
@@ -38,6 +39,11 @@ export interface InspectRunWorktreeInput {
   readonly issueNumber: number;
   readonly expected: RunWorktreeReceipt;
   readonly git?: GitRunner;
+}
+
+export interface ReadRunWorktreeDiffInput extends InspectRunWorktreeInput {
+  /** Maximum UTF-8 bytes returned to a reviewer prompt. */
+  readonly maxBytes?: number;
 }
 
 export interface RunWorktreeInspection extends RunWorktreeReceipt {
@@ -645,4 +651,53 @@ export async function inspectRunWorktree(
     headSha: actualHeadSha,
     changedFiles,
   };
+}
+
+/**
+ * Revalidate the assigned worktree before reading its canonical tracked diff.
+ *
+ * The receipt is intentionally inspected again rather than trusting a caller's
+ * path or SHA. The raw patch is read from the recorded origin/main base to the
+ * current worktree HEAD, and is rejected if it exceeds the prompt boundary.
+ */
+export async function readRunWorktreeDiff(
+  input: ReadRunWorktreeDiffInput,
+): Promise<string> {
+  const maximumBytes = input.maxBytes ?? DEFAULT_RAW_DIFF_MAX_BYTES;
+  if (
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 1 ||
+    maximumBytes > DEFAULT_RAW_DIFF_MAX_BYTES
+  ) {
+    throw new WorktreeBoundaryError(
+      `raw diff byte limit must be an integer between 1 and ${DEFAULT_RAW_DIFF_MAX_BYTES}`,
+    );
+  }
+
+  const inspected = await inspectRunWorktree(input);
+  const git = input.git ?? realGit;
+  const rawDiff = await runGit(
+    git,
+    inspected.path,
+    [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "--binary",
+      "--full-index",
+      "--no-renames",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      inspected.baseSha,
+      "--",
+    ],
+    "read worktree raw diff",
+  );
+  if (Buffer.byteLength(rawDiff, "utf8") > maximumBytes) {
+    throw new WorktreeBoundaryError(
+      "raw diff exceeds its bounded readback limit",
+    );
+  }
+  return rawDiff;
 }
