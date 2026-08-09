@@ -240,6 +240,9 @@ describe("approved publication workflow", () => {
       createPullRequest: (
         request: Parameters<typeof fake.createPullRequest>[0],
       ) => fake.createPullRequest(request),
+      reconcilePullRequest: (
+        request: Parameters<typeof fake.reconcilePullRequest>[0],
+      ) => fake.reconcilePullRequest(request),
       readPullRequest: async (
         request: Parameters<typeof fake.readPullRequest>[0],
       ) => ({
@@ -338,6 +341,41 @@ describe("approved publication workflow", () => {
     expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
     expect(commits).toBe(0);
     expect(gateway.publicationMutations()).toHaveLength(0);
+    await coordinator.close();
+  });
+
+  test("durably hands off when publication scheduling fails", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterPublishing(connection, coordinator);
+    const failingCoordinator = {
+      createEffectIntent: () => Promise.reject(new Error("SQLite unavailable")),
+      beginEffect: coordinator.beginEffect.bind(coordinator),
+      releaseEffectForRetry:
+        coordinator.releaseEffectForRetry.bind(coordinator),
+      settleExecution: coordinator.settleExecution.bind(coordinator),
+      quarantineEffect: coordinator.quarantineEffect.bind(coordinator),
+      transition: coordinator.transition.bind(coordinator),
+    };
+
+    const result = await publishApprovedRun({
+      coordinator: failingCoordinator,
+      run,
+      gateway,
+      title: "feat: publish issue 42",
+      body: "Closes #42",
+      commitAndPush: async () => {
+        throw new Error("edge must not run");
+      },
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    expect(result).toMatchObject({ reason: /SQLite unavailable/ });
     await coordinator.close();
   });
 
@@ -477,6 +515,9 @@ describe("approved publication workflow", () => {
       createPullRequest: (
         request: Parameters<typeof gateway.createPullRequest>[0],
       ) => gateway.createPullRequest(request),
+      reconcilePullRequest: (
+        request: Parameters<typeof gateway.reconcilePullRequest>[0],
+      ) => gateway.reconcilePullRequest(request),
       readPullRequest: (
         request: Parameters<typeof gateway.readPullRequest>[0],
       ) => gateway.readPullRequest(request),
@@ -542,6 +583,9 @@ describe("approved publication workflow", () => {
       createPullRequest: (
         request: Parameters<typeof gateway.createPullRequest>[0],
       ) => gateway.createPullRequest(request),
+      reconcilePullRequest: (
+        request: Parameters<typeof gateway.reconcilePullRequest>[0],
+      ) => gateway.reconcilePullRequest(request),
       readPullRequest: (
         request: Parameters<typeof gateway.readPullRequest>[0],
       ) => gateway.readPullRequest(request),
@@ -615,6 +659,9 @@ describe("approved publication workflow", () => {
       createPullRequest: (
         request: Parameters<typeof fake.createPullRequest>[0],
       ) => fake.createPullRequest(request),
+      reconcilePullRequest: (
+        request: Parameters<typeof fake.reconcilePullRequest>[0],
+      ) => fake.reconcilePullRequest(request),
       readPullRequest: (request: Parameters<typeof fake.readPullRequest>[0]) =>
         fake.readPullRequest(request),
       observeRequiredChecks: async (
@@ -632,6 +679,76 @@ describe("approved publication workflow", () => {
     });
 
     expect(observed).toMatchObject({ kind: "human", run: { state: "review" } });
+    await coordinator.close();
+  });
+
+  test("durably hands off a conflicting ephemeral PR node ID", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const published = await publish(connection, coordinator, gateway);
+    if (published.kind !== "published") throw new Error("publish failed");
+
+    const observed = await observePublishedCi({
+      coordinator,
+      run: published.run,
+      gateway,
+      pullRequestNodeId: "PR_node_other",
+      now: () => at,
+    });
+
+    expect(observed).toMatchObject({
+      kind: "human",
+      run: { state: "review" },
+      reason: /conflicts with the durable PR identity/,
+    });
+    await coordinator.close();
+  });
+
+  test("durably hands off when CI observation scheduling fails", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const published = await publish(connection, coordinator, gateway);
+    if (published.kind !== "published") throw new Error("publish failed");
+    let checkReads = 0;
+    const failingCoordinator = {
+      createEffectIntent: () => Promise.reject(new Error("SQLite unavailable")),
+      beginEffect: coordinator.beginEffect.bind(coordinator),
+      releaseEffectForRetry:
+        coordinator.releaseEffectForRetry.bind(coordinator),
+      settleExecution: coordinator.settleExecution.bind(coordinator),
+      quarantineEffect: coordinator.quarantineEffect.bind(coordinator),
+      transition: coordinator.transition.bind(coordinator),
+    };
+    const observingGateway = {
+      createPullRequest: gateway.createPullRequest.bind(gateway),
+      reconcilePullRequest: gateway.reconcilePullRequest.bind(gateway),
+      readPullRequest: gateway.readPullRequest.bind(gateway),
+      observeRequiredChecks: async (
+        request: Parameters<typeof gateway.observeRequiredChecks>[0],
+      ) => {
+        checkReads += 1;
+        return gateway.observeRequiredChecks(request);
+      },
+    };
+
+    const result = await observePublishedCi({
+      coordinator: failingCoordinator,
+      run: published.run,
+      gateway: observingGateway,
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    expect(result).toMatchObject({ reason: /SQLite unavailable/ });
+    expect(checkReads).toBe(0);
     await coordinator.close();
   });
 
@@ -684,6 +801,108 @@ describe("approved publication workflow", () => {
     await coordinator.close();
   });
 
+  test("reuses the linked PR across a repair round and observes the new head", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const first = await publish(connection, coordinator, gateway);
+    if (first.kind !== "published") throw new Error("initial publish failed");
+    gateway.setRequiredCheck(1, committedHeadSha, "test", "failure");
+    const failed = await observePublishedCi({
+      coordinator,
+      run: first.run,
+      gateway,
+      now: () => at,
+    });
+    if (failed.kind !== "ci_failed_repairable")
+      throw new Error("repair was not scheduled");
+
+    const repairedHead = "e".repeat(40);
+    gateway.advancePullRequestHead(1, repairedHead);
+    let repairing = failed.run;
+    repairing = await coordinator.transition({
+      runId: repairing.id,
+      expectedRevision: repairing.revision,
+      trigger: "repair_succeeded",
+      at,
+      summary: { text: "The bounded repair produced a new head." },
+    });
+    repairing = await coordinator.transition({
+      runId: repairing.id,
+      expectedRevision: repairing.revision,
+      trigger: "verification_passed",
+      at,
+      summary: { text: "The repaired head passed verification." },
+    });
+    repairing = await coordinator.transition({
+      runId: repairing.id,
+      expectedRevision: repairing.revision,
+      trigger: "review_approved",
+      at,
+      summary: { text: "The repaired head was approved for publication." },
+    });
+
+    const second = await publishApprovedRun({
+      coordinator,
+      run: repairing,
+      gateway,
+      title: "feat: publish issue 42",
+      body: "Closes #42",
+      commitAndPush: async (currentRun) => ({
+        branch: currentRun.branch,
+        baseSha,
+        headSha: repairedHead,
+      }),
+      now: () => at,
+    });
+    expect(second).toMatchObject({
+      kind: "published",
+      pullRequest: { number: 1, nodeId: "PR_node_1", headSha: repairedHead },
+    });
+    if (second.kind !== "published") throw new Error("repair publish failed");
+    gateway.setRequiredCheck(1, repairedHead, "test", "success");
+    const green = await observePublishedCi({
+      coordinator,
+      run: second.run,
+      gateway,
+      now: () => at,
+    });
+
+    expect(green).toMatchObject({
+      kind: "ci_passed",
+      run: { state: "review" },
+    });
+    expect(gateway.publicationMutations()).toHaveLength(1);
+    expect(
+      connection.native
+        .prepare(
+          "SELECT key, status FROM side_effects WHERE run_id = ? ORDER BY key",
+        )
+        .all(first.run.id),
+    ).toEqual([
+      {
+        key: `run:${first.run.id}:rework:${first.run.reworkEpoch}:round:0:observe-ci`,
+        status: "failed",
+      },
+      {
+        key: `run:${first.run.id}:rework:${first.run.reworkEpoch}:round:0:publish`,
+        status: "confirmed",
+      },
+      {
+        key: `run:${first.run.id}:rework:${first.run.reworkEpoch}:round:1:observe-ci`,
+        status: "confirmed",
+      },
+      {
+        key: `run:${first.run.id}:rework:${first.run.reworkEpoch}:round:1:publish`,
+        status: "confirmed",
+      },
+    ]);
+    await coordinator.close();
+  });
+
   test("hands another failed check set to Review after two repair rounds", async () => {
     const connection = await createDatabase();
     const gateway = new FakeGitHubPublicationGateway({
@@ -724,6 +943,7 @@ describe("approved publication workflow", () => {
     if (published.kind !== "published") throw new Error("publish failed");
     const gateway = {
       ...fake,
+      reconcilePullRequest: fake.reconcilePullRequest.bind(fake),
       observeRequiredChecks: async () => ({ aggregate: "green" }),
     } as unknown as FakeGitHubPublicationGateway;
 

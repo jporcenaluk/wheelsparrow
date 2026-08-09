@@ -59,6 +59,12 @@ export interface PublishPullRequestRequest {
   readonly headSha: string;
 }
 
+/** Reconcile a previously recorded PR after its branch receives a repaired head. */
+export interface ReconcilePullRequestRequest extends PublishPullRequestRequest {
+  readonly expectedNumber: number;
+  readonly expectedNodeId: string;
+}
+
 export interface PullRequestReceipt {
   readonly repository: string;
   readonly number: number;
@@ -117,6 +123,9 @@ export interface RequiredChecksReceipt {
 export interface GitHubPublicationGateway {
   createPullRequest(
     request: PublishPullRequestRequest,
+  ): Promise<PullRequestReceipt>;
+  reconcilePullRequest(
+    request: ReconcilePullRequestRequest,
   ): Promise<PullRequestReceipt>;
   readPullRequest(request: ReadPullRequestRequest): Promise<PullRequestReceipt>;
   observeRequiredChecks(
@@ -297,6 +306,41 @@ export function assertPublishPullRequestRequest(
     baseSha: input.baseSha,
     headBranch: input.headBranch,
     headSha: input.headSha,
+  };
+}
+
+export function assertReconcilePullRequestRequest(
+  value: unknown,
+): ReconcilePullRequestRequest {
+  const input = requirePlainInput(value, "Reconcile pull request request");
+  if (
+    !hasOnlyKeys(input, [
+      "repository",
+      "issueNumber",
+      "effectKey",
+      "title",
+      "body",
+      "baseBranch",
+      "baseSha",
+      "headBranch",
+      "headSha",
+      "expectedNumber",
+      "expectedNodeId",
+    ]) ||
+    !positiveInteger(input.expectedNumber) ||
+    !nodeId(input.expectedNodeId)
+  ) {
+    invalid(
+      "Reconcile pull request request is malformed or exceeds its bounds",
+    );
+  }
+  const request = { ...input };
+  delete request.expectedNumber;
+  delete request.expectedNodeId;
+  return {
+    ...assertPublishPullRequestRequest(request),
+    expectedNumber: input.expectedNumber,
+    expectedNodeId: input.expectedNodeId,
   };
 }
 

@@ -295,6 +295,32 @@ async function handoffScheduledEffect(
   }
 }
 
+async function handoffRun(
+  coordinator: PublicationCoordinator,
+  run: RunRecord,
+  reason: string,
+  now: () => string,
+): Promise<
+  | { readonly kind: "human"; readonly run: RunRecord; readonly reason: string }
+  | { readonly kind: "stale"; readonly run: RunRecord }
+> {
+  const boundedReason = bounded(reason);
+  try {
+    const handedOff = await coordinator.transition({
+      runId: run.id,
+      expectedRevision: run.revision,
+      trigger: "handoff_required",
+      at: now(),
+      summary: { text: boundedReason },
+      requiredAction: boundedReason,
+    });
+    return { kind: "human", run: handedOff, reason: boundedReason };
+  } catch (error) {
+    if (isStale(error)) return { kind: "stale", run };
+    return { kind: "human", run, reason: boundedReason };
+  }
+}
+
 async function schedule(
   coordinator: PublicationCoordinator,
   run: RunRecord,
@@ -458,11 +484,12 @@ export async function publishApprovedRun(
     );
   } catch (error) {
     if (isStale(error)) return { kind: "stale", run: input.run };
-    return {
-      kind: "human",
-      run: input.run,
-      reason: bounded(errorMessage(error)),
-    };
+    return (await handoffRun(
+      input.coordinator,
+      input.run,
+      `Publication scheduling failed closed: ${errorMessage(error)}`,
+      now,
+    )) as PublicationOutcome;
   }
   if (!scheduled.started) {
     if (
@@ -508,6 +535,14 @@ export async function publishApprovedRun(
       throw new Error(
         "Publication title and body must be bounded non-empty text.",
       );
+    if (
+      input.run.repairRound > 0 &&
+      (input.run.pullRequestNumber === null ||
+        input.run.pullRequestNodeId === null)
+    )
+      throw new Error(
+        "A repaired publication requires the durable linked pull request identity.",
+      );
     commit = assertCommitReceipt(
       await input.commitAndPush(input.run),
       input.run,
@@ -523,7 +558,14 @@ export async function publishApprovedRun(
       headBranch: commit.branch,
       headSha: commit.headSha,
     } as const;
-    const created = await input.gateway.createPullRequest(request);
+    const created =
+      input.run.repairRound > 0
+        ? await input.gateway.reconcilePullRequest({
+            ...request,
+            expectedNumber: input.run.pullRequestNumber as number,
+            expectedNodeId: input.run.pullRequestNodeId as string,
+          })
+        : await input.gateway.createPullRequest(request);
     createdPullRequest = assertLinkedPullRequest(
       created,
       input.run,
@@ -721,12 +763,12 @@ export async function observePublishedCi(
     suppliedPullRequestNodeId !== undefined &&
     suppliedPullRequestNodeId !== input.run.pullRequestNodeId
   )
-    return {
-      kind: "human",
-      run: input.run,
-      reason:
-        "The supplied pull request node ID conflicts with the durable PR identity.",
-    };
+    return (await handoffRun(
+      input.coordinator,
+      input.run,
+      "The supplied pull request node ID conflicts with the durable PR identity.",
+      now,
+    )) as CiObservationOutcome;
   const pullRequestNodeId =
     input.run.pullRequestNodeId ?? suppliedPullRequestNodeId;
   let scheduled: ScheduledEffect;
@@ -754,11 +796,12 @@ export async function observePublishedCi(
     );
   } catch (error) {
     if (isStale(error)) return { kind: "stale", run: input.run };
-    return {
-      kind: "human",
-      run: input.run,
-      reason: bounded(errorMessage(error)),
-    };
+    return (await handoffRun(
+      input.coordinator,
+      input.run,
+      `CI observation scheduling failed closed: ${errorMessage(error)}`,
+      now,
+    )) as CiObservationOutcome;
   }
   if (
     scheduled.effect.status === "confirmed" ||

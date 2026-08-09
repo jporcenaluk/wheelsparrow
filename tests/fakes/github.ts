@@ -14,6 +14,7 @@ import {
   assertObserveRequiredChecksRequest,
   assertPublishPullRequestRequest,
   assertReadPullRequestRequest,
+  assertReconcilePullRequestRequest,
   assertRequiredCheckState,
   assertRequiredChecksReceipt,
   GitHubPublicationBoundaryError,
@@ -21,6 +22,7 @@ import {
   type ObserveRequiredChecksRequest,
   type PublishPullRequestRequest,
   type PullRequestReceipt,
+  type ReconcilePullRequestRequest,
   type RequiredCheckState,
   type RequiredChecksReceipt,
 } from "../../apps/server/src/github/publication.js";
@@ -634,6 +636,37 @@ export class FakeGitHubPublicationGateway implements GitHubPublicationGateway {
     this.#mutations.push(mutation);
     this.#mutationsByEffectKey.set(request.effectKey, mutation);
     return clonePullRequest(created);
+  }
+
+  async reconcilePullRequest(
+    value: ReconcilePullRequestRequest,
+  ): Promise<PullRequestReceipt> {
+    const request = assertReconcilePullRequestRequest(value);
+    this.#assertRepository(request.repository);
+    const pullRequest = this.#pullRequests.get(request.expectedNumber);
+    if (pullRequest === undefined) {
+      publicationFailure(
+        "pull_request_not_found",
+        "The recorded pull request was not found for reconciliation",
+      );
+    }
+    if (
+      pullRequest.nodeId !== request.expectedNodeId ||
+      pullRequest.repository !== request.repository ||
+      pullRequest.issueNumber !== request.issueNumber ||
+      pullRequest.title !== request.title ||
+      pullRequest.baseBranch !== request.baseBranch ||
+      pullRequest.baseSha !== request.baseSha ||
+      pullRequest.headBranch !== request.headBranch ||
+      pullRequest.headSha !== request.headSha ||
+      pullRequest.isDraft
+    ) {
+      publicationFailure(
+        "pull_request_mismatch",
+        "The recorded pull request does not match the repaired publication",
+      );
+    }
+    return clonePullRequest(pullRequest);
   }
 
   async readPullRequest(value: unknown): Promise<PullRequestReceipt> {

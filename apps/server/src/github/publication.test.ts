@@ -89,6 +89,29 @@ describe("GitHub publication gateway seam", () => {
     });
   });
 
+  test("reconciles an existing linked PR after a repaired head advances", async () => {
+    const fake = gateway();
+    const first = await fake.createPullRequest(publishRequest());
+    const repairedHead = "c".repeat(40);
+    fake.advancePullRequestHead(first.number, repairedHead);
+
+    const reconciled = await fake.reconcilePullRequest({
+      ...publishRequest({
+        effectKey: "run:run-1:pr:repair-round-1",
+        headSha: repairedHead,
+      }),
+      expectedNumber: first.number,
+      expectedNodeId: first.nodeId,
+    });
+
+    expect(reconciled).toMatchObject({
+      number: first.number,
+      nodeId: first.nodeId,
+      headSha: repairedHead,
+    });
+    expect(fake.publicationMutations()).toHaveLength(1);
+  });
+
   test("rejects an effect-key replay after the provider changes the PR head", async () => {
     const fake = gateway();
     const request = publishRequest();
