@@ -20,6 +20,7 @@ import {
   StaleRevisionError,
   type TransitionRequest,
 } from "../database/runs.js";
+import type { SideEffectsTable } from "../database/schema.js";
 import {
   assertEffectObservationTrigger,
   type EffectKind,
@@ -83,9 +84,20 @@ export interface CancelEffectCommand {
   at?: string;
 }
 
+export interface RejectClaimCommand {
+  runId: string;
+  effectKey: string;
+  expectedRevision: number;
+  reason: string;
+  at?: string;
+}
+
 export interface ObserveEffectCommand extends EffectObservation {
   at?: string;
 }
+
+/** Quarantine an in-flight effect and advance its run revision atomically. */
+export interface QuarantineEffectCommand extends ObserveEffectCommand {}
 
 export interface ObserveAmbiguousEffectCommand {
   effectKey: string;
@@ -162,6 +174,33 @@ function boundedEvidence(value: string): string {
   while (Buffer.byteLength(result, "utf8") > maximumEvidenceBytes)
     result = result.slice(0, -1);
   return result;
+}
+
+function mapSideEffect(row: SideEffectsTable): EffectRecord {
+  return {
+    key: row.key,
+    runId: row.run_id,
+    reworkEpoch: row.rework_epoch,
+    kind: row.kind as EffectKind,
+    targetRevision: row.target_revision,
+    fingerprint: row.fingerprint,
+    intent: row.intent_json,
+    status: row.status as EffectStatus,
+    executorAttempt: row.executor_attempt,
+    executorOwnerToken: row.executor_owner_token,
+    receipt: row.receipt_json,
+    processId: row.process_id,
+    requestId: row.request_id,
+    prNumber: row.pr_number,
+    prNodeId: row.pr_node_id,
+    workflowRunId: row.workflow_run_id,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    failure: row.failure,
+    reconciliationEvidence: row.reconciliation_evidence,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 function errorValue(value: unknown): Error {
@@ -628,6 +667,59 @@ export class WorkflowCoordinator {
     });
   }
 
+  /**
+   * Quarantine an in-flight effect through the coordinator when a caller
+   * cannot use the ordinary observation command. The run revision advance and
+   * quarantine marker are one durable transaction, so late callbacks are
+   * stale even if they were already queued by an adapter.
+   */
+  quarantineEffect(command: QuarantineEffectCommand): Promise<EffectRecord> {
+    const result = this.enqueuePriority(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db.transaction().execute(async (tx) => {
+        const effect = await createEffectMutationRepository(
+          tx,
+        ).recordEffectObservation(command, at);
+        const run = await readRun(tx, effect.runId);
+        const nextRevision = run.revision + 1;
+        const updated = await tx
+          .updateTable("runs")
+          .set({ revision: nextRevision, updated_at: at })
+          .where("id", "=", run.id)
+          .where("revision", "=", run.revision)
+          .executeTakeFirst();
+        if (Number(updated.numUpdatedRows) !== 1)
+          throw new StaleRevisionError(run.revision);
+        const previous = await tx
+          .selectFrom("events")
+          .select("sequence")
+          .where("run_id", "=", run.id)
+          .orderBy("sequence", "desc")
+          .limit(1)
+          .executeTakeFirst();
+        await tx
+          .insertInto("events")
+          .values({
+            id: randomUUID(),
+            run_id: run.id,
+            sequence: (previous?.sequence ?? 0) + 1,
+            run_revision: nextRevision,
+            kind: quarantinedEffectEventKind,
+            summary: command.evidence,
+            details_json: JSON.stringify({ effectKey: command.effectKey }),
+            log_reference: null,
+            created_at: at,
+          })
+          .execute();
+        return effect;
+      });
+    });
+    return result.then((effect) => {
+      this.notifyEffectSettlement(effect);
+      return effect;
+    });
+  }
+
   cancelEffect(command: CancelEffectCommand): Promise<EffectRecord> {
     const result = this.enqueue(async () => {
       const at = asTimestamp(this.now, command.at);
@@ -652,6 +744,89 @@ export class WorkflowCoordinator {
     return result.then((effect) => {
       this.notifyEffectSettlement(effect);
       return effect;
+    });
+  }
+
+  /**
+   * Reject a just-created claim and its project mutation as one serialized
+   * transaction. A late adapter callback observes the advanced run revision
+   * and is therefore stale rather than reviving the terminal claim.
+   */
+  rejectClaim(command: RejectClaimCommand): Promise<RunRecord> {
+    const result = this.enqueuePriority(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db.transaction().execute(async (tx) => {
+        const run = await readRun(tx, command.runId);
+        if (run.revision !== command.expectedRevision)
+          throw new StaleRevisionError(command.expectedRevision);
+        if (run.state !== "claiming")
+          throw new StaleRevisionError(command.expectedRevision);
+
+        const row = await tx
+          .selectFrom("side_effects")
+          .selectAll()
+          .where("key", "=", command.effectKey)
+          .executeTakeFirst();
+        if (
+          row === undefined ||
+          row.run_id !== run.id ||
+          row.kind !== "project_todo" ||
+          row.target_revision !== run.revision ||
+          (row.status !== "pending" && row.status !== "in_flight")
+        )
+          throw new StaleEffectError(
+            command.effectKey,
+            command.expectedRevision,
+          );
+
+        let effect: EffectRecord;
+        if (row.status === "pending") {
+          effect = await createEffectMutationRepository(tx).cancelPendingEffect(
+            command.effectKey,
+            command.reason,
+            at,
+          );
+        } else {
+          const updated = await tx
+            .updateTable("side_effects")
+            .set({
+              status: "cancelled",
+              failure: command.reason,
+              completed_at: at,
+              updated_at: at,
+            })
+            .where("key", "=", command.effectKey)
+            .where("run_id", "=", run.id)
+            .where("target_revision", "=", run.revision)
+            .where("status", "=", "in_flight")
+            .executeTakeFirst();
+          if (Number(updated.numUpdatedRows) !== 1)
+            throw new StaleEffectError(
+              command.effectKey,
+              command.expectedRevision,
+            );
+          effect = mapSideEffect({
+            ...row,
+            status: "cancelled",
+            failure: command.reason,
+            completed_at: at,
+            updated_at: at,
+          });
+        }
+
+        const rejected = await createRunMutationRepository(tx).transitionRun({
+          runId: run.id,
+          expectedRevision: run.revision,
+          trigger: "claim_rejected",
+          at,
+          summary: { text: command.reason },
+        });
+        return { effect, run: rejected };
+      });
+    });
+    return result.then(({ effect, run }) => {
+      this.notifyEffectSettlement(effect);
+      return run;
     });
   }
 
@@ -1180,6 +1355,8 @@ export type CoordinatorCommand =
   | ReturnType<WorkflowCoordinator["beginEffect"]>
   | ReturnType<WorkflowCoordinator["observeEffect"]>
   | ReturnType<WorkflowCoordinator["cancelEffect"]>
+  | ReturnType<WorkflowCoordinator["rejectClaim"]>
+  | ReturnType<WorkflowCoordinator["quarantineEffect"]>
   | ReturnType<WorkflowCoordinator["updateSchedulerControl"]>;
 
 export type CoordinatorEffectOutcome = EffectStatus;

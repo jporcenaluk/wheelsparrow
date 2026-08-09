@@ -424,6 +424,226 @@ describe("workflow coordinator", () => {
     await coordinator.close();
   });
 
+  test("durably quarantines an in-flight effect through its serialized transaction", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const key = "run:run-1:typed-quarantine";
+    await coordinator.createClaim(claimInput());
+    await coordinator.createEffectIntent({
+      runId: "run-1",
+      dispatch: false,
+      key,
+      kind: "project_todo",
+      intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+    });
+    await coordinator.beginEffect({ effectKey: key });
+
+    const quarantined = await coordinator.quarantineEffect({
+      runId: "run-1",
+      expectedRevision: 1,
+      effectKey: key,
+      outcome: "ambiguous",
+      trigger: null,
+      evidence: "Typed quarantine invalidates a late callback.",
+    });
+
+    expect(quarantined).toMatchObject({ status: "ambiguous" });
+    expect(await readRun(connection.db, "run-1")).toMatchObject({
+      state: "claiming",
+      revision: 2,
+    });
+    expect(
+      connection.native
+        .prepare(
+          "SELECT kind, run_revision, details_json FROM events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+        )
+        .get("run-1"),
+    ).toMatchObject({
+      kind: "effect_quarantined",
+      run_revision: 2,
+      details_json: JSON.stringify({ effectKey: key }),
+    });
+    await expect(
+      coordinator.observeEffect({
+        runId: "run-1",
+        expectedRevision: 1,
+        effectKey: key,
+        outcome: "confirmed",
+        trigger: "todo_observed",
+        evidence: "Late callback must remain stale.",
+      }),
+    ).rejects.toThrow();
+    await coordinator.close();
+  });
+
+  test("atomically cancels a claim effect, releases ownership, and records claim rejection", async () => {
+    const connection = await createDatabase();
+    const dispatch = vi.fn();
+    const coordinator = new WorkflowCoordinator({
+      connection,
+      dispatcher: dispatch,
+    });
+    const key = "run:run-1:claim-rejection";
+    await coordinator.createClaim(claimInput(), {
+      effect: {
+        dispatch: false,
+        key,
+        kind: "project_todo",
+        intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+      },
+    });
+
+    const rejected = await coordinator.rejectClaim({
+      runId: "run-1",
+      expectedRevision: 1,
+      effectKey: key,
+      reason: "Project Todo effect could not begin.",
+      at: "2026-08-08T19:01:00.000Z",
+    });
+
+    expect(rejected).toMatchObject({
+      state: "claim_failed",
+      revision: 2,
+      ownerToken: null,
+      ownershipReleasedAt: "2026-08-08T19:01:00.000Z",
+    });
+    expect(
+      connection.native
+        .prepare("SELECT status, failure FROM side_effects WHERE key = ?")
+        .get(key),
+    ).toEqual({
+      status: "cancelled",
+      failure: "Project Todo effect could not begin.",
+    });
+    const events = await listEvents(connection.db, "run-1");
+    expect(events.at(-1)).toMatchObject({
+      kind: "claim_rejected",
+      runRevision: 2,
+      summary: "Project Todo effect could not begin.",
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+
+    await expect(
+      coordinator.createClaim({
+        ...claimInput("run-2"),
+        projectItemId: "project-run-1",
+      }),
+    ).resolves.toMatchObject({
+      id: "run-2",
+      state: "claiming",
+      ownerToken: "owner-run-2",
+    });
+    await coordinator.close();
+  });
+
+  test("rejects stale or settled claim effects without changing durable state", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const key = "run:run-1:stale-claim-rejection";
+    await coordinator.createClaim(claimInput(), {
+      effect: {
+        dispatch: false,
+        key,
+        kind: "project_todo",
+        intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+      },
+    });
+
+    await expect(
+      coordinator.rejectClaim({
+        runId: "run-1",
+        expectedRevision: 0,
+        effectKey: key,
+        reason: "Stale claim rejection.",
+      }),
+    ).rejects.toBeInstanceOf(StaleRevisionError);
+    expect(await readRun(connection.db, "run-1")).toMatchObject({
+      state: "claiming",
+      revision: 1,
+    });
+    expect(
+      connection.native
+        .prepare("SELECT status FROM side_effects WHERE key = ?")
+        .get(key),
+    ).toEqual({ status: "pending" });
+
+    await coordinator.cancelEffect({
+      effectKey: key,
+      expectedRevision: 1,
+      reason: "Settled before claim rejection.",
+    });
+    await expect(
+      coordinator.rejectClaim({
+        runId: "run-1",
+        expectedRevision: 1,
+        effectKey: key,
+        reason: "Late claim rejection.",
+      }),
+    ).rejects.toBeInstanceOf(StaleEffectError);
+    expect(await readRun(connection.db, "run-1")).toMatchObject({
+      state: "claiming",
+      revision: 1,
+    });
+    expect(
+      connection.native
+        .prepare("SELECT status, failure FROM side_effects WHERE key = ?")
+        .get(key),
+    ).toEqual({
+      status: "cancelled",
+      failure: "Settled before claim rejection.",
+    });
+    await coordinator.close();
+  });
+
+  test("cancels an in-flight claim effect before a late callback can revive the run", async () => {
+    const connection = await createDatabase();
+    let complete: ((result: unknown) => void) | undefined;
+    const dispatch = vi.fn((_, callback) => {
+      complete = callback;
+    });
+    const coordinator = new WorkflowCoordinator({
+      connection,
+      dispatcher: dispatch,
+    });
+    const key = "run:run-1:in-flight-claim-rejection";
+    await coordinator.createClaim(claimInput(), {
+      effect: {
+        dispatch: false,
+        key,
+        kind: "project_todo",
+        intent: { projectItemId: "project-run-1", from: "Ready", to: "Todo" },
+      },
+    });
+    await coordinator.beginEffect({ effectKey: key });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+
+    await expect(
+      coordinator.rejectClaim({
+        runId: "run-1",
+        expectedRevision: 1,
+        effectKey: key,
+        reason: "Project Todo dispatch was canceled.",
+      }),
+    ).resolves.toMatchObject({ state: "claim_failed", revision: 2 });
+    expect(
+      connection.native
+        .prepare("SELECT status FROM side_effects WHERE key = ?")
+        .get(key),
+    ).toEqual({ status: "cancelled" });
+
+    complete?.({
+      outcome: "confirmed",
+      trigger: "todo_observed",
+      evidence: "Late callback must be stale.",
+    });
+    await coordinator.waitForIdle();
+    expect(await readRun(connection.db, "run-1")).toMatchObject({
+      state: "claim_failed",
+      revision: 2,
+    });
+    await coordinator.close();
+  });
+
   test("does not drop a callback when a stale quarantine request fails", async () => {
     const connection = await createDatabase();
     let complete: ((result: unknown) => void) | undefined;
