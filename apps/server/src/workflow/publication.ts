@@ -91,7 +91,7 @@ export type CiObservationOutcome =
   | {
       readonly kind: "ci_pending";
       readonly run: RunRecord;
-      readonly checks: RequiredChecksReceipt;
+      readonly checks?: RequiredChecksReceipt;
       readonly effectKey: string;
     }
   | {
@@ -575,13 +575,23 @@ export async function publishApprovedRun(
     });
   } catch (error) {
     if (isStale(error)) return { kind: "stale", run: input.run };
-    return {
-      kind: "human",
-      run: settled.run,
-      reason: bounded(
-        `CI observation could not be scheduled: ${errorMessage(error)}`,
-      ),
-    };
+    const reason = bounded(
+      `CI observation could not be scheduled: ${errorMessage(error)}`,
+    );
+    try {
+      const handedOff = await input.coordinator.transition({
+        runId: settled.run.id,
+        expectedRevision: settled.run.revision,
+        trigger: "handoff_required",
+        at: now(),
+        summary: { text: reason },
+        requiredAction: reason,
+      });
+      return { kind: "human", run: handedOff, reason };
+    } catch (handoffError) {
+      if (isStale(handoffError)) return { kind: "stale", run: settled.run };
+      return { kind: "human", run: settled.run, reason };
+    }
   }
   return {
     kind: "published",
@@ -636,6 +646,8 @@ export async function observePublishedCi(
     scheduled.effect.status === "failed"
   )
     return { kind: "stale", run: input.run };
+  if (!scheduled.started)
+    return { kind: "ci_pending", run: input.run, effectKey: key };
 
   let checks: RequiredChecksReceipt;
   try {

@@ -219,24 +219,40 @@ describe("approved publication workflow", () => {
     const coordinator = new WorkflowCoordinator({ connection });
     const published = await publish(connection, coordinator, gateway);
     if (published.kind !== "published") throw new Error("publish failed");
+    let checkReads = 0;
+    const observingGateway = {
+      createPullRequest: (
+        request: Parameters<typeof gateway.createPullRequest>[0],
+      ) => gateway.createPullRequest(request),
+      readPullRequest: (
+        request: Parameters<typeof gateway.readPullRequest>[0],
+      ) => gateway.readPullRequest(request),
+      observeRequiredChecks: async (
+        request: Parameters<typeof gateway.observeRequiredChecks>[0],
+      ) => {
+        checkReads += 1;
+        return gateway.observeRequiredChecks(request);
+      },
+    };
 
     const first = await observePublishedCi({
       coordinator,
       run: published.run,
-      gateway,
+      gateway: observingGateway,
       pullRequest: published.pullRequest,
       now: () => at,
     });
     const second = await observePublishedCi({
       coordinator,
       run: published.run,
-      gateway,
+      gateway: observingGateway,
       pullRequest: published.pullRequest,
       now: () => at,
     });
 
     expect(first.kind).toBe("ci_pending");
     expect(second.kind).toBe("ci_pending");
+    expect(checkReads).toBe(1);
     expect(first.run).toMatchObject({
       state: "waiting_for_ci",
       revision: published.run.revision,
@@ -379,6 +395,58 @@ describe("approved publication workflow", () => {
     });
 
     expect(observed).toMatchObject({ kind: "human", run: { state: "review" } });
+    await coordinator.close();
+  });
+
+  test("hands off when the next CI effect cannot be durably scheduled", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubPublicationGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+    });
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterPublishing(connection, coordinator);
+    const failingCoordinator = {
+      createEffectIntent: (
+        command: Parameters<typeof coordinator.createEffectIntent>[0],
+      ) =>
+        command.kind === "observe_ci"
+          ? Promise.reject(new Error("SQLite unavailable while scheduling CI"))
+          : coordinator.createEffectIntent(command),
+      beginEffect: coordinator.beginEffect.bind(coordinator),
+      settleExecution: coordinator.settleExecution.bind(coordinator),
+      quarantineEffect: coordinator.quarantineEffect.bind(coordinator),
+      transition: coordinator.transition.bind(coordinator),
+    };
+
+    const result = await publishApprovedRun({
+      coordinator: failingCoordinator,
+      run,
+      gateway,
+      title: "feat: publish issue 42",
+      body: "Closes #42",
+      commitAndPush: async (currentRun) => ({
+        branch: currentRun.branch,
+        baseSha,
+        headSha: committedHeadSha,
+      }),
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    expect(result).toMatchObject({ reason: /schedule.*CI/i });
+    expect(
+      connection.native
+        .prepare("SELECT status FROM side_effects WHERE key = ?")
+        .get(`run:${run.id}:rework:${run.reworkEpoch}:publish`),
+    ).toEqual({ status: "confirmed" });
+    expect(
+      connection.native
+        .prepare(
+          "SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ? AND kind = 'observe_ci'",
+        )
+        .get(run.id),
+    ).toEqual({ count: 0 });
     await coordinator.close();
   });
 });
