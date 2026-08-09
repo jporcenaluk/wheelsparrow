@@ -76,6 +76,7 @@ export interface EffectObservation {
   trigger?: WorkflowTrigger | null;
   receipt?: unknown;
   evidence: string;
+  requiredAction?: string;
 }
 
 export interface ReconciliationItem {
@@ -471,6 +472,9 @@ export function createEffectMutationRepository(
           trigger,
           at,
           summary,
+          ...(observation.requiredAction === undefined
+            ? {}
+            : { requiredAction: observation.requiredAction }),
         });
       }
       const receipt = canonicalReceipt(observation.receipt);

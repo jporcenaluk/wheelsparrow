@@ -112,7 +112,7 @@ function reviewFinding(
 async function reviewEffect(
   coordinator: WorkflowCoordinator,
   run: Awaited<ReturnType<typeof enterReviewing>>,
-  key = `run:${run.id}:agent:review:attempt:1`,
+  key = `run:${run.id}:rework:${run.reworkEpoch}:agent:review:attempt:1`,
 ) {
   await coordinator.createEffectIntent({
     runId: run.id,
@@ -132,7 +132,7 @@ async function repairEffect(
   coordinator: WorkflowCoordinator,
   run: Awaited<ReturnType<typeof enterReviewing>>,
 ) {
-  const key = `run:${run.id}:agent:repair:attempt:1`;
+  const key = `run:${run.id}:rework:${run.reworkEpoch}:agent:repair:attempt:1`;
   await coordinator.createEffectIntent({
     runId: run.id,
     expectedRevision: run.revision,

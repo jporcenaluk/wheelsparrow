@@ -366,7 +366,7 @@ describe("executeClaimedRun", () => {
           (
             connection.native
               .prepare("SELECT status FROM side_effects WHERE key = ?")
-              .get("run:run-1:verify:attempt:1") as { status: string }
+              .get("run:run-1:rework:0:verify:attempt:1") as { status: string }
           ).status,
         );
         expect(input.worktreePath).toBe(receipt().path);
@@ -512,9 +512,9 @@ describe("executeClaimedRun", () => {
     expect(
       connection.native
         .prepare("SELECT key, status FROM side_effects WHERE key = ?")
-        .get("run:run-1:verify:attempt:1"),
+        .get("run:run-1:rework:0:verify:attempt:1"),
     ).toEqual({
-      key: "run:run-1:verify:attempt:1",
+      key: "run:run-1:rework:0:verify:attempt:1",
       status: "failed",
     });
     expect(

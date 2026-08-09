@@ -17,8 +17,11 @@ const intakeEffectKey = (runId: string): string =>
   `run:${runId}:intake:capture`;
 const builderEffectKey = (runId: string): string =>
   `run:${runId}:agent:builder:attempt:1`;
-const verificationEffectKey = (runId: string, attempt = 1): string =>
-  `run:${runId}:verify:attempt:${attempt}`;
+const verificationEffectKey = (
+  runId: string,
+  reworkEpoch: number,
+  attempt = 1,
+): string => `run:${runId}:rework:${reworkEpoch}:verify:attempt:${attempt}`;
 const shaPattern = /^[0-9a-f]{40}$/u;
 const sha256Pattern = /^[0-9a-f]{64}$/u;
 const maximumTextBytes = 64 * 1024;
@@ -165,7 +168,7 @@ export interface VerificationReceipt {
 export interface ExecutionCoordinator
   extends Pick<
     WorkflowCoordinator,
-    "createEffectIntent" | "beginEffect" | "settleExecution"
+    "createEffectIntent" | "beginEffect" | "settleExecution" | "transition"
   > {}
 
 interface ExecuteClaimedRunInputBase {
@@ -248,6 +251,18 @@ export type ExecutionOutcome =
       readonly kind: "verification_failed";
       readonly run: RunRecord;
       readonly reason: string;
+      readonly verification: {
+        readonly kind: "failed";
+        readonly command: string;
+        readonly cwd: string;
+        readonly exitCode: number | null;
+        readonly signal: string | null;
+        readonly stdout: string;
+        readonly stderr: string;
+        readonly headSha: string;
+        readonly changedFiles: readonly string[];
+        readonly reason: string;
+      };
     }
   | {
       readonly kind: "stale";
@@ -367,7 +382,7 @@ function validateJsonIntake(value: IntakeCapture): string {
   return serialized;
 }
 
-function validateIntakeCapture(value: unknown): IntakeCapture {
+export function validateIntakeCapture(value: unknown): IntakeCapture {
   if (!isRecord(value))
     throw new IntakeCaptureError("Intake capture must be an object.");
   if (
@@ -905,7 +920,7 @@ function verificationIntent(
 ): EffectIntentCommand {
   const attempt = run.repairRound + 1;
   return {
-    key: verificationEffectKey(run.id, attempt),
+    key: verificationEffectKey(run.id, run.reworkEpoch, attempt),
     kind: "verify",
     intent: {
       runId: run.id,
@@ -1494,7 +1509,11 @@ function parseOwnedCapabilityIntent(
       !Number.isSafeInteger(parsed.attempt) ||
       parsed.attempt < 1 ||
       effect.key !==
-        verificationEffectKey(effect.runId, parsed.attempt as number))
+        verificationEffectKey(
+          effect.runId,
+          effect.reworkEpoch,
+          parsed.attempt as number,
+        ))
   )
     throw new BuilderReceiptError(
       "Verification effect key does not match attempt.",
@@ -1695,7 +1714,7 @@ async function settleVerificationFailure(
       evidence: boundedReason,
       receipt: failureReceipt,
       step: {
-        id: `run:${run.id}:verify:attempt:${attempt}:step`,
+        id: `run:${run.id}:rework:${run.reworkEpoch}:verify:attempt:${attempt}:step`,
         runId: run.id,
         expectedRevision: run.revision,
         reworkEpoch: run.reworkEpoch,
@@ -1711,7 +1730,7 @@ async function settleVerificationFailure(
         completedAt: now(),
         exitResultJson: JSON.stringify(failureReceipt),
         summary: { text: boundedReason },
-        rawLogReference: `logs/${run.id}/verifier/attempt-${attempt}.jsonl`,
+        rawLogReference: `logs/${run.id}/rework-${run.reworkEpoch}/verifier/attempt-${attempt}.jsonl`,
       },
       at: now(),
     });
@@ -1719,6 +1738,7 @@ async function settleVerificationFailure(
       kind: "verification_failed",
       run: settled.run,
       reason: boundedReason,
+      verification: failureReceipt,
     };
   } catch (error) {
     if (error instanceof StaleRevisionError) return { kind: "stale", run };
@@ -1839,7 +1859,7 @@ async function executeVerificationStage(
       receipt: verification,
       facts: { headSha: verification.headSha },
       step: {
-        id: `run:${run.id}:verify:attempt:${attempt}:step`,
+        id: `run:${run.id}:rework:${run.reworkEpoch}:verify:attempt:${attempt}:step`,
         runId: run.id,
         expectedRevision: run.revision,
         reworkEpoch: run.reworkEpoch,
@@ -1855,7 +1875,7 @@ async function executeVerificationStage(
         completedAt,
         exitResultJson: JSON.stringify(verification),
         summary: { text: "Verification passed." },
-        rawLogReference: `logs/${run.id}/verifier/attempt-${attempt}.jsonl`,
+        rawLogReference: `logs/${run.id}/rework-${run.reworkEpoch}/verifier/attempt-${attempt}.jsonl`,
       },
       at: completedAt,
     });

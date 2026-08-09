@@ -17,6 +17,7 @@ import {
   executeClaimedRun,
   type IntakeCapture,
   type VerificationAdapter,
+  validateIntakeCapture,
   type WorkspaceInspection,
   type WorkspacePreparationReceipt,
 } from "./execution.js";
@@ -78,7 +79,7 @@ export type ReviewDiffReader = (run: RunRecord) => string | PromiseLike<string>;
 
 export type ReviewFindingReader = (
   run: RunRecord,
-) => readonly RepairFindingInput[] | PromiseLike<readonly RepairFindingInput[]>;
+) => readonly unknown[] | PromiseLike<readonly unknown[]>;
 
 export interface ReviewRepairInput {
   readonly coordinator: ExecutionCoordinator;
@@ -145,6 +146,38 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isStaleError(error: unknown): boolean {
+  return (
+    error instanceof Error && /stale|revision|effect/iu.test(error.message)
+  );
+}
+
+async function handoff(
+  input: ReviewRepairInput,
+  run: RunRecord,
+  reason: string,
+  now: () => string,
+): Promise<
+  | { kind: "human"; run: RunRecord; reason: string }
+  | { kind: "stale"; run: RunRecord }
+> {
+  if (run.state === "review") return { kind: "human", run, reason };
+  try {
+    const handedOff = await input.coordinator.transition({
+      runId: run.id,
+      expectedRevision: run.revision,
+      trigger: "handoff_required",
+      at: now(),
+      summary: { text: bounded(reason) },
+      requiredAction: reason,
+    });
+    return { kind: "human", run: handedOff, reason };
+  } catch (error) {
+    if (isStaleError(error)) return { kind: "stale", run };
+    throw error;
+  }
+}
+
 function bounded(value: string): string {
   let result = value;
   while (Buffer.byteLength(result, "utf8") > maximumEvidenceBytes)
@@ -205,6 +238,11 @@ function workspaceFor(run: RunRecord): WorkspacePreparationReceipt {
     run.branch === null ||
     run.baseSha === null ||
     run.headSha === null ||
+    run.baseBranch !== "main" ||
+    run.worktreePath.trim() !== run.worktreePath ||
+    run.branch.trim() !== run.branch ||
+    run.worktreePath.length === 0 ||
+    run.branch.length === 0 ||
     !shaPattern.test(run.baseSha) ||
     !shaPattern.test(run.headSha)
   )
@@ -219,20 +257,110 @@ function workspaceFor(run: RunRecord): WorkspacePreparationReceipt {
   };
 }
 
-function findingInput(value: RepairFindingInput): RepairFindingInput {
+function strictChangedFiles(value: unknown): readonly string[] {
+  if (!Array.isArray(value))
+    throw new Error("Workspace changed files are invalid.");
+  if (
+    value.some((path) => {
+      if (
+        typeof path !== "string" ||
+        path.trim() !== path ||
+        path.length === 0 ||
+        path.length > 512
+      )
+        return true;
+      const segments = path.split(/[\\/]/u);
+      return (
+        path.startsWith("/") ||
+        path.startsWith("\\") ||
+        segments.includes("..") ||
+        segments.includes(".")
+      );
+    })
+  )
+    throw new Error("Workspace changed files are invalid.");
+  if (value.length > 4096)
+    throw new Error("Workspace changed files are invalid.");
+  return value as string[];
+}
+
+function inspectWorkspaceReceipt(
+  value: unknown,
+  expected: WorkspacePreparationReceipt,
+  allowHeadChange: boolean,
+): WorkspacePreparationReceipt {
+  if (!isRecord(value)) throw new Error("Workspace receipt is invalid.");
+  const keys = Object.keys(value).toSorted();
+  if (keys.join(",") !== "baseBranch,baseSha,branch,changedFiles,headSha,path")
+    throw new Error("Workspace receipt shape is invalid.");
+  if (
+    value.baseBranch !== "main" ||
+    value.path !== expected.path ||
+    value.branch !== expected.branch ||
+    value.baseSha !== expected.baseSha ||
+    (!allowHeadChange && value.headSha !== expected.headSha) ||
+    typeof value.path !== "string" ||
+    typeof value.branch !== "string" ||
+    typeof value.baseSha !== "string" ||
+    typeof value.headSha !== "string" ||
+    !shaPattern.test(value.baseSha) ||
+    !shaPattern.test(value.headSha)
+  )
+    throw new Error("Workspace identity changed or is invalid.");
+  return {
+    path: value.path,
+    branch: value.branch,
+    baseBranch: "main",
+    baseSha: value.baseSha,
+    headSha: value.headSha,
+    changedFiles: strictChangedFiles(value.changedFiles),
+  };
+}
+
+function verificationEvidence(
+  value: unknown,
+  run: RunRecord,
+): string | undefined {
   if (
     !isRecord(value) ||
-    typeof value.stable_key !== "string" ||
-    value.stable_key.trim().length === 0 ||
-    !["low", "medium", "high", "critical"].includes(value.severity as string) ||
-    typeof value.evidence !== "string" ||
-    value.evidence.trim().length === 0
+    (value.kind !== "succeeded" && value.kind !== "failed")
+  )
+    return undefined;
+  if (
+    typeof value.command !== "string" ||
+    typeof value.cwd !== "string" ||
+    (value.kind === "succeeded" &&
+      (value.exitCode !== 0 || value.signal !== null)) ||
+    (value.kind === "failed" && typeof value.reason !== "string") ||
+    typeof value.headSha !== "string" ||
+    !shaPattern.test(value.headSha) ||
+    !Array.isArray(value.changedFiles) ||
+    value.changedFiles.some((path) => typeof path !== "string")
+  )
+    return undefined;
+  if (value.kind === "succeeded" && value.headSha !== run.headSha)
+    return undefined;
+  return json(value);
+}
+
+function findingInput(value: unknown): RepairFindingInput {
+  const record = isRecord(value) ? value : undefined;
+  const stableKey = record?.stable_key ?? record?.stableKey;
+  if (
+    record === undefined ||
+    typeof stableKey !== "string" ||
+    stableKey.trim().length === 0 ||
+    !["low", "medium", "high", "critical"].includes(
+      record.severity as string,
+    ) ||
+    typeof record.evidence !== "string" ||
+    record.evidence.trim().length === 0
   )
     throw new Error("Repair finding is invalid.");
   return {
-    stable_key: value.stable_key,
-    severity: value.severity,
-    evidence: value.evidence,
+    stable_key: stableKey,
+    severity: record.severity as RepairFindingInput["severity"],
+    evidence: record.evidence,
   };
 }
 
@@ -244,11 +372,11 @@ function findingsFromTerminal(
 }
 
 function reviewEffectKey(run: RunRecord): string {
-  return `run:${run.id}:agent:review:attempt:${run.repairRound + 1}`;
+  return `run:${run.id}:rework:${run.reworkEpoch}:agent:review:attempt:${run.repairRound + 1}`;
 }
 
 function repairEffectKey(run: RunRecord): string {
-  return `run:${run.id}:agent:repair:attempt:${run.repairRound}`;
+  return `run:${run.id}:rework:${run.reworkEpoch}:agent:repair:attempt:${run.repairRound}`;
 }
 
 async function schedule(
@@ -281,13 +409,15 @@ function reviewStep(
   attempt: number,
   receipt: unknown,
   prompt: ReviewerRenderReceipt,
+  model: string,
+  reasoningEffort: string,
   status: "completed" | "failed",
   startedAt: string,
   completedAt: string,
   summary: string,
 ) {
   return {
-    id: `run:${run.id}:review:attempt:${attempt}:step`,
+    id: `run:${run.id}:rework:${run.reworkEpoch}:review:attempt:${attempt}:step`,
     runId: run.id,
     expectedRevision: run.revision,
     reworkEpoch: run.reworkEpoch,
@@ -297,13 +427,13 @@ function reviewStep(
     statusSequence: 1,
     status,
     promptHash: prompt.promptHash,
-    model: run.repository,
-    reasoningEffort: "independent",
+    model,
+    reasoningEffort,
     startedAt,
     completedAt,
     exitResultJson: json(receipt),
     summary: { text: bounded(summary) },
-    rawLogReference: `logs/${run.id}/review/attempt-${attempt}.jsonl`,
+    rawLogReference: `logs/${run.id}/rework-${run.reworkEpoch}/review/attempt-${attempt}.jsonl`,
   } as const;
 }
 
@@ -312,13 +442,15 @@ function repairStep(
   attempt: number,
   receipt: unknown,
   prompt: RepairRenderReceipt,
+  model: string,
+  reasoningEffort: string,
   status: "completed" | "failed",
   startedAt: string,
   completedAt: string,
   summary: string,
 ) {
   return {
-    id: `run:${run.id}:repair:attempt:${attempt}:step`,
+    id: `run:${run.id}:rework:${run.reworkEpoch}:repair:attempt:${attempt}:step`,
     runId: run.id,
     expectedRevision: run.revision,
     reworkEpoch: run.reworkEpoch,
@@ -328,13 +460,13 @@ function repairStep(
     statusSequence: 1,
     status,
     promptHash: prompt.promptHash,
-    model: run.repository,
-    reasoningEffort: "bounded",
+    model,
+    reasoningEffort,
     startedAt,
     completedAt,
     exitResultJson: json(receipt),
     summary: { text: bounded(summary) },
-    rawLogReference: `logs/${run.id}/repair/attempt-${attempt}.jsonl`,
+    rawLogReference: `logs/${run.id}/rework-${run.reworkEpoch}/repair/attempt-${attempt}.jsonl`,
   } as const;
 }
 
@@ -345,13 +477,13 @@ function toFindings(
   at: string,
 ): readonly NewFindingRecord[] {
   return findings.map((finding, index) => ({
-    id: `run:${run.id}:finding:review:${run.repairRound + 1}:${index + 1}`,
+    id: `run:${run.id}:rework:${run.reworkEpoch}:finding:review:${run.repairRound + 1}:${index + 1}`,
     runId: run.id,
     expectedRevision: run.revision,
     reworkEpoch: run.reworkEpoch,
     reviewStepId: stepId,
     stableKey: finding.stable_key,
-    dispositionSequence: 1,
+    dispositionSequence: run.repairRound + 1,
     severity: finding.severity,
     evidence: finding.evidence,
     disposition: "open",
@@ -371,6 +503,8 @@ async function settleReview(
   now: () => string,
 ): Promise<ReviewStageOutcome> {
   const attempt = run.repairRound + 1;
+  const model = input.intake?.builder.model ?? run.repository;
+  const reasoningEffort = input.intake?.builder.reasoningEffort ?? "bounded";
   const completedAt = now();
   const findings = terminal === undefined ? [] : findingsFromTerminal(terminal);
   const exhausted =
@@ -389,22 +523,21 @@ async function settleReview(
     ...(reason === undefined ? {} : { reason }),
   };
   const shouldRepair = terminal?.outcome === "needs_repair" && !exhausted;
+  const persistFindings =
+    terminal?.outcome === "needs_repair" && findings.length > 0;
+  const trigger = persistFindings
+    ? "review_needs_repair"
+    : terminal?.outcome === "approved"
+      ? "review_approved"
+      : "handoff_required";
   try {
     const settled = await input.coordinator.settleExecution({
       runId: run.id,
       expectedRevision: run.revision,
       effectKey: effect.key,
       outcome:
-        shouldRepair || terminal === undefined || !shouldRepair
-          ? terminal?.outcome === "approved" && !exhausted
-            ? "confirmed"
-            : "failed"
-          : "failed",
-      trigger: shouldRepair
-        ? "review_needs_repair"
-        : terminal?.outcome === "approved" && !exhausted
-          ? "review_approved"
-          : "handoff_required",
+        terminal?.outcome === "approved" && !exhausted ? "confirmed" : "failed",
+      trigger,
       evidence: bounded(
         shouldRepair
           ? (terminal?.summary ?? "Independent review requires a repair.")
@@ -416,23 +549,29 @@ async function settleReview(
         attempt,
         reviewReceipt,
         prompt,
+        model,
+        reasoningEffort,
         terminal === undefined ||
-          (!shouldRepair && terminal.outcome !== "approved")
+          (terminal.outcome !== "approved" &&
+            terminal.outcome !== "needs_repair")
           ? "failed"
           : "completed",
         startedAt,
         completedAt,
         terminal?.summary ?? handoffReason,
       ),
-      ...(shouldRepair
+      ...(persistFindings
         ? {
             findings: toFindings(
               run,
-              `run:${run.id}:review:attempt:${attempt}:step`,
+              `run:${run.id}:rework:${run.reworkEpoch}:review:attempt:${attempt}:step`,
               findings,
               completedAt,
             ),
           }
+        : {}),
+      ...(trigger === "handoff_required" || exhausted
+        ? { requiredAction: handoffReason }
         : {}),
       at: completedAt,
     });
@@ -442,9 +581,13 @@ async function settleReview(
       return { kind: "approved", run: settled.run, review: terminal };
     return { kind: "human", run: settled.run, reason: handoffReason };
   } catch (error) {
-    if (error instanceof Error && /stale|revision|effect/iu.test(error.message))
-      return { kind: "stale", run };
-    throw error;
+    if (isStaleError(error)) return { kind: "stale", run };
+    return handoff(
+      input,
+      run,
+      `Independent review settlement failed closed: ${errorMessage(error)}`,
+      now,
+    );
   }
 }
 
@@ -453,37 +596,102 @@ export async function executeReviewStage(
 ): Promise<ReviewStageOutcome> {
   const now = input.now ?? (() => new Date().toISOString());
   if (input.run.state !== "reviewing") return { kind: "stale", run: input.run };
-  const intake = input.intake;
-  if (intake === undefined) throw new Error("Review intake is required.");
-  const workspace = workspaceFor(input.run);
-  const diff = await input.readDiff(input.run);
+  let intake: IntakeCapture;
+  try {
+    intake =
+      input.intake ??
+      (input.run.intakeJson === null
+        ? (() => {
+            throw new Error("Review intake is required.");
+          })()
+        : validateIntakeCapture(JSON.parse(input.run.intakeJson)));
+  } catch (error) {
+    return handoff(
+      input,
+      input.run,
+      `Review cannot use the durable issue contract: ${errorMessage(error)}`,
+      now,
+    );
+  }
+  const effectiveInput = { ...input, intake };
+  let workspace: WorkspacePreparationReceipt;
+  try {
+    workspace = workspaceFor(input.run);
+  } catch (error) {
+    return handoff(
+      effectiveInput,
+      input.run,
+      `Review workspace facts are invalid: ${errorMessage(error)}`,
+      now,
+    );
+  }
+  if (input.workspaceInspect === undefined)
+    return handoff(
+      effectiveInput,
+      input.run,
+      "Independent review cannot prove the assigned worktree identity; human Review must inspect it.",
+      now,
+    );
+  let diff: string;
+  try {
+    const before = inspectWorkspaceReceipt(
+      await input.workspaceInspect(input.run, workspace),
+      workspace,
+      false,
+    );
+    diff = await input.readDiff(input.run);
+    inspectWorkspaceReceipt(
+      await input.workspaceInspect(input.run, before),
+      before,
+      false,
+    );
+  } catch (error) {
+    return handoff(
+      effectiveInput,
+      input.run,
+      `Independent review cannot safely read the assigned worktree diff: ${errorMessage(error)}`,
+      now,
+    );
+  }
   const repositoryFacts =
     input.repositoryFacts ?? "No additional repository facts were supplied.";
-  const verification =
-    typeof input.verification === "string"
-      ? input.verification
-      : json(
-          input.verification ?? { state: "verification evidence unavailable" },
-        );
+  const verification = verificationEvidence(input.verification, input.run);
+  if (verification === undefined)
+    return handoff(
+      effectiveInput,
+      input.run,
+      "Independent review lacks the actual successful durable verification receipt.",
+      now,
+    );
   const attempt = input.run.repairRound + 1;
-  const rendered = renderReceipt(
-    await input.reviewer.render({
-      issueNumber: input.run.issueNumber,
-      issueTitle: intake.title,
-      issueBody: intake.body,
-      worktreePath: workspace.path,
-      baseSha: workspace.baseSha,
-      headSha: workspace.headSha,
-      diff,
-      repositoryFacts,
-      verification,
-    }),
-    "Reviewer",
-  );
+  let rendered: ReviewerRenderReceipt;
+  try {
+    rendered = renderReceipt(
+      await input.reviewer.render({
+        issueNumber: input.run.issueNumber,
+        issueTitle: intake.title,
+        issueBody: intake.body,
+        worktreePath: workspace.path,
+        baseSha: workspace.baseSha,
+        headSha: workspace.headSha,
+        diff,
+        repositoryFacts,
+        verification,
+      }),
+      "Reviewer",
+    );
+  } catch (error) {
+    return handoff(
+      effectiveInput,
+      input.run,
+      `Independent reviewer prompt rendering failed: ${errorMessage(error)}`,
+      now,
+    );
+  }
   let effect: EffectRecord | undefined;
   try {
     effect = await schedule(
-      input.coordinator,
+      effectiveInput.coordinator,
       input.run,
       reviewEffectKey(input.run),
       "agent_review",
@@ -499,11 +707,21 @@ export async function executeReviewStage(
       now,
     );
   } catch (error) {
-    if (error instanceof Error && /stale|revision|effect/iu.test(error.message))
-      return { kind: "stale", run: input.run };
-    throw error;
+    if (isStaleError(error)) return { kind: "stale", run: input.run };
+    return handoff(
+      effectiveInput,
+      input.run,
+      `Independent review could not create its durable effect: ${errorMessage(error)}`,
+      now,
+    );
   }
-  if (effect === undefined) return { kind: "stale", run: input.run };
+  if (effect === undefined)
+    return handoff(
+      effectiveInput,
+      input.run,
+      "Independent review was replayed or ambiguous; human Review must reconcile the prior effect.",
+      now,
+    );
   const startedAt = now();
   let rawResult: unknown;
   let terminal: ReviewerTerminalResult;
@@ -525,7 +743,7 @@ export async function executeReviewStage(
     ) as ReviewerTerminalResult;
   } catch (error) {
     return settleReview(
-      input,
+      effectiveInput,
       input.run,
       effect,
       rendered,
@@ -536,10 +754,29 @@ export async function executeReviewStage(
       now,
     );
   }
+  try {
+    inspectWorkspaceReceipt(
+      await input.workspaceInspect(input.run, workspace),
+      workspace,
+      false,
+    );
+  } catch (error) {
+    return settleReview(
+      effectiveInput,
+      input.run,
+      effect,
+      rendered,
+      startedAt,
+      undefined,
+      rawResult,
+      `Reviewer changed or lost the assigned worktree: ${errorMessage(error)}`,
+      now,
+    );
+  }
   // Keep invocation/receipt parsing separate from durable settlement. A
   // coordinator validation or stale error must never relaunch settlement.
   return settleReview(
-    input,
+    effectiveInput,
     input.run,
     effect,
     rendered,
@@ -554,7 +791,7 @@ export async function executeReviewStage(
 async function executeRepairStage(
   input: ReviewRepairInput,
   run: RunRecord,
-  findingsOverride?: readonly RepairFindingInput[],
+  findingsOverride?: readonly unknown[],
 ): Promise<
   | { kind: "repaired"; run: RunRecord }
   | { kind: "human"; run: RunRecord; reason: string }
@@ -563,56 +800,130 @@ async function executeRepairStage(
   const now = input.now ?? (() => new Date().toISOString());
   if (run.state !== "repairing") return { kind: "stale", run };
   if (run.repairRound < 1 || run.repairRound > 2)
-    return {
-      kind: "human",
+    return handoff(
+      input,
       run,
-      reason: "Repair round is outside the shared bounded budget.",
-    };
+      "Repair round is outside the shared bounded budget.",
+      now,
+    );
+  let intake: IntakeCapture;
+  try {
+    intake =
+      input.intake ??
+      (run.intakeJson === null
+        ? (() => {
+            throw new Error("Repair intake is required.");
+          })()
+        : validateIntakeCapture(JSON.parse(run.intakeJson)));
+  } catch (error) {
+    return handoff(
+      input,
+      run,
+      `Repair cannot use the durable issue contract: ${errorMessage(error)}`,
+      now,
+    );
+  }
+  const effectiveInput = { ...input, intake };
   if (input.repair === undefined)
-    return {
-      kind: "human",
+    return handoff(
+      effectiveInput,
       run,
-      reason:
-        "No repair capability is available; human Review must repair the recorded findings.",
-    };
-  const findings =
-    findingsOverride ??
-    (input.readFindings === undefined
-      ? undefined
-      : await input.readFindings(run));
+      "No repair capability is available; human Review must repair the recorded findings.",
+      now,
+    );
+  let findings: readonly unknown[] | undefined;
+  try {
+    findings =
+      findingsOverride ??
+      (input.readFindings === undefined
+        ? undefined
+        : await input.readFindings(run));
+  } catch (error) {
+    return handoff(
+      effectiveInput,
+      run,
+      `Durable review findings could not be read: ${errorMessage(error)}`,
+      now,
+    );
+  }
   if (findings === undefined || findings.length === 0)
-    return {
-      kind: "human",
+    return handoff(
+      effectiveInput,
       run,
-      reason: "No durable review findings are available for repair.",
-    };
-  const normalizedFindings = findings.map(findingInput);
-  const workspace = workspaceFor(run);
-  const diff = await input.readDiff(run);
+      "No durable review findings are available for repair.",
+      now,
+    );
+  let normalizedFindings: readonly RepairFindingInput[];
+  try {
+    normalizedFindings = findings.map(findingInput);
+  } catch (error) {
+    return handoff(
+      effectiveInput,
+      run,
+      `Durable review findings are invalid: ${errorMessage(error)}`,
+      now,
+    );
+  }
+  let workspace: WorkspacePreparationReceipt;
+  try {
+    workspace = workspaceFor(run);
+  } catch (error) {
+    return handoff(
+      effectiveInput,
+      run,
+      `Repair workspace facts are invalid: ${errorMessage(error)}`,
+      now,
+    );
+  }
+  const verification = verificationEvidence(input.verification, run);
+  if (verification === undefined)
+    return handoff(
+      effectiveInput,
+      run,
+      "Repair lacks actual verification evidence from the preceding durable step.",
+      now,
+    );
+  let diff: string;
+  try {
+    diff = await input.readDiff(run);
+  } catch (error) {
+    return handoff(
+      effectiveInput,
+      run,
+      `Repair cannot safely read the assigned worktree diff: ${errorMessage(error)}`,
+      now,
+    );
+  }
   const repositoryFacts =
     input.repositoryFacts ?? "No additional repository facts were supplied.";
-  const verification =
-    typeof input.verification === "string"
-      ? input.verification
-      : json(
-          input.verification ?? { state: "verification evidence unavailable" },
-        );
   const attempt = run.repairRound;
-  const rendered = renderReceipt(
-    await input.repair.render({
-      issueNumber: run.issueNumber,
-      issueTitle: input.intake?.title ?? "Issue contract unavailable",
-      issueBody: input.intake?.body ?? "Issue contract unavailable",
-      worktreePath: workspace.path,
-      baseSha: workspace.baseSha,
-      headSha: workspace.headSha,
-      diff,
-      repositoryFacts,
-      verification,
-      findings: normalizedFindings,
-    }),
-    "Repair",
-  );
+  const model = intake.builder.model;
+  const reasoningEffort = intake.builder.reasoningEffort;
+  let rendered: RepairRenderReceipt;
+  try {
+    rendered = renderReceipt(
+      await input.repair.render({
+        issueNumber: run.issueNumber,
+        issueTitle: intake.title,
+        issueBody: intake.body,
+        worktreePath: workspace.path,
+        baseSha: workspace.baseSha,
+        headSha: workspace.headSha,
+        diff,
+        repositoryFacts,
+        verification,
+        findings: normalizedFindings,
+      }),
+      "Repair",
+    );
+  } catch (error) {
+    return handoff(
+      effectiveInput,
+      run,
+      `Repair prompt rendering failed: ${errorMessage(error)}`,
+      now,
+    );
+  }
   let effect: EffectRecord | undefined;
   try {
     effect = await schedule(
@@ -633,11 +944,21 @@ async function executeRepairStage(
       now,
     );
   } catch (error) {
-    if (error instanceof Error && /stale|revision|effect/iu.test(error.message))
-      return { kind: "stale", run };
-    throw error;
+    if (isStaleError(error)) return { kind: "stale", run };
+    return handoff(
+      effectiveInput,
+      run,
+      `Repair could not create its durable effect: ${errorMessage(error)}`,
+      now,
+    );
   }
-  if (effect === undefined) return { kind: "stale", run };
+  if (effect === undefined)
+    return handoff(
+      effectiveInput,
+      run,
+      "Repair was replayed or ambiguous; human Review must reconcile the prior effect.",
+      now,
+    );
   const startedAt = now();
   let rawResult: unknown;
   let terminal: RepairTerminalResult | undefined;
@@ -650,8 +971,8 @@ async function executeRepairStage(
       headSha: workspace.headSha,
       prompt: rendered.prompt,
       promptHash: rendered.promptHash,
-      model: input.intake?.builder.model ?? run.repository,
-      reasoningEffort: input.intake?.builder.reasoningEffort ?? "bounded",
+      model,
+      reasoningEffort,
       attempt,
       findings: normalizedFindings,
     });
@@ -686,11 +1007,14 @@ async function executeRepairStage(
           attempt,
           receipt,
           rendered,
+          model,
+          reasoningEffort,
           "failed",
           startedAt,
           completedAt,
           handoffReason,
         ),
+        requiredAction: handoffReason,
         at: completedAt,
       });
       return { kind: "human", run: settled.run, reason: handoffReason };
@@ -719,45 +1043,33 @@ async function executeRepairStage(
         attempt,
         receipt,
         rendered,
+        model,
+        reasoningEffort,
         "failed",
         startedAt,
         completedAt,
         reasonText,
       ),
+      requiredAction: reasonText,
       at: completedAt,
     });
     return { kind: "human", run: settled.run, reason: reasonText };
   }
   let inspected: WorkspacePreparationReceipt;
   try {
-    const value = await input.workspaceInspect(run, workspace);
+    inspected = inspectWorkspaceReceipt(
+      await input.workspaceInspect(run, workspace),
+      workspace,
+      true,
+    );
     if (
-      !isRecord(value) ||
-      typeof value.path !== "string" ||
-      typeof value.branch !== "string" ||
-      typeof value.baseSha !== "string" ||
-      typeof value.headSha !== "string"
+      terminal?.changed_files.some(
+        (path) => !inspected.changedFiles.includes(path),
+      )
     )
-      throw new Error("Repair workspace receipt is invalid.");
-    inspected = {
-      path: value.path,
-      branch: value.branch,
-      baseBranch: value.baseBranch === "main" ? "main" : "main",
-      baseSha: value.baseSha,
-      headSha: value.headSha,
-      changedFiles: Array.isArray(value.changedFiles)
-        ? value.changedFiles.filter(
-            (path): path is string => typeof path === "string",
-          )
-        : [],
-    };
-    if (
-      inspected.path !== workspace.path ||
-      inspected.branch !== workspace.branch ||
-      inspected.baseSha !== workspace.baseSha ||
-      !shaPattern.test(inspected.headSha)
-    )
-      throw new Error("Repair changed the assigned workspace identity.");
+      throw new Error(
+        "Repair reported a file outside the observed worktree diff.",
+      );
   } catch (error) {
     const handoffReason = `Repair workspace inspection failed: ${errorMessage(error)}`;
     const settled = await input.coordinator.settleExecution({
@@ -773,11 +1085,14 @@ async function executeRepairStage(
         attempt,
         receipt,
         rendered,
+        model,
+        reasoningEffort,
         "failed",
         startedAt,
         completedAt,
         handoffReason,
       ),
+      requiredAction: handoffReason,
       at: completedAt,
     });
     return { kind: "human", run: settled.run, reason: handoffReason };
@@ -801,6 +1116,8 @@ async function executeRepairStage(
         attempt,
         receipt,
         rendered,
+        model,
+        reasoningEffort,
         "completed",
         startedAt,
         completedAt,
@@ -826,19 +1143,30 @@ export async function executeReviewRepair(
   for (let guard = 0; guard < 8; guard += 1) {
     if (run.state === "verifying") {
       if (input.verify === undefined || input.workspaceInspect === undefined)
-        return {
-          kind: "human",
+        return handoff(
+          input,
           run,
-          reason: "Verification capability is unavailable.",
-        };
-      const verificationResult = await executeClaimedRun({
-        coordinator: input.coordinator,
-        run,
-        workspacePrepare: async () => workspaceFor(run),
-        workspaceInspect: input.workspaceInspect,
-        verify: input.verify,
-        now,
-      });
+          "Verification capability is unavailable.",
+          now,
+        );
+      let verificationResult: Awaited<ReturnType<typeof executeClaimedRun>>;
+      try {
+        verificationResult = await executeClaimedRun({
+          coordinator: input.coordinator,
+          run,
+          workspacePrepare: async () => workspaceFor(run),
+          workspaceInspect: input.workspaceInspect,
+          verify: input.verify,
+          now,
+        });
+      } catch (error) {
+        return handoff(
+          input,
+          run,
+          `Verification could not safely resume: ${errorMessage(error)}`,
+          now,
+        );
+      }
       if (verificationResult.kind === "stale")
         return { kind: "stale", run: verificationResult.run };
       run = verificationResult.run;
@@ -846,12 +1174,15 @@ export async function executeReviewRepair(
         verification = verificationResult.verification;
         continue;
       }
+      if (verificationResult.kind === "verification_failed")
+        verification = verificationResult.verification;
       if (run.state !== "repairing")
-        return {
-          kind: "human",
+        return handoff(
+          input,
           run,
-          reason: "Verification did not reach the review gate.",
-        };
+          "Verification did not reach the review gate.",
+          now,
+        );
     }
     if (run.state === "reviewing") {
       const review = await executeReviewStage({ ...input, run, verification });
@@ -865,11 +1196,12 @@ export async function executeReviewRepair(
       findings = review.findings;
     }
     if (run.state !== "repairing")
-      return {
-        kind: "human",
+      return handoff(
+        input,
         run,
-        reason: "Review loop reached an unexpected state.",
-      };
+        "Review loop reached an unexpected state.",
+        now,
+      );
     const repair = await executeRepairStage(
       { ...input, run, verification },
       run,
@@ -879,23 +1211,38 @@ export async function executeReviewRepair(
     run = repair.run;
     findings = undefined;
     if (input.verify === undefined || input.workspaceInspect === undefined)
-      return {
-        kind: "human",
+      return handoff(
+        input,
         run,
-        reason: "Repair completed but verification capability is unavailable.",
-      };
-    const verificationResult = await executeClaimedRun({
-      coordinator: input.coordinator,
-      run,
-      workspacePrepare: async () => workspaceFor(run),
-      workspaceInspect: input.workspaceInspect,
-      verify: input.verify,
-      now,
-    });
+        "Repair completed but verification capability is unavailable.",
+        now,
+      );
+    let verificationResult: Awaited<ReturnType<typeof executeClaimedRun>>;
+    try {
+      verificationResult = await executeClaimedRun({
+        coordinator: input.coordinator,
+        run,
+        workspacePrepare: async () => workspaceFor(run),
+        workspaceInspect: input.workspaceInspect,
+        verify: input.verify,
+        now,
+      });
+    } catch (error) {
+      return handoff(
+        input,
+        run,
+        `Verification after repair could not safely run: ${errorMessage(error)}`,
+        now,
+      );
+    }
     if (verificationResult.kind === "stale")
       return { kind: "stale", run: verificationResult.run };
     run = verificationResult.run;
     if (verificationResult.kind === "reviewing") {
+      verification = verificationResult.verification;
+      continue;
+    }
+    if (verificationResult.kind === "verification_failed") {
       verification = verificationResult.verification;
       continue;
     }
@@ -906,11 +1253,12 @@ export async function executeReviewRepair(
         reason: "Verification exhausted the shared repair budget.",
       };
   }
-  return {
-    kind: "human",
+  return handoff(
+    input,
     run,
-    reason: "Review loop exceeded its bounded sequencing guard.",
-  };
+    "Review loop exceeded its bounded sequencing guard.",
+    now,
+  );
 }
 
 export const executeReviewAndRepair = executeReviewRepair;

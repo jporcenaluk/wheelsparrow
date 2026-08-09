@@ -178,7 +178,17 @@ describe("durable review and repair sequencing", () => {
       coordinator,
       run,
       intake: intake(),
-      verification: { command: "pnpm test:unit", headSha: firstHeadSha },
+      verification: {
+        kind: "succeeded" as const,
+        command: "pnpm test:unit",
+        cwd: workspace(firstHeadSha).path,
+        exitCode: 0,
+        signal: null,
+        stdout: "verified",
+        stderr: "",
+        headSha: firstHeadSha,
+        changedFiles: workspace(firstHeadSha).changedFiles,
+      },
       readDiff: async () => `diff --git a/file b/file\n+repair me`,
       readFindings: async () => [
         {
@@ -245,10 +255,10 @@ describe("durable review and repair sequencing", () => {
           };
         },
       },
-      workspaceInspect: async (_run, expected) => {
+      workspaceInspect: async (run, expected) => {
         const receipt = expected as ReturnType<typeof workspace>;
         return workspace(
-          receipt.headSha === firstHeadSha ? repairedHeadSha : receipt.headSha,
+          run.state === "repairing" ? repairedHeadSha : receipt.headSha,
         );
       },
       verify: async ({ expectedHeadSha }) => ({
@@ -273,17 +283,39 @@ describe("durable review and repair sequencing", () => {
         .prepare("SELECT key FROM side_effects WHERE run_id = ? ORDER BY key")
         .all(run.id),
     ).toEqual([
-      { key: `run:${run.id}:agent:repair:attempt:1` },
-      { key: `run:${run.id}:agent:review:attempt:1` },
-      { key: `run:${run.id}:agent:review:attempt:2` },
       { key: `run:${run.id}:intake:capture` },
-      { key: `run:${run.id}:verify:attempt:2` },
+      { key: `run:${run.id}:rework:${run.reworkEpoch}:agent:repair:attempt:1` },
+      { key: `run:${run.id}:rework:${run.reworkEpoch}:agent:review:attempt:1` },
+      { key: `run:${run.id}:rework:${run.reworkEpoch}:agent:review:attempt:2` },
+      { key: `run:${run.id}:rework:${run.reworkEpoch}:verify:attempt:2` },
     ]);
     expect(
       connection.native
         .prepare("SELECT COUNT(*) AS count FROM findings WHERE run_id = ?")
         .get(run.id),
     ).toEqual({ count: 1 });
+    const durableStepIds = connection.native
+      .prepare("SELECT id FROM steps WHERE run_id = ? ORDER BY rowid")
+      .all(run.id) as Array<{ id: string }>;
+    expect(durableStepIds.map(({ id }) => id)).toEqual(
+      expect.arrayContaining([
+        `run:${run.id}:rework:0:review:attempt:1:step`,
+        `run:${run.id}:rework:0:repair:attempt:1:step`,
+        `run:${run.id}:rework:0:review:attempt:2:step`,
+      ]),
+    );
+    expect(
+      connection.native
+        .prepare(
+          "SELECT id, disposition_sequence FROM findings WHERE run_id = ?",
+        )
+        .all(run.id),
+    ).toEqual([
+      {
+        id: `run:${run.id}:rework:0:finding:review:1:1`,
+        disposition_sequence: 1,
+      },
+    ]);
     await coordinator.close();
   });
 
@@ -332,7 +364,17 @@ describe("durable review and repair sequencing", () => {
       coordinator,
       run,
       intake: intake(),
-      verification: "verification evidence",
+      verification: {
+        kind: "succeeded" as const,
+        command: "pnpm test:unit",
+        cwd: workspace(firstHeadSha).path,
+        exitCode: 0,
+        signal: null,
+        stdout: "verified",
+        stderr: "",
+        headSha: firstHeadSha,
+        changedFiles: workspace(firstHeadSha).changedFiles,
+      },
       readDiff: async () => "raw diff",
       reviewer: {
         render: async () => ({ prompt: "review", promptHash: hash("review") }),
@@ -357,6 +399,7 @@ describe("durable review and repair sequencing", () => {
           };
         },
       },
+      workspaceInspect: async (_run, expected) => expected,
       now: () => at,
     });
     expect(result.kind).toBe("human");
@@ -367,6 +410,70 @@ describe("durable review and repair sequencing", () => {
         .prepare("SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ?")
         .get(run.id),
     ).toEqual({ count: 1 });
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM findings WHERE run_id = ?")
+        .get(run.id),
+    ).toEqual({ count: 1 });
+    await coordinator.close();
+  });
+
+  test("durably hands a missing repair capability from repairing to Review", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    await coordinator.createClaim(claimInput());
+    let run = await readRun(connection.db, claimInput().id);
+    for (const trigger of [
+      "todo_observed",
+      "workspace_prepared",
+      "intake_captured",
+      "builder_succeeded",
+      "verification_passed",
+      "review_needs_repair",
+    ] as const) {
+      await coordinator.transition({
+        runId: run.id,
+        expectedRevision: run.revision,
+        trigger,
+        at,
+        summary: { text: `${trigger}.` },
+      });
+      run = await readRun(connection.db, run.id);
+    }
+    connection.native
+      .prepare(
+        "UPDATE runs SET base_sha = ?, head_sha = ?, worktree_path = ?, branch = ?, intake_json = ? WHERE id = ?",
+      )
+      .run(
+        baseSha,
+        firstHeadSha,
+        workspace(firstHeadSha).path,
+        workspace(firstHeadSha).branch,
+        JSON.stringify(intake()),
+        run.id,
+      );
+    run = await readRun(connection.db, run.id);
+
+    const result = await executeReviewRepair({
+      coordinator,
+      run,
+      intake: intake(),
+      verification: { kind: "succeeded", headSha: firstHeadSha },
+      readDiff: async () => "diff",
+      reviewer: {
+        render: async () => ({ prompt: "unused", promptHash: hash("unused") }),
+        invoke: async () => ({
+          outcome: "approved" as const,
+          summary: "unused",
+          validation: [],
+        }),
+      },
+    });
+
+    expect(result.kind).toBe("human");
+    expect(result.run.state).toBe("review");
+    expect(result.run.revision).toBe(run.revision + 1);
+    expect(result.run.requiredAction).toMatch(/repair capability/iu);
     await coordinator.close();
   });
 });

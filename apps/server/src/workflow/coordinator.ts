@@ -117,6 +117,8 @@ export interface ExecutionSettlementCommand {
   step?: NewStepRecord;
   /** Findings belong to the review step and are appended in this transaction. */
   findings?: readonly NewFindingRecord[];
+  /** Durable operator guidance for a handoff to Review. */
+  requiredAction?: string;
 }
 
 export interface ExecutionSettlement {
@@ -620,9 +622,15 @@ export class WorkflowCoordinator {
             throw new RangeError(
               `A settlement may append at most ${maximumSettlementFindings} findings.`,
             );
+          const exhaustedReviewHandoff =
+            command.trigger === "handoff_required" &&
+            currentEffect.kind === "agent_review" &&
+            current.repairRound >= 2;
           if (
             command.outcome !== "failed" ||
-            command.trigger !== "review_needs_repair" ||
+            (command.trigger !== "review_needs_repair" &&
+              !exhaustedReviewHandoff &&
+              command.trigger !== "handoff_required") ||
             command.findings.length === 0
           )
             throw new TypeError(
@@ -637,6 +645,10 @@ export class WorkflowCoordinator {
           )
             throw new TypeError(
               "Findings require an agent_review effect and reviewer review step.",
+            );
+          if (command.trigger === "handoff_required" && !exhaustedReviewHandoff)
+            throw new TypeError(
+              "Only an exhausted agent_review may hand off with findings.",
             );
           for (const finding of command.findings) {
             if (finding.expectedRevision !== command.expectedRevision)
@@ -664,6 +676,10 @@ export class WorkflowCoordinator {
             facts: command.facts,
             at,
           });
+        const exhaustedReview =
+          currentEffect.kind === "agent_review" &&
+          command.trigger === "review_needs_repair" &&
+          current.repairRound >= 2;
         const observation: EffectObservation = {
           runId: command.runId,
           expectedRevision: command.expectedRevision,
@@ -672,9 +688,13 @@ export class WorkflowCoordinator {
           evidence: command.evidence,
         };
         if (command.trigger !== undefined)
-          observation.trigger = command.trigger;
+          observation.trigger = exhaustedReview
+            ? "handoff_required"
+            : command.trigger;
         if (command.receipt !== undefined)
           observation.receipt = command.receipt;
+        if (command.requiredAction !== undefined)
+          observation.requiredAction = command.requiredAction;
         const effect = await createEffectMutationRepository(
           tx,
         ).recordEffectObservation(observation, at);
