@@ -427,6 +427,30 @@ describe("coordinator-owned delivery persistence", () => {
     await coordinator.close();
   });
 
+  test.each([
+    ["missing", undefined],
+    ["arbitrary", "fast-forward"],
+  ])("rejects a merge receipt with %s method", async (_label, method) => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { approved } = await approvedMergeEffect(connection, coordinator);
+
+    await expect(
+      coordinator.observeEffect({
+        runId: approved.run.id,
+        expectedRevision: approved.run.revision,
+        effectKey: approved.effect.key,
+        outcome: "confirmed",
+        trigger: "merge_observed",
+        evidence: "The callback reported an unsupported merge method.",
+        receipt: mergeReceipt({ method }),
+        at,
+      }),
+    ).rejects.toThrow(/method|receipt|merge/i);
+    expect(await readRun(connection.db, approved.run.id)).toEqual(approved.run);
+    await coordinator.close();
+  });
+
   test("abandonEffect rejects a null confirmed delivery receipt", async () => {
     const connection = await createDatabase();
     const coordinator = new WorkflowCoordinator({ connection });

@@ -250,6 +250,7 @@ const deliveryEffectKinds = new Set<EffectKind>([
   "project_done",
 ]);
 const deliveryShaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+const deliveryMergeMethods = new Set(["squash", "rebase", "merge"]);
 const maximumDeliveryReceiptBytes = 1024 * 1024;
 const maximumDeliveryTextBytes = 512;
 // A fixed event kind plus structured effect-key details is durable quarantine
@@ -429,6 +430,12 @@ function deliverySha(value: unknown, label: string): string {
   return value;
 }
 
+function deliveryMergeMethod(value: unknown, label: string): string {
+  if (typeof value !== "string" || !deliveryMergeMethods.has(value))
+    throw new TypeError(`${label} is invalid.`);
+  return value;
+}
+
 function deliveryNumber(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0)
     throw new TypeError(`${label} is invalid.`);
@@ -490,6 +497,7 @@ function validateDeliveryObservation(
     const number = deliveryNumber(value.number, "Merge pull request number");
     const issueNumber = deliveryNumber(value.issueNumber, "Merge issue number");
     const nodeId = deliveryText(value.nodeId, "Merge pull request node ID");
+    const method = deliveryMergeMethod(value.method, "Merge method");
     const baseBranch = deliveryText(value.baseBranch, "Merge base branch");
     const base = deliverySha(value.baseSha, "Merge base SHA");
     const headBranch = deliveryText(value.headBranch, "Merge head branch");
@@ -514,8 +522,13 @@ function validateDeliveryObservation(
     const expectedBase = deliverySha(intent.baseSha, "Intent base SHA");
     const expectedHead = deliverySha(intent.headSha, "Intent head SHA");
     const expectedBranch = deliveryText(intent.branch, "Intent branch");
+    const expectedMethod = Object.hasOwn(intent, "method")
+      ? deliveryMergeMethod(intent.method, "Intent merge method")
+      : undefined;
     equalDelivery(repository, run.repository, "Merge repository");
     equalDelivery(number, expectedNumber, "Merge pull request number");
+    if (expectedMethod !== undefined)
+      equalDelivery(method, expectedMethod, "Merge method");
     equalDelivery(issueNumber, run.issueNumber, "Merge issue number");
     equalDelivery(nodeId, expectedNodeId, "Merge pull request node ID");
     equalDelivery(baseBranch, run.baseBranch, "Merge base branch");
