@@ -288,7 +288,7 @@ function inspectTerminalLine(line: string, state: TerminalScanState): void {
     return;
   }
 
-  if (typeof event !== "object" || event === null) {
+  if (typeof event !== "object" || event === null || Array.isArray(event)) {
     return;
   }
 
@@ -298,7 +298,7 @@ function inspectTerminalLine(line: string, state: TerminalScanState): void {
       state.terminal = parseBuilderTerminalResult(event);
       state.terminalCount += 1;
     } catch {
-      // Other untyped JSONL output is progress or diagnostic output.
+      state.malformed = true;
     }
     return;
   }
@@ -306,13 +306,10 @@ function inspectTerminalLine(line: string, state: TerminalScanState): void {
 
   state.terminalCount += 1;
   try {
-    const candidate =
-      "result" in eventRecord
-        ? eventRecord.result
-        : Object.fromEntries(
-            Object.entries(eventRecord).filter(([key]) => key !== "type"),
-          );
-    state.terminal = parseBuilderTerminalResult(candidate);
+    if (!("result" in eventRecord)) {
+      throw new Error("Missing terminal result");
+    }
+    state.terminal = parseBuilderTerminalResult(eventRecord.result);
   } catch {
     state.malformed = true;
   }

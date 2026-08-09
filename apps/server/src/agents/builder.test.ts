@@ -355,9 +355,11 @@ describe("bounded builder process", () => {
         );
         process.stdout.write(JSON.stringify({
           type: "terminal",
-          outcome: "completed",
-          summary: forbidden.length === 0 ? "safe environment" : forbidden.join(","),
-          validation: ["credential environment checked"],
+          result: {
+            outcome: "completed",
+            summary: forbidden.length === 0 ? "safe environment" : forbidden.join(","),
+            validation: ["credential environment checked"],
+          },
         }) + "\\n");
       `);
       const result = await runBuilder(
