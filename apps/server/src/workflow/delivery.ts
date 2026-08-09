@@ -1169,12 +1169,15 @@ function doneRequest(
   run: RunRecord,
   configuration: DeliveryConfiguration,
   effectKeyValue: string,
-): ConditionalProjectDoneMoveRequest {
+): ConditionalProjectDoneMoveRequest & {
+  readonly runId: string;
+  readonly reworkEpoch: number;
+} {
   const error = doneConfigError(configuration);
   if (error !== undefined) throw new Error(error);
   if (!SHA_PATTERN.test(run.mergeSha ?? ""))
     throw new Error("Done projection requires the durable merge SHA.");
-  return assertConditionalProjectDoneMoveRequest({
+  const request = assertConditionalProjectDoneMoveRequest({
     repository: run.repository,
     projectId: configuration.projectId,
     projectNumber: configuration.projectNumber,
@@ -1187,6 +1190,11 @@ function doneRequest(
     effectKey: effectKeyValue,
     mergeSha: run.mergeSha,
   });
+  return {
+    ...request,
+    runId: run.id,
+    reworkEpoch: run.reworkEpoch,
+  };
 }
 
 function assertDoneResult(
@@ -1220,7 +1228,10 @@ export async function executeProjectDoneStage(
   if (input.run.state !== "completing")
     return { kind: "stale", run: input.run };
   const key = effectKey(input.run, "done");
-  let request: ConditionalProjectDoneMoveRequest;
+  let request: ConditionalProjectDoneMoveRequest & {
+    readonly runId: string;
+    readonly reworkEpoch: number;
+  };
   try {
     request = doneRequest(input.run, input.configuration, key);
   } catch (error) {
@@ -1264,10 +1275,15 @@ export async function executeProjectDoneStage(
     return { kind: "stale", run: input.run };
   }
   let item: unknown;
+  const {
+    runId: _runId,
+    reworkEpoch: _reworkEpoch,
+    ...requestForGateway
+  } = request;
   try {
     item = assertDoneResult(
-      await input.gateway.moveProjectItemToDone(request),
-      request,
+      await input.gateway.moveProjectItemToDone(requestForGateway),
+      requestForGateway,
     );
   } catch (error) {
     return failEffect(
@@ -1287,7 +1303,11 @@ export async function executeProjectDoneStage(
       effectKey: key,
       outcome: "confirmed",
       trigger: "done_observed",
-      receipt: { outcome: "moved", item },
+      receipt: {
+        outcome: "moved",
+        mergeSha: requestForGateway.mergeSha,
+        item,
+      },
       evidence: "Project item is conditionally recorded as Done.",
       at: now(),
     });
@@ -1551,14 +1571,23 @@ async function dispatchEffect(
       "toStatus",
       "mergeSha",
     ]);
-    if (intent === undefined)
+    if (
+      intent === undefined ||
+      intent.runId !== effect.runId ||
+      intent.reworkEpoch !== effect.reworkEpoch
+    )
       return {
         outcome: "failed",
         evidence: `Invalid Done intent for ${effect.key}.`,
       };
     try {
+      const {
+        runId: _runId,
+        reworkEpoch: _reworkEpoch,
+        ...requestIntent
+      } = intent;
       const request = assertConditionalProjectDoneMoveRequest({
-        ...intent,
+        ...requestIntent,
         effectKey: effect.key,
       });
       const result = await gateway.moveProjectItemToDone(request);
@@ -1566,7 +1595,11 @@ async function dispatchEffect(
       return {
         outcome: "confirmed",
         trigger: "done_observed",
-        receipt: { outcome: result.outcome, item },
+        receipt: {
+          outcome: result.outcome,
+          mergeSha: request.mergeSha,
+          item,
+        },
         evidence: `Done projection ${effect.key} confirmed.`,
       };
     } catch {
@@ -1663,15 +1696,24 @@ async function observeEffect(
       "toStatus",
       "mergeSha",
     ]);
-    if (intent === undefined)
+    if (
+      intent === undefined ||
+      intent.runId !== effect.runId ||
+      intent.reworkEpoch !== effect.reworkEpoch
+    )
       return {
         outcome: "failed",
         trigger: "delivery_failed",
         evidence: `Invalid Done intent ${effect.key}.`,
       };
     try {
+      const {
+        runId: _runId,
+        reworkEpoch: _reworkEpoch,
+        ...requestIntent
+      } = intent;
       const request = assertConditionalProjectDoneMoveRequest({
-        ...intent,
+        ...requestIntent,
         effectKey: effect.key,
       });
       const item = assertDoneResult(
@@ -1681,7 +1723,11 @@ async function observeEffect(
       return {
         outcome: "confirmed",
         trigger: "reconciled_done",
-        receipt: { outcome: "already_applied", item },
+        receipt: {
+          outcome: "already_applied",
+          mergeSha: request.mergeSha,
+          item,
+        },
         evidence: `Done ${effect.key} reconciled.`,
       };
     } catch {

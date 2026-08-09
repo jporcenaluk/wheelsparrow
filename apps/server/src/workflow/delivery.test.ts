@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { FakeGitHubDeliveryGateway } from "../../../../tests/fakes/github.js";
 import { openDatabase } from "../database/connection.js";
 import type { EffectRecord } from "../database/effects.js";
+import { listUnresolvedForReconciliation } from "../database/effects.js";
 import { migrateDatabase } from "../database/migrate.js";
 import { createRunMutationRepository, readRun } from "../database/runs.js";
 import type {
@@ -207,6 +208,80 @@ function deployment(sha: string): StagingDeploymentReceipt {
     deployedSha: sha,
     state: "success",
   };
+}
+
+async function reachSmoked() {
+  const connection = await createDatabase();
+  const gateway = new FakeGitHubDeliveryGateway({
+    repository: "octo/widget",
+    requiredChecks: ["test"],
+    staging: { workflow: "deploy-staging.yml", environment: "staging" },
+  });
+  gateway.seedProjectItem({
+    projectItemId: "PVTI_1",
+    projectId: "PVT_1",
+    projectNumber: 2,
+    repository: "octo/widget",
+    issueNodeId: "I_42",
+    issueNumber: 42,
+    isOpen: true,
+    status: "Review",
+    revision: "revision-1",
+    labels: [],
+    createdAt: at,
+    dependencies: [],
+  });
+  gateway.seedPullRequest(candidate());
+  const coordinator = new WorkflowCoordinator({ connection });
+  const review = await enterReview(connection, coordinator);
+  const approval = await coordinator.approveMerge({
+    runId: review.id,
+    expectedRevision: review.revision,
+    operator: "operator@example.test",
+    approvedHeadSha: headSha,
+    observedBaseSha: baseSha,
+    dispatch: false,
+    at,
+  });
+  const merged = await executeMergeStage({
+    coordinator,
+    gateway,
+    run: approval.run,
+    configuration: deliveryConfiguration(),
+    now: () => at,
+  });
+  if (merged.kind !== "merged") throw new Error("merge did not complete");
+  gateway.setWorkflowRun(stagingRun(merged.merge.mergeSha));
+  gateway.setDeployment(deployment(merged.merge.mergeSha));
+  const staged = await executeStagingStage({
+    coordinator,
+    gateway,
+    run: merged.run,
+    configuration: deliveryConfiguration(),
+    now: () => at,
+  });
+  if (staged.kind !== "staged") throw new Error("staging did not complete");
+  const smoked = await executeSmokeStage({
+    coordinator,
+    run: staged.run,
+    configuration: deliveryConfiguration(),
+    smokeRunner: {
+      run: async () => ({
+        outcome: "passed" as const,
+        exitCode: 0,
+        durationMs: 2,
+        output: "ok",
+      }),
+    },
+    now: () => at,
+  });
+  if (smoked.kind !== "smoked") throw new Error("smoke did not complete");
+  const unresolved = await listUnresolvedForReconciliation(connection.db);
+  const doneEffect = unresolved.find(
+    ({ effect }) => effect.key === smoked.doneEffectKey,
+  );
+  if (doneEffect === undefined) throw new Error("Done effect is missing");
+  return { connection, gateway, coordinator, smoked, doneEffect };
 }
 
 afterEach(async () => {
@@ -730,5 +805,135 @@ describe("coordinator-owned delivery stages", () => {
     await expect(malformed.dispatcher(effect)).resolves.toMatchObject({
       outcome: "ambiguous",
     });
+  });
+
+  test("direct Done confirmation satisfies strict coordinator receipt binding", async () => {
+    const fixture = await reachSmoked();
+    const result = await executeProjectDoneStage({
+      coordinator: fixture.coordinator,
+      gateway: fixture.gateway,
+      run: fixture.smoked.run,
+      configuration: deliveryConfiguration(),
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "done", run: { state: "done" } });
+    expect(JSON.parse(fixture.doneEffect.effect.intent)).toMatchObject({
+      runId: fixture.smoked.run.id,
+      reworkEpoch: fixture.smoked.run.reworkEpoch,
+    });
+    const effect = await fixture.connection.db
+      .selectFrom("side_effects")
+      .select(["status", "receipt_json"])
+      .where("key", "=", fixture.smoked.doneEffectKey)
+      .executeTakeFirstOrThrow();
+    expect(effect.status).toBe("confirmed");
+    expect(JSON.parse(effect.receipt_json ?? "null")).toMatchObject({
+      outcome: "moved",
+      mergeSha,
+    });
+    await fixture.coordinator.close();
+  });
+
+  test("dispatcher Done confirmation satisfies strict coordinator receipt binding", async () => {
+    const fixture = await reachSmoked();
+    await fixture.coordinator.close();
+    const capability = createDeliveryCapability(
+      fixture.gateway,
+      deliveryConfiguration(),
+      {
+        run: async () => ({
+          outcome: "passed" as const,
+          exitCode: 0,
+          durationMs: 1,
+        }),
+      },
+    );
+    const restarted = new WorkflowCoordinator({
+      connection: fixture.connection,
+      dispatcher: capability.dispatcher,
+    });
+    const settlement = restarted.waitForEffectSettlement(
+      fixture.doneEffect.effect.key,
+      1_000,
+    );
+    await restarted.beginEffect({
+      effectKey: fixture.doneEffect.effect.key,
+      expectedRevision: fixture.smoked.run.revision,
+      at,
+    });
+    const effect = await settlement;
+    expect(effect.status).toBe("confirmed");
+    expect(JSON.parse(effect.receipt ?? "null")).toMatchObject({
+      outcome: "moved",
+      mergeSha,
+    });
+    expect(
+      await readRun(fixture.connection.db, fixture.smoked.run.id),
+    ).toMatchObject({
+      state: "done",
+    });
+    await restarted.close();
+  });
+
+  test("restart reconciliation Done confirmation satisfies strict coordinator receipt binding", async () => {
+    const fixture = await reachSmoked();
+    await fixture.coordinator.beginEffect({
+      effectKey: fixture.doneEffect.effect.key,
+      expectedRevision: fixture.smoked.run.revision,
+      at,
+    });
+    await fixture.coordinator.close();
+    const capability = createDeliveryCapability(
+      fixture.gateway,
+      deliveryConfiguration(),
+      {
+        run: async () => ({
+          outcome: "passed" as const,
+          exitCode: 0,
+          durationMs: 1,
+        }),
+      },
+    );
+    const restarted = new WorkflowCoordinator({
+      connection: fixture.connection,
+      observer: capability.observer,
+    });
+    const current = await readRun(fixture.connection.db, fixture.smoked.run.id);
+    const settlement = restarted.waitForEffectSettlement(
+      fixture.doneEffect.effect.key,
+      1_000,
+    );
+    await restarted.observeAmbiguousEffect({
+      effectKey: fixture.doneEffect.effect.key,
+      expectedRevision: current.revision,
+    });
+    const effect = await settlement;
+    expect(effect.status).toBe("confirmed");
+    expect(JSON.parse(effect.receipt ?? "null")).toMatchObject({
+      outcome: "already_applied",
+      mergeSha,
+    });
+    expect(
+      await readRun(fixture.connection.db, fixture.smoked.run.id),
+    ).toMatchObject({
+      state: "done",
+    });
+    await restarted.close();
+  });
+
+  test("Done projection rejects a missing durable merge SHA", async () => {
+    const fixture = await reachSmoked();
+    const result = await executeProjectDoneStage({
+      coordinator: fixture.coordinator,
+      gateway: fixture.gateway,
+      run: { ...fixture.smoked.run, mergeSha: null },
+      configuration: deliveryConfiguration(),
+      now: () => at,
+    });
+
+    expect(result.kind).toBe("human");
+    expect(fixture.gateway.doneMutations()).toHaveLength(0);
+    await fixture.coordinator.close();
   });
 });
