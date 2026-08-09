@@ -39,6 +39,7 @@ const PROJECT_PAGE_QUERY = `
                 labels(first: 100) { nodes { name } }
                 blockedBy(first: 100) {
                   nodes { ... on Issue { id number state } }
+                  pageInfo { hasNextPage endCursor }
                 }
               }
             }
@@ -236,10 +237,18 @@ function parseProjectItem(
 
   const blockedByContainer = content.blockedBy;
   let dependencies: ProjectItem["dependencies"];
+  const blockedByPageInfo = isRecord(blockedByContainer)
+    ? blockedByContainer.pageInfo
+    : undefined;
   if (
     !isRecord(blockedByContainer) ||
-    array(blockedByContainer.nodes) === undefined
+    array(blockedByContainer.nodes) === undefined ||
+    !isRecord(blockedByPageInfo) ||
+    typeof blockedByPageInfo.hasNextPage !== "boolean" ||
+    blockedByPageInfo.hasNextPage
   ) {
+    // A Project dependency connection that is truncated or does not expose
+    // pagination metadata cannot prove that every blocker is closed.
     dependencies = "unavailable";
   } else {
     const dependencyNodes = blockedByContainer.nodes as readonly unknown[];

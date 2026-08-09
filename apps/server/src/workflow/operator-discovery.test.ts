@@ -78,6 +78,57 @@ function snapshot(): ProjectSnapshot {
   };
 }
 
+function prioritySnapshot(): ProjectSnapshot {
+  const base = {
+    projectId: "PVT_1",
+    projectNumber: 1,
+    repository: "owner/repository",
+  } as const;
+  return {
+    ...base,
+    items: [
+      {
+        projectItemId: "PVTI_priority_late",
+        ...base,
+        issueNodeId: "I_priority_late",
+        issueNumber: 99,
+        isOpen: true,
+        status: "Ready",
+        revision: "revision-priority-late",
+        labels: ["mvp"],
+        createdAt: "2026-08-08T12:00:00.000Z",
+        priorityRank: 1,
+        dependencies: [],
+      },
+      {
+        projectItemId: "PVTI_priority_early",
+        ...base,
+        issueNodeId: "I_priority_early",
+        issueNumber: 1,
+        isOpen: true,
+        status: "Ready",
+        revision: "revision-priority-early",
+        labels: ["mvp"],
+        createdAt: "2026-08-08T08:00:00.000Z",
+        priorityRank: 2,
+        dependencies: [],
+      },
+      {
+        projectItemId: "PVTI_no_priority",
+        ...base,
+        issueNodeId: "I_no_priority",
+        issueNumber: 2,
+        isOpen: true,
+        status: "Ready",
+        revision: "revision-no-priority",
+        labels: ["mvp"],
+        createdAt: "2026-08-08T07:00:00.000Z",
+        dependencies: [],
+      },
+    ],
+  };
+}
+
 async function database(): Promise<DatabaseConnection> {
   const directory = await mkdtemp(
     join(tmpdir(), "wheelsparrow-operator-discovery-"),
@@ -103,6 +154,24 @@ afterEach(async () => {
 });
 
 describe("operator Ready discovery", () => {
+  test("preserves selector priority ordering instead of sorting Ready items by issue number", async () => {
+    const connection = await database();
+    const gateway = {
+      async readConfiguredProject() {
+        return prioritySnapshot();
+      },
+    };
+
+    const queue = await discoverReadyQueue({
+      connection,
+      gateway,
+      configuration,
+      now: () => "2026-08-09T10:00:00.000Z",
+    });
+
+    expect(queue.map((item) => item.issue_number)).toEqual([99, 1, 2]);
+  });
+
   test("returns truthful eligible and blocked Ready items from the configured gateway", async () => {
     const connection = await database();
     const gateway = {

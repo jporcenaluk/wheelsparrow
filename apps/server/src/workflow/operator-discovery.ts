@@ -143,6 +143,30 @@ function inConfiguredReadyScope(
   );
 }
 
+function compareReadyItems(left: ProjectItem, right: ProjectItem): number {
+  if (left.priorityRank === undefined && right.priorityRank !== undefined)
+    return 1;
+  if (left.priorityRank !== undefined && right.priorityRank === undefined)
+    return -1;
+  if (
+    left.priorityRank !== undefined &&
+    right.priorityRank !== undefined &&
+    left.priorityRank !== right.priorityRank
+  ) {
+    return left.priorityRank - right.priorityRank;
+  }
+  if (left.createdAt !== right.createdAt) {
+    return left.createdAt < right.createdAt ? -1 : 1;
+  }
+  if (left.issueNumber !== right.issueNumber) {
+    return left.issueNumber - right.issueNumber;
+  }
+  return Buffer.compare(
+    Buffer.from(left.projectItemId, "utf8"),
+    Buffer.from(right.projectItemId, "utf8"),
+  );
+}
+
 function resultReason(
   result: DiscoveryResult,
   item: ProjectItem,
@@ -179,20 +203,16 @@ export async function discoverReadyQueue(
     ownedProjectItemIds,
   });
   const now = input.now?.() ?? new Date().toISOString();
-  const readyItems = snapshot.items.filter((item) =>
-    inConfiguredReadyScope(item, snapshot, input.configuration),
-  );
-  return readyItems
-    .map((item) =>
-      queueRun(
-        item,
-        now,
-        result.eligible.includes(item) ? null : resultReason(result, item),
-      ),
+  const readyItems = snapshot.items
+    .filter((item) =>
+      inConfiguredReadyScope(item, snapshot, input.configuration),
     )
-    .toSorted(
-      (left, right) =>
-        left.issue_number - right.issue_number ||
-        left.run_id.localeCompare(right.run_id),
-    );
+    .toSorted(compareReadyItems);
+  return readyItems.map((item) =>
+    queueRun(
+      item,
+      now,
+      result.eligible.includes(item) ? null : resultReason(result, item),
+    ),
+  );
 }

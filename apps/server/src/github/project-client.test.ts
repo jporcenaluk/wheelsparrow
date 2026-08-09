@@ -41,7 +41,13 @@ function projectPage() {
                 createdAt: "2026-08-08T10:00:00Z",
                 repository: { nameWithOwner: "octo/widget" },
                 labels: { nodes: [{ name: "mvp" }] },
-                blockedBy: { nodes: [] },
+                blockedBy: {
+                  nodes: [],
+                  pageInfo: {
+                    hasNextPage: false,
+                    endCursor: null as string | null,
+                  },
+                },
               },
               fieldValues: {
                 nodes: [
@@ -86,6 +92,10 @@ function projectPage() {
                 labels: { nodes: [{ name: "mvp" }] },
                 blockedBy: {
                   nodes: [{ id: "I_dep", number: 13, state: "OPEN" }],
+                  pageInfo: {
+                    hasNextPage: false,
+                    endCursor: null as string | null,
+                  },
                 },
               },
               fieldValues: {
@@ -202,5 +212,35 @@ describe("configured GitHub Project client", () => {
     await expect(client.readConfiguredProject()).rejects.toBeInstanceOf(
       GitHubProjectResponseError,
     );
+  });
+
+  test("marks dependencies unavailable when the blockedBy page is truncated", async () => {
+    const page = projectPage();
+    const blocked = page.data.node.items.nodes[1];
+    if (blocked === undefined) throw new Error("blocked fixture is missing");
+    blocked.content.blockedBy = {
+      nodes: Array.from({ length: 100 }, (_, index) => ({
+        id: `I_closed_${index}`,
+        number: index + 100,
+        state: "CLOSED",
+      })),
+      pageInfo: { hasNextPage: true, endCursor: "cursor:100" },
+    };
+    const client = new GitHubProjectClient({
+      ...configuration,
+      token: "test-token",
+      fetch: async (_input, init) =>
+        String(init?.body).includes("projectId")
+          ? response(page)
+          : response({
+              data: {
+                user: { projectV2: { id: "PVT_7" } },
+                organization: null,
+              },
+            }),
+    });
+
+    const snapshot = await client.readConfiguredProject();
+    expect(snapshot.items[1]?.dependencies).toBe("unavailable");
   });
 });
