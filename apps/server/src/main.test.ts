@@ -1,12 +1,19 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Configuration } from "@wheelsparrow/contracts";
 import { afterEach, describe, expect, test } from "vitest";
+import { FakeGitHubDeliveryGateway } from "../../../tests/fakes/github.js";
 import type { LocalPaths } from "./config.js";
 import type { DatabaseConnection } from "./database/connection.js";
+import { openDatabase } from "./database/connection.js";
+import { migrateDatabase } from "./database/migrate.js";
+import { createRunMutationRepository, readRun } from "./database/runs.js";
+import type { MergeCandidateReceipt } from "./github/delivery.js";
 import { GitHubCredentialsUnavailableError } from "./github/project-client.js";
 import {
+  createProductionCoordinator,
   createProductionReadyDiscovery,
   parsePort,
   type RunningService,
@@ -17,6 +24,7 @@ import {
 } from "./main.js";
 
 const temporaryDirectories: string[] = [];
+const temporaryConnections: ReturnType<typeof openDatabase>[] = [];
 
 const productionConfiguration: Configuration = {
   github: {
@@ -46,11 +54,162 @@ const productionConfiguration: Configuration = {
 
 afterEach(async () => {
   await Promise.all(
+    temporaryConnections.splice(0).map((connection) => connection.close()),
+  );
+  await Promise.all(
     temporaryDirectories
       .splice(0)
       .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
+
+const migrationSource = fileURLToPath(
+  new URL("../../../migrations", import.meta.url),
+);
+
+async function createMainCompositionDatabase(): Promise<
+  ReturnType<typeof openDatabase>
+> {
+  const directory = await mkdtemp(join(tmpdir(), "wheelsparrow-main-compose-"));
+  temporaryDirectories.push(directory);
+  const migrationsDirectory = join(directory, "migrations");
+  await cp(migrationSource, migrationsDirectory, { recursive: true });
+  const connection = openDatabase(join(directory, "wheelsparrow.sqlite3"));
+  migrateDatabase(connection, migrationsDirectory);
+  temporaryConnections.push(connection);
+  return connection;
+}
+
+const mergeBaseSha = "a".repeat(40);
+const mergeHeadSha = "b".repeat(40);
+
+function mergeCandidate(): MergeCandidateReceipt {
+  return {
+    repository: "owner/repository",
+    number: 7,
+    issueNumber: 42,
+    nodeId: "PR_node_7",
+    isDraft: false,
+    title: "Merge the exact approved candidate",
+    baseBranch: "main",
+    baseSha: mergeBaseSha,
+    headBranch: "ticket/42",
+    headSha: mergeHeadSha,
+    requiredChecks: {
+      repository: "owner/repository",
+      number: 7,
+      nodeId: "PR_node_7",
+      headSha: mergeHeadSha,
+      requiredCheckNames: ["test"],
+      requiredChecks: [{ name: "test", state: "success" }],
+      headDrift: false,
+      aggregate: "green",
+    },
+    threads: [],
+    mergeability: "mergeable",
+    permittedMergeMethods: ["squash"],
+  };
+}
+
+async function enterCompositionReview(
+  connection: ReturnType<typeof openDatabase>,
+  coordinator: {
+    createClaim: (input: {
+      id: string;
+      repository: string;
+      projectItemId: string;
+      issueNodeId: string;
+      issueNumber: number;
+      ownerToken: string;
+      at: string;
+      summary: { text: string };
+    }) => Promise<unknown>;
+    transition: (request: {
+      runId: string;
+      expectedRevision: number;
+      trigger:
+        | "todo_observed"
+        | "workspace_prepared"
+        | "intake_captured"
+        | "builder_succeeded"
+        | "verification_passed"
+        | "review_approved"
+        | "pr_observed"
+        | "ci_passed";
+      at: string;
+      summary: { text: string };
+    }) => Promise<unknown>;
+  },
+) {
+  const runId = "main-composition-run";
+  const at = "2026-08-10T10:00:00.000Z";
+  await coordinator.createClaim({
+    id: runId,
+    repository: "owner/repository",
+    projectItemId: "PVTI_42",
+    issueNodeId: "I_42",
+    issueNumber: 42,
+    ownerToken: "main-composition-owner",
+    at,
+    summary: { text: "Composition test run." },
+  });
+  let run = await readRun(connection.db, runId);
+  run = await connection.db.transaction().execute((tx) =>
+    createRunMutationRepository(tx).updateExecutionFacts({
+      runId,
+      expectedRevision: run.revision,
+      facts: {
+        worktreePath: "/safe/worktree",
+        baseSha: mergeBaseSha,
+        branch: "ticket/42",
+        headSha: mergeHeadSha,
+      },
+      at,
+    }),
+  );
+  run = await connection.db.transaction().execute((tx) =>
+    createRunMutationRepository(tx).updatePublicationFacts({
+      runId,
+      expectedRevision: run.revision,
+      facts: {
+        pullRequestNumber: 7,
+        pullRequestNodeId: "PR_node_7",
+        pullRequestTitle: mergeCandidate().title,
+        pullRequestUrl: "https://github.com/owner/repository/pull/7",
+        baseSha: mergeBaseSha,
+        headSha: mergeHeadSha,
+        branch: "ticket/42",
+      },
+      at,
+    }),
+  );
+  for (const trigger of [
+    "todo_observed",
+    "workspace_prepared",
+    "intake_captured",
+    "builder_succeeded",
+    "verification_passed",
+    "review_approved",
+  ] as const) {
+    run = (await coordinator.transition({
+      runId,
+      expectedRevision: run.revision,
+      trigger,
+      at,
+      summary: { text: `${trigger}.` },
+    })) as typeof run;
+  }
+  for (const trigger of ["pr_observed", "ci_passed"] as const) {
+    run = (await coordinator.transition({
+      runId,
+      expectedRevision: run.revision,
+      trigger,
+      at,
+      summary: { text: `${trigger}.` },
+    })) as typeof run;
+  }
+  return run;
+}
 
 function localPaths(repositoryRoot = "/repository"): LocalPaths {
   const dataRoot = join(repositoryRoot, ".wheelsparrow");
@@ -221,6 +380,62 @@ function lifecycleFakes({
 }
 
 describe("start", () => {
+  test("composes production delivery adapters that dispatch an approved merge to the gateway", async () => {
+    const connection = await createMainCompositionDatabase();
+    const gateway = new FakeGitHubDeliveryGateway({
+      repository: "owner/repository",
+      requiredChecks: ["test"],
+      staging: {
+        workflow: productionConfiguration.staging.workflow,
+        environment: productionConfiguration.staging.environment,
+      },
+    });
+    gateway.seedPullRequest(mergeCandidate());
+    const coordinator = createProductionCoordinator(
+      connection,
+      productionConfiguration,
+      {
+        deliveryGateway: gateway,
+        smokeRunner: {
+          run: async () => {
+            throw new Error("smoke must not run during merge dispatch");
+          },
+        },
+      },
+    );
+
+    try {
+      const review = await enterCompositionReview(connection, coordinator);
+      const approval = await coordinator.approveMerge({
+        runId: review.id,
+        expectedRevision: review.revision,
+        operator: "operator@example.test",
+        approvedHeadSha: mergeHeadSha,
+        observedBaseSha: mergeBaseSha,
+        dispatch: false,
+        at: "2026-08-10T10:00:00.000Z",
+      });
+      const settled = coordinator.waitForEffectSettlement(
+        approval.effect.key,
+        1_000,
+      );
+      await coordinator.beginEffect({
+        effectKey: approval.effect.key,
+        expectedRevision: approval.run.revision,
+        at: "2026-08-10T10:00:00.000Z",
+      });
+
+      const effect = await settled;
+      expect(effect.status).toBe("confirmed");
+      expect(gateway.mergeMutations()).toHaveLength(1);
+      expect(gateway.mergeMutations()[0]?.request.expectedHeadSha).toBe(
+        mergeHeadSha,
+      );
+    } finally {
+      await coordinator.close();
+    }
+  });
+
   test("composes a credential-backed discovery callback that fails closed without credentials", async () => {
     let fetchCalls = 0;
     const discoverReady = createProductionReadyDiscovery({
