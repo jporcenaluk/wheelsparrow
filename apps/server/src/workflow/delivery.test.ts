@@ -419,6 +419,45 @@ describe("coordinator-owned delivery stages", () => {
     await coordinator.close();
   });
 
+  test("definite merge prevention is failed rather than quarantined as ambiguous", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubDeliveryGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+      staging: { workflow: "deploy-staging.yml", environment: "staging" },
+    });
+    gateway.seedPullRequest(candidate());
+    gateway.setMergeFailure("merge_prevented");
+    const coordinator = new WorkflowCoordinator({ connection });
+    const review = await enterReview(connection, coordinator);
+    const approval = await coordinator.approveMerge({
+      runId: review.id,
+      expectedRevision: review.revision,
+      operator: "operator@example.test",
+      approvedHeadSha: headSha,
+      observedBaseSha: baseSha,
+      dispatch: false,
+      at,
+    });
+
+    const result = await executeMergeStage({
+      coordinator,
+      gateway,
+      run: approval.run,
+      configuration: deliveryConfiguration(),
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    const effect = await connection.db
+      .selectFrom("side_effects")
+      .select("status")
+      .where("key", "=", approval.effect.key)
+      .executeTakeFirstOrThrow();
+    expect(effect.status).toBe("failed");
+    await coordinator.close();
+  });
+
   test("staging SHA mismatch returns Review and retry never calls merge", async () => {
     const connection = await createDatabase();
     const gateway = new FakeGitHubDeliveryGateway({
@@ -652,6 +691,39 @@ describe("coordinator-owned delivery stages", () => {
     });
     expect(gateway.mergeMutations()).toHaveLength(1);
     await restarted.close();
+  });
+
+  test("startup dispatch reports a definite merge prevention as failed", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubDeliveryGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+      staging: { workflow: "deploy-staging.yml", environment: "staging" },
+    });
+    gateway.seedPullRequest(candidate());
+    gateway.setMergeFailure("merge_prevented");
+    const coordinator = new WorkflowCoordinator({ connection });
+    const review = await enterReview(connection, coordinator);
+    const approval = await coordinator.approveMerge({
+      runId: review.id,
+      expectedRevision: review.revision,
+      operator: "operator@example.test",
+      approvedHeadSha: headSha,
+      observedBaseSha: baseSha,
+      dispatch: false,
+      at,
+    });
+    const capability = createDeliveryCapability(
+      gateway,
+      deliveryConfiguration(),
+      { run: async () => ({ outcome: "passed" as const }) },
+      { resolveRun: () => approval.run },
+    );
+
+    await expect(
+      dispatchCapability(capability, approval.effect),
+    ).resolves.toMatchObject({ outcome: "failed", trigger: "delivery_failed" });
+    await coordinator.close();
   });
 
   test("requires a durable run resolver for restart delivery capabilities", () => {

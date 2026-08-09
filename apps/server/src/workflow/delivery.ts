@@ -11,6 +11,7 @@ import {
   assertObserveStagingRequest,
   assertStagingObservation,
   type ConditionalProjectDoneMoveRequest,
+  GitHubDeliveryBoundaryError,
   type GitHubDeliveryGateway,
   type MergeCandidateReceipt,
   type MergeCandidateRequest,
@@ -240,6 +241,15 @@ function isStale(error: unknown): boolean {
 
 function isAmbiguous(error: unknown): boolean {
   return isRecord(error) && error.kind === "merge_ambiguous";
+}
+
+/** A boundary response can prove that GitHub refused the mutation. */
+function isDefinitiveMergeFailure(error: unknown): boolean {
+  return (
+    (error instanceof GitHubDeliveryBoundaryError &&
+      error.kind !== "merge_ambiguous") ||
+    (isRecord(error) && error.kind === "merge_prevented")
+  );
 }
 
 function parseArgv(command: string): string[] {
@@ -724,7 +734,10 @@ export async function executeMergeStage(
     verifyMergeReceipt(receipt, candidateRequest, method);
     merged = receipt;
   } catch (error) {
-    if (mutationAttempted || isAmbiguous(error))
+    if (
+      (mutationAttempted && !isDefinitiveMergeFailure(error)) ||
+      isAmbiguous(error)
+    )
       return failEffect(
         input.coordinator,
         input.run,
@@ -1459,7 +1472,10 @@ async function dispatchEffect(
         evidence: `Merge ${effect.key} confirmed.`,
       };
     } catch (error) {
-      if (mutationAttempted || isAmbiguous(error))
+      if (
+        (mutationAttempted && !isDefinitiveMergeFailure(error)) ||
+        isAmbiguous(error)
+      )
         return {
           outcome: "ambiguous",
           evidence: `Merge ${effect.key} is ambiguous and requires reconciliation; it will not be retried.`,
