@@ -535,16 +535,14 @@ describe("operator routes", () => {
       schema_version: 1,
       error: { code: "capability_unavailable" },
     });
-    expect(
-      connection.native
-        .prepare("SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ?")
-        .get("run-retry").count,
-    ).toBe(0);
-    expect(
-      connection.native
-        .prepare("SELECT state FROM runs WHERE id = ?")
-        .get("run-retry").state,
-    ).toBe("review");
+    const effectCount = connection.native
+      .prepare("SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ?")
+      .get("run-retry") as { count: number };
+    const run = connection.native
+      .prepare("SELECT state FROM runs WHERE id = ?")
+      .get("run-retry") as { state: string };
+    expect(effectCount.count).toBe(0);
+    expect(run.state).toBe("review");
   });
 
   test("requires CSRF and same-origin for SSE connections", async () => {

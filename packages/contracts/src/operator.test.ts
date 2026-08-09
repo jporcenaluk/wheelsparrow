@@ -2,9 +2,13 @@ import { Value } from "typebox/value";
 import { describe, expect, test } from "vitest";
 
 import {
+  ApproveMergeRequestSchema,
+  ApproveMergeResponseSchema,
   ConfigurationResponseSchema,
   OperatorEventSchema,
   OperatorFindingSchema,
+  OperatorMergeEffectSchema,
+  OperatorMergeIntentSchema,
   OperatorRunDetailSchema,
   OperatorStepSchema,
   QueueResponseSchema,
@@ -39,6 +43,86 @@ const scheduler = {
 };
 
 describe("operator contracts", () => {
+  test("accepts exact-SHA merge approval and redacted effect summaries", () => {
+    expect(
+      Value.Check(ApproveMergeRequestSchema, {
+        schema_version: 1,
+        expected_run_revision: 4,
+        approved_head_sha: "b".repeat(40),
+        approved_base_sha: "a".repeat(40),
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(OperatorMergeIntentSchema, {
+        repository: "owner/repo",
+        pull_request_number: 7,
+        pull_request_url: "https://github.com/owner/repo/pull/7",
+        branch: "codex/run-1",
+        base_sha: "a".repeat(40),
+        head_sha: "b".repeat(40),
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(OperatorMergeEffectSchema, {
+        key: "run:run-1:rework:0:merge",
+        kind: "merge",
+        target_revision: 5,
+        status: "pending",
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(ApproveMergeRequestSchema, {
+        schema_version: 1,
+        expected_run_revision: 4,
+        approved_head_sha: "not-a-sha",
+        approved_base_sha: "a".repeat(40),
+      }),
+    ).toBe(false);
+    expect(
+      Value.Check(ApproveMergeResponseSchema, {
+        schema_version: 1,
+        run: {
+          ...queueRun,
+          state: "merging",
+          revision: 5,
+          base_branch: "main",
+          base_sha: "a".repeat(40),
+          head_sha: "b".repeat(40),
+          observed_base_sha: "a".repeat(40),
+          merge_sha: null,
+          worktree_path: null,
+          stop_requested_at: null,
+          started_at: null,
+          handed_off_at: null,
+          terminal_at: null,
+        },
+        approval: {
+          id: "approval-1",
+          operator: "operator",
+          approved_head_sha: "b".repeat(40),
+          observed_base_sha: "a".repeat(40),
+          decision: "approved",
+          invalidation_reason: null,
+          created_at: "2026-08-09T10:00:00.000Z",
+        },
+        effect: {
+          key: "run:run-1:rework:0:merge",
+          kind: "merge",
+          target_revision: 5,
+          status: "pending",
+        },
+        merge_intent: {
+          repository: "owner/repo",
+          pull_request_number: 7,
+          pull_request_url: "https://github.com/owner/repo/pull/7",
+          branch: "codex/run-1",
+          base_sha: "a".repeat(40),
+          head_sha: "b".repeat(40),
+        },
+      }),
+    ).toBe(true);
+  });
+
   test("accepts a versioned redacted queue snapshot", () => {
     expect(
       Value.Check(QueueResponseSchema, {
