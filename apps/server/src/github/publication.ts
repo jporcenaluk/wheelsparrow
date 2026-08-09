@@ -217,6 +217,7 @@ function canonicalPullRequestUrl(
     return false;
   }
   return (
+    value === canonical &&
     parsed.protocol === "https:" &&
     parsed.hostname === "github.com" &&
     parsed.port === "" &&

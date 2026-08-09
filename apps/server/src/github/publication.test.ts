@@ -321,6 +321,23 @@ describe("GitHub publication gateway seam", () => {
     ["URL query", { url: "https://github.com/octo/widget/pull/1?x=1" }],
     ["URL fragment", { url: "https://github.com/octo/widget/pull/1#x" }],
     ["URL userinfo", { url: "https://user@github.com/octo/widget/pull/1" }],
+    ["URL default port", { url: "https://github.com:443/octo/widget/pull/1" }],
+    [
+      "URL leading whitespace",
+      { url: " https://github.com/octo/widget/pull/1" },
+    ],
+    [
+      "URL trailing whitespace",
+      { url: "https://github.com/octo/widget/pull/1 " },
+    ],
+    [
+      "URL embedded newline",
+      { url: "https://github.com/octo/\nwidget/pull/1" },
+    ],
+    [
+      "URL trailing newline",
+      { url: "https://github.com/octo/widget/pull/1\n" },
+    ],
     [
       "URL path delimiter",
       { url: "https://github.com/octo/widget/pull/1/extra" },
