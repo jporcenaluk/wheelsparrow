@@ -691,29 +691,15 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
     );
     const workflowRuns = records(record(workflow)?.workflow_runs);
     if (workflowRuns === undefined) this.#invalid();
-    const matchingWorkflowRuns = workflowRuns
+    const workflowRun = workflowRuns
       .filter((run) => {
         const path = text(run.path) ?? text(run.name);
         return (
           path !== undefined &&
-          (path === expected.workflow ||
-            path.endsWith(`/${expected.workflow}`)) &&
-          run.head_sha === expected.mergeSha
+          (path === expected.workflow || path.endsWith(`/${expected.workflow}`))
         );
       })
       .sort(providerRecency)[0];
-    const workflowRun =
-      matchingWorkflowRuns ??
-      workflowRuns
-        .filter((run) => {
-          const path = text(run.path) ?? text(run.name);
-          return (
-            path !== undefined &&
-            (path === expected.workflow ||
-              path.endsWith(`/${expected.workflow}`))
-          );
-        })
-        .sort(providerRecency)[0];
     const workflowReceipt =
       workflowRun === undefined
         ? undefined

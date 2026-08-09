@@ -486,6 +486,47 @@ describe("GitHubDeliveryClient", () => {
     });
   });
 
+  test("chooses the latest configured workflow even when its SHA drifted", async () => {
+    const driftedSha = "d".repeat(40);
+    const gateway = client(async (input) => {
+      const url = new URL(input.toString());
+      if (url.pathname.includes("/actions/workflows/")) {
+        return response({
+          workflow_runs: [
+            {
+              id: 1,
+              path: ".github/workflows/deploy.yml",
+              head_sha: mergeSha,
+              status: "completed",
+              conclusion: "success",
+              created_at: "2026-08-09T10:00:00Z",
+            },
+            {
+              id: 2,
+              path: ".github/workflows/deploy.yml",
+              head_sha: driftedSha,
+              status: "completed",
+              conclusion: "success",
+              created_at: "2026-08-09T11:00:00Z",
+            },
+          ],
+        });
+      }
+      return response([]);
+    });
+    await expect(
+      gateway.observeStaging({
+        repository,
+        workflow: "deploy.yml",
+        environment: "staging",
+        mergeSha,
+      }),
+    ).resolves.toMatchObject({
+      outcome: "sha_mismatch",
+      workflowRun: { id: "2", headSha: driftedSha },
+    });
+  });
+
   test("fails closed for an arbitrary endpoint override", () => {
     expect(
       () =>
