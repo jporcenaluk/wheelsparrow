@@ -283,6 +283,42 @@ describe("contained Git worktree boundary", () => {
     ).rejects.toThrow(/changed|symbolic|symlink|outside/u);
   });
 
+  test("rejects an assigned worktree with unrelated history before reading its diff", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await runGit(prepared.path, "checkout", "--orphan", "unrelated-history");
+    await writeFile(join(prepared.path, "README.md"), "unrelated\n", "utf8");
+    await runGit(prepared.path, "add", "README.md");
+    await runGit(prepared.path, "commit", "-m", "unrelated history");
+    const unrelatedHead = await runGit(prepared.path, "rev-parse", "HEAD");
+    await runGit(prepared.path, "branch", "-f", prepared.branch, unrelatedHead);
+    await runGit(prepared.path, "checkout", prepared.branch);
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: unrelatedHead,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/ancestry|descend|origin\/main|base/u);
+  });
+
   test("bounds the number of untracked files before launching per-file diffs", async () => {
     const { repositoryRoot } = await temporaryGitRepository();
     const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");

@@ -627,7 +627,7 @@ function boundedRawDiffGit(
     return runGitProcess(
       cwd,
       args,
-      [0, 1],
+      args.includes("--no-index") ? [0, 1] : [0],
       Math.min(GIT_TIMEOUT_MS, remaining),
       Math.min(MAX_OUTPUT_BYTES, maximumBytes + 1),
     );
