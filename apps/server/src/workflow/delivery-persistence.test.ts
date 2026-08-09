@@ -508,7 +508,7 @@ describe("coordinator-owned delivery persistence", () => {
         expectedRevision: run.revision,
         effectKey: effect.key,
         outcome: "confirmed",
-        trigger: "smoke_passed",
+        trigger: "smoke_succeeded",
         evidence: "The smoke receipt omitted its SHA.",
         receipt: {
           outcome: "passed",
@@ -538,7 +538,7 @@ describe("coordinator-owned delivery persistence", () => {
         expectedRevision: run.revision,
         effectKey: effect.key,
         outcome: "confirmed",
-        trigger: "smoke_passed",
+        trigger: "smoke_succeeded",
         evidence: "The smoke receipt changed its SHA.",
         receipt: {
           outcome: "passed",
