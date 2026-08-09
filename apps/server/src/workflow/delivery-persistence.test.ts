@@ -78,6 +78,58 @@ async function approvedMergeEffect(
   return { review, approved };
 }
 
+async function deliveryEffect(
+  connection: ReturnType<typeof openDatabase>,
+  coordinator: WorkflowCoordinator,
+  kind: "smoke" | "project_done",
+) {
+  let run = await enterReview(connection, coordinator);
+  run = await connection.db.transaction().execute((tx) =>
+    createRunMutationRepository(tx).updateDeliveryFacts({
+      runId: run.id,
+      expectedRevision: run.revision,
+      facts: { mergeSha },
+      at,
+    }),
+  );
+  const key = `run:${run.id}:${kind}`;
+  const intent =
+    kind === "smoke"
+      ? {
+          runId: run.id,
+          reworkEpoch: run.reworkEpoch,
+          repository: run.repository,
+          mergeSha,
+          command: "pnpm test:unit",
+        }
+      : {
+          runId: run.id,
+          reworkEpoch: run.reworkEpoch,
+          repository: run.repository,
+          projectId: "project-delivery",
+          projectNumber: 7,
+          itemId: run.projectItemId,
+          issueNodeId: run.issueNodeId,
+          issueNumber: run.issueNumber,
+          expectedRevision: "project-revision",
+          fromStatus: "Review",
+          toStatus: "Done",
+          mergeSha,
+        };
+  const created = await coordinator.createEffectIntent({
+    runId: run.id,
+    expectedRevision: run.revision,
+    key,
+    kind,
+    intent,
+    dispatch: false,
+  });
+  const effect = await coordinator.beginEffect({
+    effectKey: created.effect.key,
+  });
+  return { run, effect };
+}
+
 async function enterReview(
   connection: ReturnType<typeof openDatabase>,
   coordinator: WorkflowCoordinator,
@@ -372,6 +424,161 @@ describe("coordinator-owned delivery persistence", () => {
         .prepare("SELECT status FROM side_effects WHERE key = ?")
         .get(approved.effect.key),
     ).toEqual({ status: "in_flight" });
+    await coordinator.close();
+  });
+
+  test("abandonEffect rejects a null confirmed delivery receipt", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { approved } = await approvedMergeEffect(connection, coordinator);
+
+    await expect(
+      coordinator.abandonEffect({
+        runId: approved.run.id,
+        expectedRevision: approved.run.revision,
+        effectKey: approved.effect.key,
+        outcome: "confirmed",
+        trigger: "merge_observed",
+        evidence: "The abandoned merge omitted its receipt.",
+        receipt: null,
+        at,
+      }),
+    ).rejects.toThrow(/receipt|merge/i);
+    expect(await readRun(connection.db, approved.run.id)).toEqual(approved.run);
+    await coordinator.close();
+  });
+
+  test("quarantineEffect rejects a confirmed merge receipt without merge SHA", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { approved } = await approvedMergeEffect(connection, coordinator);
+
+    await expect(
+      coordinator.quarantineEffect({
+        runId: approved.run.id,
+        expectedRevision: approved.run.revision,
+        effectKey: approved.effect.key,
+        outcome: "confirmed",
+        trigger: "merge_observed",
+        evidence: "The quarantined merge omitted its SHA.",
+        receipt: mergeReceipt({ mergeSha: undefined }),
+        at,
+      }),
+    ).rejects.toThrow(/SHA|receipt|merge/i);
+    expect(await readRun(connection.db, approved.run.id)).toEqual(approved.run);
+    await coordinator.close();
+  });
+
+  test("abandonEffect rejects a confirmed smoke receipt without merge SHA", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { run, effect } = await deliveryEffect(
+      connection,
+      coordinator,
+      "smoke",
+    );
+
+    await expect(
+      coordinator.abandonEffect({
+        runId: run.id,
+        expectedRevision: run.revision,
+        effectKey: effect.key,
+        outcome: "confirmed",
+        trigger: "smoke_passed",
+        evidence: "The smoke receipt omitted its SHA.",
+        receipt: {
+          outcome: "passed",
+          exitCode: 0,
+          durationMs: 10,
+          summary: "Smoke passed.",
+          command: "pnpm test:unit",
+        },
+        at,
+      }),
+    ).rejects.toThrow(/SHA|receipt|smoke/i);
+    await coordinator.close();
+  });
+
+  test("quarantineEffect rejects a confirmed smoke receipt with changed merge SHA", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { run, effect } = await deliveryEffect(
+      connection,
+      coordinator,
+      "smoke",
+    );
+
+    await expect(
+      coordinator.quarantineEffect({
+        runId: run.id,
+        expectedRevision: run.revision,
+        effectKey: effect.key,
+        outcome: "confirmed",
+        trigger: "smoke_passed",
+        evidence: "The smoke receipt changed its SHA.",
+        receipt: {
+          outcome: "passed",
+          exitCode: 0,
+          durationMs: 10,
+          summary: "Smoke passed.",
+          command: "pnpm test:unit",
+          mergeSha: "e".repeat(40),
+        },
+        at,
+      }),
+    ).rejects.toThrow(/SHA|intent|smoke|match/i);
+    await coordinator.close();
+  });
+
+  test("abandonEffect rejects a Done receipt without merge SHA", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { run, effect } = await deliveryEffect(
+      connection,
+      coordinator,
+      "project_done",
+    );
+
+    await expect(
+      coordinator.abandonEffect({
+        runId: run.id,
+        expectedRevision: run.revision,
+        effectKey: effect.key,
+        outcome: "confirmed",
+        trigger: "done_observed",
+        evidence: "The Done receipt omitted its SHA.",
+        receipt: { outcome: "moved", item: {} },
+        at,
+      }),
+    ).rejects.toThrow(/SHA|receipt|Done/i);
+    await coordinator.close();
+  });
+
+  test("quarantineEffect rejects a Done receipt with changed merge SHA", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { run, effect } = await deliveryEffect(
+      connection,
+      coordinator,
+      "project_done",
+    );
+
+    await expect(
+      coordinator.quarantineEffect({
+        runId: run.id,
+        expectedRevision: run.revision,
+        effectKey: effect.key,
+        outcome: "confirmed",
+        trigger: "done_observed",
+        evidence: "The Done receipt changed its SHA.",
+        receipt: {
+          outcome: "moved",
+          mergeSha: "e".repeat(40),
+          item: {},
+        },
+        at,
+      }),
+    ).rejects.toThrow(/SHA|intent|Done|match/i);
     await coordinator.close();
   });
 

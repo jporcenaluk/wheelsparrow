@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-
+import type { Transaction } from "kysely";
 import type { DatabaseConnection } from "../database/connection.js";
 import {
   createEffectMutationRepository,
@@ -26,7 +26,7 @@ import {
   StaleRevisionError,
   type TransitionRequest,
 } from "../database/runs.js";
-import type { SideEffectsTable } from "../database/schema.js";
+import type { DatabaseSchema, SideEffectsTable } from "../database/schema.js";
 import {
   assertEffectObservationTrigger,
   CODING_STATES,
@@ -569,6 +569,7 @@ function validateDeliveryObservation(
       ["id", "workflow", "headSha", "status", "conclusion"],
       "Staging workflow run",
     );
+    deliveryText(workflowRun.id, "Staging workflow run ID");
     equalDelivery(
       workflowRun.workflow,
       expectedWorkflow,
@@ -591,6 +592,7 @@ function validateDeliveryObservation(
       ["id", "environment", "deployedSha", "state"],
       "Staging deployment",
     );
+    deliveryText(deployment.id, "Staging deployment ID");
     equalDelivery(
       deployment.environment,
       expectedEnvironment,
@@ -613,6 +615,12 @@ function validateDeliveryObservation(
     );
     if (!["passed", "succeeded", "success"].includes(value.outcome as string))
       throw new TypeError("Confirmed smoke requires a successful receipt.");
+    const smokeCommand = deliveryText(value.command, "Smoke command");
+    const smokeMergeSha = deliverySha(value.mergeSha, "Smoke merge SHA");
+    deliveryText(value.summary, "Smoke summary");
+    const expectedCommand = deliveryText(intent.command, "Smoke command");
+    equalDelivery(smokeCommand, expectedCommand, "Smoke command");
+    equalDelivery(smokeMergeSha, expectedMergeSha, "Smoke merge SHA");
     if (
       value.exitCode !== null &&
       value.exitCode !== undefined &&
@@ -626,16 +634,17 @@ function validateDeliveryObservation(
         (value.durationMs as number) < 0)
     )
       throw new TypeError("Smoke duration is invalid.");
-    if (value.command !== undefined)
-      equalDelivery(value.command, intent.command, "Smoke command");
-    if (value.mergeSha !== undefined)
-      equalDelivery(value.mergeSha, expectedMergeSha, "Smoke merge SHA");
     return {};
   }
 
-  deliveryKeys(value, ["outcome", "item"], "Done receipt");
+  deliveryKeys(value, ["outcome", "mergeSha", "item"], "Done receipt");
   if (!["moved", "already_applied"].includes(value.outcome as string))
     throw new TypeError("Confirmed Done projection requires a move receipt.");
+  equalDelivery(
+    deliverySha(value.mergeSha, "Done merge SHA"),
+    expectedMergeSha,
+    "Done merge SHA",
+  );
   const item = deliveryRecord(value.item, "Done project item");
   const expectedRepository = deliveryText(intent.repository, "Done repository");
   const expectedProjectId = deliveryText(intent.projectId, "Done project ID");
@@ -660,6 +669,42 @@ function validateDeliveryObservation(
   equalDelivery(item.issueNumber, run.issueNumber, "Done issue number");
   equalDelivery(item.status, intent.toStatus ?? "Done", "Done project status");
   return {};
+}
+
+async function recordValidatedObservation(
+  tx: Transaction<DatabaseSchema>,
+  effect: SideEffectsTable,
+  run: RunRecord,
+  observation: EffectObservation,
+  at: string,
+  expectedMergeSha?: string,
+): Promise<EffectRecord> {
+  const deliveryFacts = validateDeliveryObservation(
+    effect,
+    run,
+    observation.outcome,
+    observation.receipt,
+  );
+  if (
+    effect.kind === "merge" &&
+    observation.outcome === "confirmed" &&
+    expectedMergeSha !== undefined &&
+    expectedMergeSha !== deliveryFacts.mergeSha
+  )
+    throw new TypeError(
+      "Merge delivery facts must match the confirmed receipt.",
+    );
+  if (deliveryFacts.mergeSha !== undefined)
+    await createRunMutationRepository(tx).updateDeliveryFacts({
+      runId: run.id,
+      expectedRevision: observation.expectedRevision,
+      facts: { mergeSha: deliveryFacts.mergeSha },
+      at,
+    });
+  return createEffectMutationRepository(tx).recordEffectObservation(
+    observation,
+    at,
+  );
 }
 
 function malformedResult(
@@ -1173,6 +1218,11 @@ export class WorkflowCoordinator {
           throw new TypeError(
             "A confirmed merge settlement requires delivery facts.",
           );
+        if (currentEffect.kind === "merge" && command.outcome === "confirmed")
+          deliverySha(
+            command.deliveryFacts?.mergeSha,
+            "Merge delivery facts SHA",
+          );
         if (
           currentEffect.kind === "merge" &&
           command.outcome !== "confirmed" &&
@@ -1188,20 +1238,6 @@ export class WorkflowCoordinator {
         )
           throw new TypeError(
             "A confirmed delivery settlement requires its receipt.",
-          );
-        const deliveryFacts = validateDeliveryObservation(
-          currentEffect,
-          current,
-          command.outcome,
-          command.receipt,
-        );
-        if (
-          currentEffect.kind === "merge" &&
-          command.outcome === "confirmed" &&
-          command.deliveryFacts?.mergeSha !== deliveryFacts.mergeSha
-        )
-          throw new TypeError(
-            "Merge delivery facts must match the confirmed receipt.",
           );
         const repository = createRunMutationRepository(tx);
         if (command.step !== undefined) {
@@ -1274,13 +1310,6 @@ export class WorkflowCoordinator {
             facts: command.publicationFacts,
             at,
           });
-        else if (command.deliveryFacts !== undefined)
-          await repository.updateDeliveryFacts({
-            runId: command.runId,
-            expectedRevision: command.expectedRevision,
-            facts: command.deliveryFacts,
-            at,
-          });
         else if (command.facts !== undefined)
           await repository.updateExecutionFacts({
             runId: command.runId,
@@ -1307,9 +1336,14 @@ export class WorkflowCoordinator {
           observation.receipt = command.receipt;
         if (command.requiredAction !== undefined)
           observation.requiredAction = command.requiredAction;
-        const effect = await createEffectMutationRepository(
+        const effect = await recordValidatedObservation(
           tx,
-        ).recordEffectObservation(observation, at);
+          currentEffect,
+          current,
+          observation,
+          at,
+          command.deliveryFacts?.mergeSha,
+        );
         return { run: await readRun(tx, command.runId), effect };
       });
     });
@@ -1423,10 +1457,24 @@ export class WorkflowCoordinator {
     const result = this.enqueuePriority(async () => {
       const at = asTimestamp(this.now, command.at);
       return this.connection.db.transaction().execute(async (tx) => {
-        const effect = await createEffectMutationRepository(
+        const current = await tx
+          .selectFrom("side_effects")
+          .selectAll()
+          .where("key", "=", command.effectKey)
+          .executeTakeFirst();
+        if (current === undefined)
+          throw new StaleEffectError(
+            command.effectKey,
+            command.expectedRevision,
+          );
+        const run = await readRun(tx, current.run_id);
+        const effect = await recordValidatedObservation(
           tx,
-        ).recordEffectObservation(command, at);
-        const run = await readRun(tx, effect.runId);
+          current,
+          run,
+          command,
+          at,
+        );
         const previous = await tx
           .selectFrom("events")
           .select("sequence")
@@ -1467,10 +1515,24 @@ export class WorkflowCoordinator {
     const result = this.enqueuePriority(async () => {
       const at = asTimestamp(this.now, command.at);
       return this.connection.db.transaction().execute(async (tx) => {
-        const effect = await createEffectMutationRepository(
+        const current = await tx
+          .selectFrom("side_effects")
+          .selectAll()
+          .where("key", "=", command.effectKey)
+          .executeTakeFirst();
+        if (current === undefined)
+          throw new StaleEffectError(
+            command.effectKey,
+            command.expectedRevision,
+          );
+        const run = await readRun(tx, current.run_id);
+        const effect = await recordValidatedObservation(
           tx,
-        ).recordEffectObservation(command, at);
-        const run = await readRun(tx, effect.runId);
+          current,
+          run,
+          command,
+          at,
+        );
         const nextRevision = run.revision + 1;
         const updated = await tx
           .updateTable("runs")
@@ -1835,23 +1897,7 @@ export class WorkflowCoordinator {
           throw new TypeError(
             "A confirmed delivery settlement requires its receipt.",
           );
-        const deliveryFacts = validateDeliveryObservation(
-          current,
-          run,
-          command.outcome,
-          command.receipt,
-        );
-        if (deliveryFacts.mergeSha !== undefined)
-          await createRunMutationRepository(tx).updateDeliveryFacts({
-            runId: run.id,
-            expectedRevision: command.expectedRevision,
-            facts: { mergeSha: deliveryFacts.mergeSha },
-            at,
-          });
-        return createEffectMutationRepository(tx).recordEffectObservation(
-          command,
-          at,
-        );
+        return recordValidatedObservation(tx, current, run, command, at);
       });
     });
     return result.then((effect) => {
