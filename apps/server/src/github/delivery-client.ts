@@ -36,12 +36,33 @@ const CANDIDATE_QUERY = `
       squashMergeAllowed rebaseMergeAllowed mergeCommitAllowed
       pullRequest(number: $number) {
         id number title isDraft baseRefName baseRefOid headRefName headRefOid mergeable
+        merged mergeCommit { oid }
         closingIssuesReferences(first: 20) { nodes { number } }
         reviewThreads(first: 100) { nodes { id isResolved } pageInfo { hasNextPage } }
         commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
           __typename ... on CheckRun { name status conclusion }
           ... on StatusContext { context state }
         } pageInfo { hasNextPage } } } } } }
+      }
+    }
+  }
+`;
+
+const MERGE_OBSERVATION_QUERY = `
+  query WheelsparrowMergeObservation($owner: String!, $name: String!, $sha: GitObjectID!) {
+    repository(owner: $owner, name: $name) {
+      object(oid: $sha) {
+        ... on Commit {
+          oid
+          associatedPullRequests(first: 20) {
+            nodes {
+              id number merged
+              mergeCommit { oid }
+              closingIssuesReferences(first: 20) { nodes { id number } }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
       }
     }
   }
@@ -163,7 +184,25 @@ function sameDoneRequest(
   );
 }
 
-function checkedEndpoint(value: string, graphql: boolean): string {
+function providerRecency(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): number {
+  const leftTime = text(left.created_at) ?? text(left.updated_at) ?? "";
+  const rightTime = text(right.created_at) ?? text(right.updated_at) ?? "";
+  if (leftTime !== rightTime) return rightTime.localeCompare(leftTime);
+  const leftId = String(left.id ?? "");
+  const rightId = String(right.id ?? "");
+  if (leftId !== rightId)
+    return rightId.localeCompare(leftId, undefined, { numeric: true });
+  return JSON.stringify(right).localeCompare(JSON.stringify(left));
+}
+
+function checkedEndpoint(
+  value: string,
+  graphql: boolean,
+  testOnly: boolean,
+): string {
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -179,11 +218,18 @@ function checkedEndpoint(value: string, graphql: boolean): string {
     parsed.protocol !== "https:" ||
     (parsed.hostname !== "api.github.com" &&
       parsed.hostname !== "api.github.test") ||
+    parsed.port !== "" ||
     parsed.username !== "" ||
     parsed.password !== "" ||
     parsed.search !== "" ||
     parsed.hash !== ""
   ) {
+    throw new GitHubDeliveryClientError(
+      "invalid_input",
+      "GitHub delivery endpoint configuration is invalid.",
+    );
+  }
+  if (parsed.hostname === "api.github.test" && !testOnly) {
     throw new GitHubDeliveryClientError(
       "invalid_input",
       "GitHub delivery endpoint configuration is invalid.",
@@ -196,7 +242,7 @@ function checkedEndpoint(value: string, graphql: boolean): string {
       "GitHub delivery endpoint configuration is invalid.",
     );
   }
-  if (!graphql && parsed.pathname.endsWith("/graphql")) {
+  if (!graphql && parsed.pathname !== "" && parsed.pathname !== "/") {
     throw new GitHubDeliveryClientError(
       "invalid_input",
       "GitHub delivery endpoint configuration is invalid.",
@@ -264,11 +310,22 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
     string,
     { request: MergeRequest; receipt: MergeReceipt }
   >();
+  readonly #mergeInFlight = new Map<
+    string,
+    { request: MergeRequest; promise: Promise<MergeReceipt> }
+  >();
   readonly #doneReceipts = new Map<
     string,
     {
       request: ConditionalProjectDoneMoveRequest;
       result: ProjectDoneMoveResult;
+    }
+  >();
+  readonly #doneInFlight = new Map<
+    string,
+    {
+      request: ConditionalProjectDoneMoveRequest;
+      promise: Promise<ProjectDoneMoveResult>;
     }
   >();
 
@@ -307,10 +364,12 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
     this.#endpoint = checkedEndpoint(
       options.endpoint ?? GRAPHQL_ENDPOINT,
       true,
+      options.fetch !== undefined,
     );
     this.#restEndpoint = checkedEndpoint(
       options.restEndpoint ?? REST_ENDPOINT,
       false,
+      options.fetch !== undefined,
     );
     this.#timeoutMs = options.timeoutMs ?? 30_000;
     this.#projectGateway = options.projectGateway;
@@ -336,6 +395,26 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
         );
       return { ...previous.receipt };
     }
+    const active = this.#mergeInFlight.get(expected.effectKey);
+    if (active !== undefined) {
+      if (!sameMergeRequest(active.request, expected))
+        deliveryFailure(
+          "effect_key_conflict",
+          "Merge effect key was reused with different request facts",
+        );
+      return active.promise;
+    }
+    const promise = this.#mergePullRequest(expected);
+    this.#mergeInFlight.set(expected.effectKey, { request: expected, promise });
+    try {
+      return await promise;
+    } finally {
+      if (this.#mergeInFlight.get(expected.effectKey)?.promise === promise)
+        this.#mergeInFlight.delete(expected.effectKey);
+    }
+  }
+
+  async #mergePullRequest(expected: MergeRequest): Promise<MergeReceipt> {
     const observed = await this.#readCandidate(expected);
     const candidate = observed.candidate;
     if (
@@ -363,6 +442,25 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
         "base_drift",
         "The pull request base changed after approval",
       );
+    if (observed.mergedSha !== undefined) {
+      const receipt = assertMergeReceipt({
+        repository: candidate.repository,
+        number: candidate.number,
+        issueNumber: candidate.issueNumber,
+        nodeId: candidate.nodeId,
+        method: expected.method,
+        baseBranch: candidate.baseBranch,
+        baseSha: candidate.baseSha,
+        headBranch: candidate.headBranch,
+        headSha: candidate.headSha,
+        mergeSha: observed.mergedSha,
+      });
+      this.#mergeReceipts.set(expected.effectKey, {
+        request: expected,
+        receipt,
+      });
+      return { ...receipt };
+    }
     if (candidate.requiredChecks.aggregate !== "green")
       deliveryFailure(
         "required_checks_not_green",
@@ -385,25 +483,6 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
         "merge_method_not_permitted",
         "The requested merge method is not permitted",
       );
-    if (observed.mergedSha !== undefined) {
-      const receipt = assertMergeReceipt({
-        repository: candidate.repository,
-        number: candidate.number,
-        issueNumber: candidate.issueNumber,
-        nodeId: candidate.nodeId,
-        method: expected.method,
-        baseBranch: candidate.baseBranch,
-        baseSha: candidate.baseSha,
-        headBranch: candidate.headBranch,
-        headSha: candidate.headSha,
-        mergeSha: observed.mergedSha,
-      });
-      this.#mergeReceipts.set(expected.effectKey, {
-        request: expected,
-        receipt,
-      });
-      return { ...receipt };
-    }
     let response: Response;
     try {
       response = await this.#rest(
@@ -418,11 +497,18 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
       );
     }
     if (!response.ok) {
-      // The mutation was explicitly rejected by GitHub. A transport failure
-      // above is the only path that remains ambiguous.
+      if (
+        response.status >= 400 &&
+        response.status < 500 &&
+        response.status !== 408
+      )
+        throw new GitHubDeliveryClientError(
+          "merge_prevented",
+          "GitHub prevented the merge.",
+        );
       throw new GitHubDeliveryClientError(
-        "merge_prevented",
-        "GitHub prevented the merge.",
+        "merge_ambiguous",
+        "GitHub merge outcome is ambiguous.",
       );
     }
     const value = record(await this.#json(response, "merge_ambiguous"));
@@ -601,17 +687,33 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
     const expected = assertObserveStagingRequest(request);
     this.#scope(expected.repository);
     const workflow = await this.#restJson(
-      `/repos/${this.#owner}/${this.#repository}/actions/workflows/${encodeURIComponent(expected.workflow)}/runs?head_sha=${expected.mergeSha}`,
+      `/repos/${this.#owner}/${this.#repository}/actions/workflows/${encodeURIComponent(expected.workflow)}/runs?per_page=100`,
     );
     const workflowRuns = records(record(workflow)?.workflow_runs);
     if (workflowRuns === undefined) this.#invalid();
-    const workflowRun = workflowRuns.find((run) => {
-      const path = text(run.path) ?? text(run.name);
-      return (
-        path !== undefined &&
-        (path === expected.workflow || path.endsWith(`/${expected.workflow}`))
-      );
-    });
+    const matchingWorkflowRuns = workflowRuns
+      .filter((run) => {
+        const path = text(run.path) ?? text(run.name);
+        return (
+          path !== undefined &&
+          (path === expected.workflow ||
+            path.endsWith(`/${expected.workflow}`)) &&
+          run.head_sha === expected.mergeSha
+        );
+      })
+      .sort(providerRecency)[0];
+    const workflowRun =
+      matchingWorkflowRuns ??
+      workflowRuns
+        .filter((run) => {
+          const path = text(run.path) ?? text(run.name);
+          return (
+            path !== undefined &&
+            (path === expected.workflow ||
+              path.endsWith(`/${expected.workflow}`))
+          );
+        })
+        .sort(providerRecency)[0];
     const workflowReceipt =
       workflowRun === undefined
         ? undefined
@@ -629,9 +731,9 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
     );
     const deploymentList = records(deployments);
     if (deploymentList === undefined) this.#invalid();
-    const deployment = deploymentList.find(
-      (item) => item.environment === expected.environment,
-    );
+    const deployment = deploymentList
+      .filter((item) => item.environment === expected.environment)
+      .sort(providerRecency)[0];
     if (deployment === undefined)
       return assertStagingObservation({
         ...expected,
@@ -651,12 +753,7 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
     );
     const statusList = records(statuses);
     if (statusList === undefined) this.#invalid();
-    const status = [...statusList].sort((left, right) => {
-      const leftTime = text(left.created_at);
-      const rightTime = text(right.created_at);
-      if (leftTime === undefined || rightTime === undefined) return 0;
-      return rightTime.localeCompare(leftTime);
-    })[0];
+    const status = [...statusList].sort(providerRecency)[0];
     const state = status?.state ?? deployment.state;
     if (state !== undefined && typeof state !== "string") this.#invalid();
     const deploymentReceipt = {
@@ -697,13 +794,34 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
       if (previous.result.outcome === "rejected") return previous.result;
       return { outcome: "already_applied", item: previous.result.item };
     }
+    const active = this.#doneInFlight.get(expected.effectKey);
+    if (active !== undefined) {
+      if (!sameDoneRequest(active.request, expected))
+        return { outcome: "rejected", reason: { kind: "effect_key_conflict" } };
+      return active.promise;
+    }
+    const promise = this.#moveProjectItemToDone(expected);
+    this.#doneInFlight.set(expected.effectKey, { request: expected, promise });
+    try {
+      return await promise;
+    } finally {
+      if (this.#doneInFlight.get(expected.effectKey)?.promise === promise)
+        this.#doneInFlight.delete(expected.effectKey);
+    }
+  }
+
+  async #moveProjectItemToDone(
+    expected: ConditionalProjectDoneMoveRequest,
+  ): Promise<ProjectDoneMoveResult> {
     const merged = [...this.#mergeReceipts.values()].find(
       (entry) =>
         entry.receipt.repository === expected.repository &&
         entry.receipt.issueNumber === expected.issueNumber &&
         entry.receipt.mergeSha === expected.mergeSha,
     );
-    if (merged === undefined)
+    const observedExternally =
+      merged === undefined ? await this.#observeMergeForDone(expected) : true;
+    if (!observedExternally)
       return { outcome: "rejected", reason: { kind: "merge_not_observed" } };
     const gateway = this.#projectGateway;
     if (gateway === undefined)
@@ -724,6 +842,41 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
       this.#doneReceipts.set(expected.effectKey, { request: expected, result });
     }
     return result;
+  }
+
+  async #observeMergeForDone(
+    request: ConditionalProjectDoneMoveRequest,
+  ): Promise<boolean> {
+    const data = await this.#graphql(MERGE_OBSERVATION_QUERY, {
+      owner: this.#owner,
+      name: this.#repository,
+      sha: request.mergeSha,
+    });
+    const repository = record(data)?.repository;
+    const object = record(record(repository)?.object);
+    if (object === undefined || object.oid !== request.mergeSha) return false;
+    const associated = record(object.associatedPullRequests);
+    const nodes = records(associated?.nodes);
+    if (
+      nodes === undefined ||
+      record(associated?.pageInfo)?.hasNextPage !== false
+    )
+      this.#invalid();
+    return nodes.some((pullRequest) => {
+      if (pullRequest.merged !== true) return false;
+      if (record(pullRequest.mergeCommit)?.oid !== request.mergeSha)
+        return false;
+      const issues = records(
+        record(pullRequest.closingIssuesReferences)?.nodes,
+      );
+      return (
+        issues?.some(
+          (issue) =>
+            issue.id === request.issueNodeId &&
+            issue.number === request.issueNumber,
+        ) ?? false
+      );
+    });
   }
 
   #workflowRun(value: Record<string, unknown>, request: ObserveStagingRequest) {

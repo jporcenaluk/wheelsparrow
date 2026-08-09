@@ -219,6 +219,42 @@ describe("delivery boundary contracts", () => {
       } as unknown),
     ).toThrowError(expect.objectContaining({ kind: "invalid_input" }));
   });
+
+  test("requires deployed staging receipts to prove exact successful workflow and deployment", () => {
+    expect(() =>
+      assertStagingObservation({
+        repository,
+        workflow: "deploy-staging.yml",
+        environment: "staging",
+        mergeSha,
+        workflowRun: undefined,
+        deployment: undefined,
+        outcome: "deployed",
+      }),
+    ).toThrowError(expect.objectContaining({ kind: "invalid_input" }));
+    expect(() =>
+      assertStagingObservation({
+        repository,
+        workflow: "deploy-staging.yml",
+        environment: "staging",
+        mergeSha,
+        workflowRun: {
+          id: "run-1",
+          workflow: "deploy-staging.yml",
+          headSha: mergeSha,
+          status: "completed",
+          conclusion: "cancelled",
+        },
+        deployment: {
+          id: "deployment-1",
+          environment: "staging",
+          deployedSha: mergeSha,
+          state: "success",
+        },
+        outcome: "deployed",
+      }),
+    ).toThrowError(expect.objectContaining({ kind: "invalid_input" }));
+  });
 });
 
 describe("FakeGitHubDeliveryGateway", () => {

@@ -101,6 +101,32 @@ function graphqlCandidate() {
   };
 }
 
+function graphqlMergeObservation() {
+  return {
+    data: {
+      repository: {
+        object: {
+          oid: mergeSha,
+          associatedPullRequests: {
+            nodes: [
+              {
+                id: "PR_node_7",
+                number: 7,
+                merged: true,
+                mergeCommit: { oid: mergeSha },
+                closingIssuesReferences: {
+                  nodes: [{ id: "I_42", number: 42 }],
+                },
+              },
+            ],
+            pageInfo: { hasNextPage: false },
+          },
+        },
+      },
+    },
+  };
+}
+
 describe("GitHubDeliveryClient", () => {
   test("fails closed before fetch when credentials are absent", async () => {
     let calls = 0;
@@ -207,6 +233,31 @@ describe("GitHubDeliveryClient", () => {
     ).rejects.not.toThrow("secret");
   });
 
+  test("returns an already-merged exact candidate before check preflight or PUT", async () => {
+    const calls: Request[] = [];
+    const gateway = client(async (input, init) => {
+      const request = new Request(input, init);
+      calls.push(request);
+      const body = graphqlCandidate();
+      body.data.repository.pullRequest.merged = true;
+      body.data.repository.pullRequest.mergeCommit = { oid: mergeSha };
+      body.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[0].conclusion =
+        "FAILURE";
+      return response(body);
+    });
+    await expect(
+      gateway.mergePullRequest({
+        ...candidateRequest(),
+        effectKey: "run:1:merge:already",
+        method: "squash",
+      }),
+    ).resolves.toMatchObject({ mergeSha, headSha });
+    expect(calls).toHaveLength(1);
+    const queryBody = await calls[0]?.clone().text();
+    expect(queryBody).toContain("merged");
+    expect(queryBody).toContain("mergeCommit");
+  });
+
   test("correlates one workflow run and deployment to the exact merge SHA", async () => {
     const gateway = client(async (input) => {
       const url = new URL(input.toString());
@@ -293,6 +344,24 @@ describe("GitHubDeliveryClient", () => {
     ).rejects.toMatchObject({ kind: "merge_prevented" });
   });
 
+  test("keeps timeout and server merge responses ambiguous", async () => {
+    for (const status of [408, 500]) {
+      const gateway = client(async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url.endsWith("/graphql"))
+          return response(graphqlCandidate());
+        return response({ message: "provider response" }, status);
+      });
+      await expect(
+        gateway.mergePullRequest({
+          ...candidateRequest(),
+          effectKey: `run:1:merge:ambiguous:${status}`,
+          method: "squash",
+        }),
+      ).rejects.toMatchObject({ kind: "merge_ambiguous" });
+    }
+  });
+
   test("classifies an explicit merged-false response as prevented", async () => {
     const gateway = client(async (input, init) => {
       const request = new Request(input, init);
@@ -353,6 +422,66 @@ describe("GitHubDeliveryClient", () => {
     });
   });
 
+  test("chooses latest matching workflow, deployment, and status independent of provider order", async () => {
+    const gateway = client(async (input) => {
+      const url = new URL(input.toString());
+      if (url.pathname.includes("/actions/workflows/")) {
+        return response({
+          workflow_runs: [
+            {
+              id: 1,
+              path: ".github/workflows/deploy.yml",
+              head_sha: mergeSha,
+              status: "completed",
+              conclusion: "success",
+              created_at: "2026-08-09T10:00:00Z",
+            },
+            {
+              id: 2,
+              path: ".github/workflows/deploy.yml",
+              head_sha: mergeSha,
+              status: "completed",
+              conclusion: "cancelled",
+              created_at: "2026-08-09T11:00:00Z",
+            },
+          ],
+        });
+      }
+      if (url.pathname.endsWith("/deployments")) {
+        return response([
+          {
+            id: 1,
+            environment: "staging",
+            sha: mergeSha,
+            created_at: "2026-08-09T10:00:00Z",
+          },
+          {
+            id: 2,
+            environment: "staging",
+            sha: mergeSha,
+            created_at: "2026-08-09T11:00:00Z",
+          },
+        ]);
+      }
+      return response([
+        { id: 1, state: "success", created_at: "2026-08-09T10:00:00Z" },
+        { id: 2, state: "failure", created_at: "2026-08-09T11:00:00Z" },
+      ]);
+    });
+    await expect(
+      gateway.observeStaging({
+        repository,
+        workflow: "deploy.yml",
+        environment: "staging",
+        mergeSha,
+      }),
+    ).resolves.toMatchObject({
+      outcome: "failed",
+      workflowRun: { id: "2" },
+      deployment: { id: "2" },
+    });
+  });
+
   test("fails closed for an arbitrary endpoint override", () => {
     expect(
       () =>
@@ -361,6 +490,16 @@ describe("GitHubDeliveryClient", () => {
           repository: "widget",
           token: "ghs_test_token",
           endpoint: "https://evil.example/graphql",
+        }),
+    ).toThrowError(expect.objectContaining({ kind: "invalid_input" }));
+    expect(
+      () =>
+        new GitHubDeliveryClient({
+          owner: "octo",
+          repository: "widget",
+          token: "ghs_test_token",
+          fetch: async () => response({}),
+          restEndpoint: "https://api.github.test:443/evil",
         }),
     ).toThrowError(expect.objectContaining({ kind: "invalid_input" }));
   });
@@ -443,5 +582,98 @@ describe("GitHubDeliveryClient", () => {
       outcome: "already_applied",
     });
     expect(moves).toBe(1);
+  });
+
+  test("re-proves an exact merge after a client restart before moving Done", async () => {
+    const doneItem: ProjectItem = {
+      projectItemId: "PVTI_1",
+      projectId: "PVT_1",
+      projectNumber: 9,
+      repository,
+      issueNodeId: "I_42",
+      issueNumber: 42,
+      isOpen: true,
+      status: "Done",
+      revision: "revision-2",
+      labels: ["mvp"],
+      createdAt: "2026-08-09T12:00:00.000Z",
+      dependencies: [],
+    };
+    const projectGateway: GitHubProjectGateway = {
+      readProject: async () => ({
+        projectId: "PVT_1",
+        projectNumber: 9,
+        repository,
+        items: [doneItem],
+      }),
+      readProjectItem: async () => doneItem,
+      moveProjectItem: async () => ({ outcome: "moved", item: doneItem }),
+    };
+    const first = client(async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url.endsWith("/graphql")) return response(graphqlCandidate());
+      return response({ merged: true, sha: mergeSha });
+    });
+    await first.mergePullRequest({
+      ...candidateRequest(),
+      effectKey: "run:restart:merge",
+      method: "squash",
+    });
+    const restarted = new GitHubDeliveryClient({
+      owner: "octo",
+      repository: "widget",
+      token: "ghs_test_token",
+      endpoint: "https://api.github.test/graphql",
+      restEndpoint: "https://api.github.test",
+      projectGateway,
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        const body = await request.clone().text();
+        if (body.includes("WheelsparrowMergeObservation"))
+          return response(graphqlMergeObservation());
+        throw new Error("unexpected provider operation");
+      },
+    });
+    await expect(
+      restarted.moveProjectItemToDone({
+        repository,
+        projectId: "PVT_1",
+        projectNumber: 9,
+        itemId: "PVTI_1",
+        issueNodeId: "I_42",
+        issueNumber: 42,
+        expectedRevision: "revision-1",
+        fromStatus: "Review",
+        toStatus: "Done",
+        effectKey: "run:restart:done",
+        mergeSha,
+      }),
+    ).resolves.toMatchObject({ outcome: "moved" });
+  });
+
+  test("does not duplicate concurrent merge or Done mutations for one effect", async () => {
+    let releaseMerge: (() => void) | undefined;
+    const mergeGate = new Promise<void>((resolve) => {
+      releaseMerge = resolve;
+    });
+    let puts = 0;
+    const gateway = client(async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url.endsWith("/graphql")) return response(graphqlCandidate());
+      puts += 1;
+      await mergeGate;
+      return response({ merged: true, sha: mergeSha });
+    });
+    const mergeRequest = {
+      ...candidateRequest(),
+      effectKey: "run:concurrent:merge",
+      method: "squash" as const,
+    };
+    const first = gateway.mergePullRequest(mergeRequest);
+    const second = gateway.mergePullRequest(mergeRequest);
+    await Promise.resolve();
+    releaseMerge?.();
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(puts).toBe(1);
   });
 });

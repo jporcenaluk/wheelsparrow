@@ -625,6 +625,21 @@ export function assertStagingObservation(value: unknown): StagingObservation {
       "Staging deployment evidence is not bound to the configured environment",
     );
   }
+  if (input.outcome === "deployed") {
+    if (
+      input.workflowRun === undefined ||
+      input.deployment === undefined ||
+      input.workflowRun.headSha !== input.mergeSha ||
+      input.workflowRun.status !== "completed" ||
+      input.workflowRun.conclusion !== "success" ||
+      input.deployment.deployedSha !== input.mergeSha ||
+      input.deployment.state !== "success"
+    ) {
+      invalid(
+        "Deployed staging evidence must prove a successful exact-SHA workflow and deployment",
+      );
+    }
+  }
   return {
     repository: input.repository,
     workflow: input.workflow,
