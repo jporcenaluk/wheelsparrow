@@ -1,6 +1,6 @@
 # Wheelsparrow MVP Implementation Ledger
 
-Updated: 2026-08-08
+Updated: 2026-08-09
 
 Active goal thread: `019fd8d9-1c69-7810-82ae-6e6b35c2e2e6`
 
@@ -21,9 +21,9 @@ and marks the ticket done only when the evidence matches.
 
 ## Authority and Scope
 
-- Authoritative implementation base: Block 1A merge commit
-  `e6899f48ab2c6d5499eae4de16a96c8dd5ec6eca`, present as local `origin/main`; live protected-main
-  status was not re-queried in this worktree.
+- Authoritative implementation base: Block 2 merge commit
+  `5c53b95c2293bf65b1154ed03b696c176c2ec9bc`, present as local `origin/main`; live protected-main
+  status will be re-queried before this block is published.
 - Approved product design: `SPEC.md`, `ARCHITECTURE.md`, `TECH_STACK.md`, and `CICD.md`; their
   content is unchanged from source revision `81271c278c47a96e2882888e20c577449c5f69b8` through the
   current protected-main SHA.
@@ -87,30 +87,31 @@ required product outcomes.
 | 1 | Deterministic Block 0 process-cleanup repair and control-plane setup | PR #25 foundation | `merged` | `.worktrees/block0-flake`; `fix/block-0-process-test-flake` | `docs/superpowers/plans/2026-08-08-block-0-repair-and-control-plane.md` | [#26](https://github.com/jporcenaluk/wheelsparrow/pull/26) | `64951a3edc3de50bdc8007becde965308c5d3040` |
 | 2 | SQLite storage, migrations, and single-process ownership | 1 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md` | — | `e6899f48ab2c6d5499eae4de16a96c8dd5ec6eca` |
 | 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-1b-coordinator.md` | [#28](https://github.com/jporcenaluk/wheelsparrow/pull/28) | `d79b3810ee7a53bf9d37bd191b6b7471bda55538` |
-| 4 | GitHub discovery and claim through a verified local candidate | 3 | `review` | `.worktrees/block2-github`; `feat/block-2-github` | `docs/superpowers/plans/2026-08-08-block-2-github-discovery.md` | — | — |
-| 5 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 4 | `pending` | — | — | — | — |
-| 6 | Operator API and browser controls | 3 and stable read contract | `pending` | — | — | — | — |
-| 7 | Exact-SHA approval, merge, staging, smoke, and Done transition | 5 and 6 | `pending` | — | — | — | — |
-| 8 | Integration, security, artifact, and requirement-conformance closure | 7 | `pending` | — | — | — | — |
+| 4 | GitHub discovery and claim through a verified local candidate | 3 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-2-github-discovery.md` | [#29](https://github.com/jporcenaluk/wheelsparrow/pull/29) | `5c53b95c2293bf65b1154ed03b696c176c2ec9bc` |
+| 5 | Contained worktree, builder, verification, and durable execution | 4 | `review` | `.worktrees/block3-builder`; `feat/block-3-builder` | `docs/superpowers/plans/2026-08-09-block-3-builder-workspaces.md` | — | — |
+| 6 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 5 | `pending` | — | — | — | — |
+| 7 | Operator API and browser controls | 3 and stable read contract | `pending` | — | — | — | — |
+| 8 | Exact-SHA approval, merge, staging, smoke, and Done transition | 6 and 7 | `pending` | — | — | — | — |
+| 9 | Integration, security, artifact, and requirement-conformance closure | 8 | `pending` | — | — | — | — |
 
 ## Current Resume Point
 
-- Branch base: merged Block 1B SHA
-  `d79b3810ee7a53bf9d37bd191b6b7471bda55538`.
-- Active slice: merge-train row 4, Block 2 GitHub discovery and durable claim.
-- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block2-github`.
-- Branch: `feat/block-2-github`.
-- Observed executable head before this ledger edit: `43ad16194d073f08d4f8ead039f0bc3e7103ae64`.
-- Active plan: `docs/superpowers/plans/2026-08-08-block-2-github-discovery.md`; all Task 1-3
-  checkboxes are complete.
-- Last verification: at `43ad16194d073f08d4f8ead039f0bc3e7103ae64`, unrestricted Node 24.18.0
-  `make verify-agent` passed formatting, Markdownlint, frozen install, all TypeScript projects, and
-  23 test files / 538 tests; `make build` and diff hygiene passed. The managed sandbox suppresses
-  detached-child output, so unrestricted evidence is authoritative for ownership/process tests.
-- Publication state: Block 2 is pre-PR; local independent requirements, quality, and whole-block
-  conformance reviews are approved.
-- Next safe command: re-run the full gate at the ledger head, publish a non-draft Block 2 PR, observe
-  exact-head CI, and merge under the authorized workflow.
+- Branch base: merged Block 2 SHA
+  `5c53b95c2293bf65b1154ed03b696c176c2ec9bc`.
+- Active slice: merge-train row 5, Block 3 contained builder execution.
+- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block3-builder`.
+- Branch: `feat/block-3-builder`.
+- Observed executable head before this ledger edit: `cb32433`.
+- Active plan: `docs/superpowers/plans/2026-08-09-block-3-builder-workspaces.md`; code and focused
+  boundary tests are complete, with publication evidence still pending.
+- Last verification: at `cb32433`, unrestricted Node 24.18.0 `make verify-agent` passed formatting,
+  Markdownlint, frozen install, all TypeScript projects, and 28 test files / 611 tests; `make build`,
+  `make smoke-production`, and diff hygiene passed. The managed sandbox suppresses detached-child
+  output, so unrestricted evidence is authoritative for ownership/process tests.
+- Publication state: Block 3 is pre-PR; the exact-head local gate is green and a fresh whole-block
+  review is in progress.
+- Next safe command: publish a non-draft Block 3 PR, observe exact-head CI, and merge under the
+  authorized workflow once the fresh review is clean.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 
@@ -246,6 +247,7 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | B1 service lifecycle integration | Commit `e604a39` runs durable reconciliation after migration and before listener startup, and closes the coordinator before database resources during shutdown and failure cleanup. |
 | 2026-08-08 | Row 3 exact-head pre-PR whole gate | At `e604a39f9de8b81026798cc82796a509d117b12d`, unrestricted Node 24.18.0 `make verify-agent` passed formatting, Markdownlint, frozen install, all TypeScript projects, 19 test files / 410 tests, and diff hygiene; `make build` and `make smoke-production` passed. No PR, CI, approval, or merge evidence exists yet. |
 | 2026-08-09 | Row 4 GitHub discovery and durable claim | Commits `6561df7`, `7738af7`, `8cf0f31`, `a3707e7`, `4b5f19a`, and `43ad161` add a narrow typed GitHub project boundary, test-only stateful fake, fail-closed deterministic eligibility, active durable-ownership lookup, durable exact-item claim, atomic claim rejection, late-callback quarantine, and restart-safe reconciliation. The fake detects revision, identity, duplicate-mutation, dependency, receipt, ordering, and timestamp drift. Fresh requirements, quality/security, and whole-block reviewers approved after repairing malformed duplicate IDs, post-mutation ambiguity, observer uncertainty, and representation-order drift. At `43ad161`, unrestricted Node 24.18.0 `make verify-agent` passed 23 files / 538 tests; `make build`, Markdownlint, and diff hygiene passed. Publication remains pending. |
+| 2026-08-09 | Row 5 Block 3 local execution gate | Commits `6cf96f2`, `a6d130c`, `f84d307`, `89ac50f`, `a4fba31`, `db35268`, `4665f0e`, `41d8c5a`, `74abb97`, `0ef7471`, and `cb32433` create/reinspect contained run worktrees, render and run bounded credential-free builder subprocesses, run bounded verification, atomically persist receipts and append-only steps through the coordinator, and advance `preparing -> intaking -> building -> verifying -> reviewing`. Fresh process and Git boundary reviews drove containment, credential, redaction, command, timeout, changed-file, and restart repairs. At `cb32433`, unrestricted Node 24.18.0 `make verify-agent` passed 28 files / 611 tests; `make build`, `make smoke-production`, and diff hygiene passed. Fresh combined review and publication remain pending. |
 
 ## Open Decisions and Risks
 
