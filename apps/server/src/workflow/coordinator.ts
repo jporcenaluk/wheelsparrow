@@ -27,6 +27,7 @@ import {
 import type { SideEffectsTable } from "../database/schema.js";
 import {
   assertEffectObservationTrigger,
+  CODING_STATES,
   type EffectKind,
   type EffectStatus,
   WORKFLOW_TRIGGERS,
@@ -73,6 +74,14 @@ export interface TransitionCommandOptions {
 
 export interface CreateClaimOptions {
   effect?: EffectIntentCommand;
+}
+
+/** A human operator's bounded request to queue or reserve one review run. */
+export interface ReturnToTodoCommand {
+  runId: string;
+  expectedRevision: number;
+  feedback: string;
+  at?: string;
 }
 
 export interface BeginEffectCommand {
@@ -1064,6 +1073,39 @@ export class WorkflowCoordinator {
   }
 
   /**
+   * Queue a review run for rework, reserving the coding slot when it is free.
+   *
+   * The slot check and state transition share one coordinator-owned SQLite
+   * transaction. That makes the selected trigger deterministic with respect
+   * to other claims and leaves the operator's bounded feedback in both the
+   * required-action projection and the append-only transition evidence.
+   */
+  returnToTodo(command: ReturnToTodoCommand): Promise<RunRecord> {
+    return this.enqueue(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db.transaction().execute(async (tx) => {
+        const activeCodingRun = await tx
+          .selectFrom("runs")
+          .select("id")
+          .where("state", "in", [...CODING_STATES])
+          .executeTakeFirst();
+        const trigger =
+          activeCodingRun === undefined
+            ? "return_todo_reserved"
+            : "return_todo_queued";
+        return createRunMutationRepository(tx).transitionRun({
+          runId: command.runId,
+          expectedRevision: command.expectedRevision,
+          trigger,
+          at,
+          summary: { text: command.feedback },
+          requiredAction: command.feedback,
+        });
+      });
+    });
+  }
+
+  /**
    * Ask the injected observer about an unresolved effect. The observer runs
    * after this read transaction commits and its callback is submitted back to
    * this same FIFO queue.
@@ -1579,6 +1621,7 @@ export type CoordinatorCommand =
   | ReturnType<WorkflowCoordinator["cancelEffect"]>
   | ReturnType<WorkflowCoordinator["rejectClaim"]>
   | ReturnType<WorkflowCoordinator["quarantineEffect"]>
+  | ReturnType<WorkflowCoordinator["returnToTodo"]>
   | ReturnType<WorkflowCoordinator["updateSchedulerControl"]>;
 
 export type CoordinatorEffectOutcome = EffectStatus;
