@@ -417,6 +417,85 @@ describe("contained Git worktree boundary", () => {
     ).rejects.toThrow(/HEAD|SHA|receipt/u);
   });
 
+  test("rejects a tracked diff when HEAD changes during the raw read", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    let raced = false;
+    const racingGit = async (cwd: string, args: readonly string[]) => {
+      const output = await realGit(cwd, args);
+      if (!raced && args.includes("--binary") && !args.includes("--no-index")) {
+        raced = true;
+        await writeFile(join(prepared.path, "README.md"), "raced\n", "utf8");
+        await runGit(prepared.path, "add", "README.md");
+        await runGit(prepared.path, "commit", "-m", "raced HEAD");
+      }
+      return output;
+    };
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: racingGit,
+      }),
+    ).rejects.toThrow(/HEAD|SHA|receipt/u);
+  });
+
+  test("rejects a tracked diff when the assigned worktree is replaced during the raw read", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    let raced = false;
+    const racingGit = async (cwd: string, args: readonly string[]) => {
+      const output = await realGit(cwd, args);
+      if (!raced && args.includes("--binary") && !args.includes("--no-index")) {
+        raced = true;
+        await rm(prepared.path, { recursive: true, force: true });
+        await symlink(repositoryRoot, prepared.path);
+      }
+      return output;
+    };
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: racingGit,
+      }),
+    ).rejects.toThrow(/symbolic|symlink|worktree|boundary/u);
+  });
+
   test("rejects a workspace root outside the repository data root", async () => {
     const { repositoryRoot } = await temporaryGitRepository();
     const outsideRoot = await mkdtemp(join(tmpdir(), "wheelsparrow-outside-"));

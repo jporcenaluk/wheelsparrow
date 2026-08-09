@@ -842,6 +842,22 @@ export async function readRunWorktreeDiff(
     );
   }
 
+  // The tracked diff reads the worktree/index, not just an immutable pair of
+  // commits. Revalidate every assigned identity after the read so a branch,
+  // repository, base, HEAD, or worktree replacement cannot make the returned
+  // patch belong to a different checkout than the inspected receipt.
+  const revalidated = await inspectRunWorktree({ ...input, git: rawGit });
+  if (
+    revalidated.path !== inspected.path ||
+    revalidated.branch !== inspected.branch ||
+    revalidated.baseSha !== inspected.baseSha ||
+    revalidated.headSha !== inspected.headSha
+  ) {
+    throw new WorktreeBoundaryError(
+      "assigned worktree identity changed while reading its tracked diff",
+    );
+  }
+
   const untrackedPaths = await inspectUntrackedFiles(rawGit, inspected.path);
   for (const path of untrackedPaths) {
     const before = await inspectReadableUntrackedFile(inspected.path, path);
