@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+
+import type { BuilderTerminalResult } from "../agents/builder.js";
 import type { EffectRecord } from "../database/effects.js";
 import { type RunRecord, StaleRevisionError } from "../database/runs.js";
 import type {
@@ -9,11 +12,21 @@ const workspaceEffectKey = (runId: string): string =>
   `run:${runId}:workspace:prepare`;
 const intakeEffectKey = (runId: string): string =>
   `run:${runId}:intake:capture`;
+const builderEffectKey = (runId: string): string =>
+  `run:${runId}:agent:builder:attempt:1`;
+const verificationEffectKey = (runId: string): string =>
+  `run:${runId}:verify:attempt:1`;
 const shaPattern = /^[0-9a-f]{40}$/u;
+const sha256Pattern = /^[0-9a-f]{64}$/u;
 const maximumTextBytes = 64 * 1024;
 const maximumIdentifierBytes = 512;
 const maximumAcceptanceCriterionBytes = 16 * 1024;
 const maximumIntakeJsonBytes = 1024 * 1024;
+const maximumPromptBytes = 1024 * 1024;
+const maximumBuilderSummaryBytes = 4 * 1024;
+const maximumBuilderEvidenceBytes = 1024;
+const maximumBuilderLogBytes = 16 * 1024;
+const maximumVerificationLogBytes = 16 * 1024;
 
 /** The receipt required before a run may leave the preparing state. */
 export interface WorkspacePreparationReceipt {
@@ -22,6 +35,7 @@ export interface WorkspacePreparationReceipt {
   readonly baseBranch: "main";
   readonly baseSha: string;
   readonly headSha: string;
+  readonly changedFiles: readonly string[];
 }
 
 /** A narrow edge seam; the edge is called only after its intent is durable. */
@@ -76,6 +90,75 @@ export interface IntakeCapture {
   readonly verificationCommand: string;
 }
 
+export interface BuilderRenderInput {
+  readonly issueNumber: number;
+  readonly worktreePath: string;
+  readonly baseSha: string;
+  readonly intake: IntakeCapture;
+}
+
+export interface BuilderPromptReceipt {
+  readonly prompt: string;
+  readonly promptHash: string;
+}
+
+export interface BuilderInvokeInput {
+  readonly issueNumber: number;
+  readonly worktreePath: string;
+  readonly baseSha: string;
+  readonly intake: IntakeCapture;
+  readonly prompt: string;
+  readonly promptHash: string;
+  readonly model: string;
+  readonly reasoningEffort: string;
+}
+
+/** The narrow adapter seam used by workflow execution tests and the process edge. */
+export interface BuilderAdapter {
+  readonly render: (
+    input: BuilderRenderInput,
+  ) => unknown | PromiseLike<unknown>;
+  readonly invoke: (
+    input: BuilderInvokeInput,
+  ) => unknown | PromiseLike<unknown>;
+}
+
+export interface BuilderReceipt {
+  readonly kind: "succeeded";
+  readonly promptHash: string;
+  readonly model: string;
+  readonly reasoningEffort: string;
+  readonly terminal: BuilderTerminalResult;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number | null;
+  readonly headSha: string;
+  readonly changedFiles: readonly string[];
+}
+
+export interface VerificationInvokeInput {
+  readonly command: string;
+  readonly worktreePath: string;
+  readonly intake: IntakeCapture;
+  readonly expectedHeadSha: string;
+}
+
+export type VerificationAdapter = (
+  input: VerificationInvokeInput,
+) => unknown | PromiseLike<unknown>;
+
+export interface VerificationReceipt {
+  readonly kind: "succeeded";
+  readonly command: string;
+  readonly cwd: string;
+  readonly exitCode: 0;
+  readonly signal: null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly headSha: string;
+  readonly changedFiles: readonly string[];
+}
+
 export interface ExecutionCoordinator
   extends Pick<
     WorkflowCoordinator,
@@ -88,14 +171,15 @@ interface ExecuteClaimedRunInputBase {
   readonly run: RunRecord;
   readonly workspacePrepare: WorkspacePreparation;
   readonly workspaceInspect: WorkspaceInspection;
+  readonly builder?: BuilderAdapter;
+  readonly verify?: VerificationAdapter;
   readonly now?: () => string;
 }
 
-export type ExecuteClaimedRunInput = ExecuteClaimedRunInputBase &
-  (
-    | { readonly intake: IntakeCapture; readonly intakeCapture?: never }
-    | { readonly intakeCapture: IntakeCapture; readonly intake?: never }
-  );
+export type ExecuteClaimedRunInput = ExecuteClaimedRunInputBase & {
+  readonly intake?: IntakeCapture;
+  readonly intakeCapture?: IntakeCapture;
+};
 
 export type ExecutionOutcome =
   | {
@@ -110,6 +194,28 @@ export type ExecutionOutcome =
       readonly reason: string;
     }
   | {
+      readonly kind: "builder_failed";
+      readonly run: RunRecord;
+      readonly reason: string;
+    }
+  | {
+      readonly kind: "verifying";
+      readonly run: RunRecord;
+      readonly workspace: WorkspacePreparationReceipt;
+      readonly intakeJson: string;
+      readonly builder?: BuilderReceipt;
+    }
+  | {
+      readonly kind: "reviewing";
+      readonly run: RunRecord;
+      readonly verification: VerificationReceipt;
+    }
+  | {
+      readonly kind: "verification_failed";
+      readonly run: RunRecord;
+      readonly reason: string;
+    }
+  | {
       readonly kind: "stale";
       readonly run: RunRecord;
     };
@@ -120,6 +226,10 @@ export class WorkspaceReceiptError extends Error {
 
 export class IntakeCaptureError extends Error {
   override name = "IntakeCaptureError";
+}
+
+export class BuilderReceiptError extends Error {
+  override name = "BuilderReceiptError";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -373,17 +483,18 @@ function validateWorkspaceReceipt(value: unknown): WorkspacePreparationReceipt {
     throw new WorkspaceReceiptError("Workspace receipt must be an object.");
   const keys = Object.keys(value).toSorted();
   if (
-    keys.join(",") !== "baseBranch,baseSha,branch,headSha,path" ||
+    keys.join(",") !== "baseBranch,baseSha,branch,changedFiles,headSha,path" ||
     !isNonEmptyText(value.path) ||
     !isNonEmptyText(value.branch) ||
     value.baseBranch !== "main" ||
     typeof value.baseSha !== "string" ||
     !shaPattern.test(value.baseSha) ||
     typeof value.headSha !== "string" ||
-    !shaPattern.test(value.headSha)
+    !shaPattern.test(value.headSha) ||
+    !validChangedFiles(value.changedFiles)
   ) {
     throw new WorkspaceReceiptError(
-      "Workspace receipt must contain path, branch, baseBranch=main, baseSha, and headSha.",
+      "Workspace receipt must contain bounded path, branch, baseBranch=main, baseSha, headSha, and changedFiles.",
     );
   }
   return {
@@ -392,6 +503,306 @@ function validateWorkspaceReceipt(value: unknown): WorkspacePreparationReceipt {
     baseBranch: "main",
     baseSha: value.baseSha,
     headSha: value.headSha,
+    changedFiles: value.changedFiles,
+  };
+}
+
+function validatePromptReceipt(value: unknown): BuilderPromptReceipt {
+  if (!isRecord(value))
+    throw new BuilderReceiptError("Builder prompt receipt must be an object.");
+  if (
+    !hasExactKeys(value, ["prompt", "promptHash"]) ||
+    !isNonEmptyText(value.prompt) ||
+    byteLength(value.prompt) > maximumPromptBytes ||
+    typeof value.promptHash !== "string" ||
+    !sha256Pattern.test(value.promptHash)
+  ) {
+    throw new BuilderReceiptError(
+      "Builder prompt receipt must contain a bounded prompt and SHA-256 hash.",
+    );
+  }
+  const expectedHash = createHash("sha256")
+    .update(value.prompt, "utf8")
+    .digest("hex");
+  if (value.promptHash !== expectedHash)
+    throw new BuilderReceiptError("Builder prompt hash does not match prompt.");
+  return { prompt: value.prompt, promptHash: value.promptHash };
+}
+
+function validChangedFiles(value: unknown): value is readonly string[] {
+  return (
+    isDenseArray(value) &&
+    value.length <= 4096 &&
+    value.every((path) => {
+      if (!isNonEmptyText(path) || byteLength(path) > maximumIdentifierBytes)
+        return false;
+      const segments = path.split(/[\\/]/u);
+      return (
+        !path.startsWith("/") &&
+        !path.startsWith("\\") &&
+        !segments.includes("..") &&
+        !segments.includes(".")
+      );
+    })
+  );
+}
+
+function boundedBuilderLog(value: unknown, label: string): string {
+  if (typeof value !== "string")
+    throw new BuilderReceiptError(`${label} must be text.`);
+  if (byteLength(value) > maximumBuilderLogBytes)
+    throw new BuilderReceiptError(`${label} exceeds its size limit.`);
+  return value;
+}
+
+function validateBuilderTerminal(value: unknown): BuilderTerminalResult {
+  if (!isRecord(value))
+    throw new BuilderReceiptError("Builder terminal result must be an object.");
+  if (
+    !hasExactKeys(
+      value,
+      ["outcome", "summary", "validation"],
+      ["requested_action"],
+    ) ||
+    (value.outcome !== "completed" && value.outcome !== "blocked") ||
+    !boundedText(
+      value.summary,
+      "Builder summary",
+      maximumBuilderSummaryBytes,
+    ) ||
+    !isDenseArray(value.validation) ||
+    value.validation.length > 32 ||
+    !value.validation.every((entry) =>
+      boundedText(
+        entry,
+        "Builder validation evidence",
+        maximumBuilderEvidenceBytes,
+      ),
+    ) ||
+    (value.requested_action !== undefined &&
+      !boundedText(
+        value.requested_action,
+        "Builder requested action",
+        maximumBuilderEvidenceBytes,
+      ))
+  ) {
+    throw new BuilderReceiptError(
+      "Builder terminal result must be a completed or blocked bounded result.",
+    );
+  }
+  return value as unknown as BuilderTerminalResult;
+}
+
+interface ValidatedBuilderSuccess {
+  readonly kind: "succeeded";
+  readonly terminal: BuilderTerminalResult;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number | null;
+}
+
+interface ValidatedBuilderFailure {
+  readonly kind: "failed";
+  readonly reason: string;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly error?: string;
+}
+
+type ValidatedBuilderResult = ValidatedBuilderSuccess | ValidatedBuilderFailure;
+
+interface BuilderFailureDetails {
+  readonly terminal?: BuilderTerminalResult;
+  readonly stdout?: string;
+  readonly stderr?: string;
+  readonly exitCode?: number | null;
+  readonly signal?: string | null;
+  readonly error?: string;
+}
+
+function validateBuilderResult(value: unknown): ValidatedBuilderResult {
+  if (
+    !isRecord(value) ||
+    (value.kind !== "succeeded" && value.kind !== "failed")
+  )
+    throw new BuilderReceiptError("Builder invocation result kind is invalid.");
+  const stdout = boundedBuilderLog(value.stdout, "Builder stdout");
+  const stderr = boundedBuilderLog(value.stderr, "Builder stderr");
+  const exitCode = value.exitCode === undefined ? null : value.exitCode;
+  if (
+    exitCode !== null &&
+    (typeof exitCode !== "number" ||
+      !Number.isSafeInteger(exitCode) ||
+      exitCode < 0)
+  )
+    throw new BuilderReceiptError("Builder exit code is invalid.");
+  if (value.kind === "failed") {
+    if (
+      typeof value.reason !== "string" ||
+      value.reason.trim().length === 0 ||
+      byteLength(value.reason) > maximumIdentifierBytes
+    )
+      throw new BuilderReceiptError("Builder failure reason is invalid.");
+    if (value.signal !== null && typeof value.signal !== "string")
+      throw new BuilderReceiptError("Builder failure signal is invalid.");
+    const error =
+      value.error === undefined
+        ? undefined
+        : boundedBuilderLog(value.error, "Builder error");
+    return {
+      kind: "failed",
+      reason: value.reason,
+      stdout,
+      stderr,
+      exitCode,
+      signal: value.signal,
+      ...(error === undefined ? {} : { error }),
+    };
+  }
+  const terminal = validateBuilderTerminal(value.terminal);
+  if (exitCode !== null && exitCode !== 0)
+    throw new BuilderReceiptError("Builder success must have exit code zero.");
+  return { kind: "succeeded", terminal, stdout, stderr, exitCode };
+}
+
+function persistedWorkspaceReceipt(
+  run: RunRecord,
+): WorkspacePreparationReceipt {
+  try {
+    return validateWorkspaceReceipt({
+      path: run.worktreePath,
+      branch: run.branch,
+      baseBranch: run.baseBranch,
+      baseSha: run.baseSha,
+      headSha: run.headSha,
+      changedFiles: [],
+    });
+  } catch (error) {
+    throw new BuilderReceiptError(
+      `Persisted workspace facts are invalid: ${errorMessage(error)}`,
+    );
+  }
+}
+
+function assertSameWorkspace(
+  expected: WorkspacePreparationReceipt,
+  observed: WorkspacePreparationReceipt,
+): void {
+  if (
+    observed.path !== expected.path ||
+    observed.branch !== expected.branch ||
+    observed.baseBranch !== expected.baseBranch ||
+    observed.baseSha !== expected.baseSha
+  ) {
+    throw new BuilderReceiptError(
+      "Builder inspection changed the assigned workspace identity.",
+    );
+  }
+}
+
+function boundedFailureReason(reason: string): string {
+  let result = reason;
+  while (byteLength(result) > maximumBuilderSummaryBytes)
+    result = result.slice(0, -1);
+  return result || "Builder failed.";
+}
+
+function verificationPromptHash(command: string): string {
+  return createHash("sha256")
+    .update(`verification:${command}`, "utf8")
+    .digest("hex");
+}
+
+function boundedVerificationLog(value: unknown, label: string): string {
+  if (typeof value !== "string")
+    throw new BuilderReceiptError(`${label} must be text.`);
+  if (byteLength(value) > maximumVerificationLogBytes)
+    throw new BuilderReceiptError(`${label} exceeds its size limit.`);
+  return value;
+}
+
+function normalizedVerificationCommand(
+  value: unknown,
+  expected: string,
+): string {
+  if (typeof value === "string" && value === expected) return value;
+  if (
+    isDenseArray(value) &&
+    value.every((argument) => typeof argument === "string") &&
+    value.join(" ") === expected
+  )
+    return value.join(" ");
+  throw new BuilderReceiptError(
+    "Verification receipt command does not match intake.",
+  );
+}
+
+interface ValidatedVerificationResult {
+  readonly kind: "succeeded" | "failed";
+  readonly command: string;
+  readonly cwd: string;
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly headSha: string;
+  readonly reason?: string;
+}
+
+function validateVerificationResult(
+  value: unknown,
+  expectedCommand: string,
+  expectedCwd: string,
+  expectedHeadSha: string,
+): ValidatedVerificationResult {
+  if (
+    !isRecord(value) ||
+    (value.kind !== "succeeded" && value.kind !== "failed")
+  )
+    throw new BuilderReceiptError("Verification receipt kind is invalid.");
+  const command = normalizedVerificationCommand(value.command, expectedCommand);
+  if (value.cwd !== expectedCwd)
+    throw new BuilderReceiptError("Verification receipt cwd is invalid.");
+  if (typeof value.exitCode !== "number" && value.exitCode !== null)
+    throw new BuilderReceiptError("Verification exit code is invalid.");
+  if (
+    value.exitCode !== null &&
+    (!Number.isSafeInteger(value.exitCode) || value.exitCode < 0)
+  )
+    throw new BuilderReceiptError("Verification exit code is invalid.");
+  if (value.signal !== null && typeof value.signal !== "string")
+    throw new BuilderReceiptError("Verification signal is invalid.");
+  const stdout = boundedVerificationLog(value.stdout, "Verification stdout");
+  const stderr = boundedVerificationLog(value.stderr, "Verification stderr");
+  if (typeof value.headSha !== "string" || !shaPattern.test(value.headSha))
+    throw new BuilderReceiptError("Verification head SHA is invalid.");
+  if (value.headSha !== expectedHeadSha)
+    throw new BuilderReceiptError("Verification head SHA does not match.");
+  if (
+    value.kind === "succeeded" &&
+    (value.exitCode !== 0 || value.signal !== null)
+  )
+    throw new BuilderReceiptError(
+      "Verification success must have exit code zero and no signal.",
+    );
+  const reason =
+    value.kind === "failed" &&
+    typeof value.reason === "string" &&
+    value.reason.trim().length > 0
+      ? value.reason
+      : undefined;
+  return {
+    kind: value.kind,
+    command,
+    cwd: value.cwd,
+    exitCode: value.exitCode,
+    signal: value.signal,
+    stdout,
+    stderr,
+    headSha: value.headSha,
+    ...(reason === undefined ? {} : { reason }),
   };
 }
 
@@ -424,6 +835,52 @@ function intakeIntent(
   };
 }
 
+function builderIntent(
+  run: RunRecord,
+  intake: IntakeCapture,
+  workspace: WorkspacePreparationReceipt,
+  prompt: BuilderPromptReceipt,
+): EffectIntentCommand {
+  return {
+    key: builderEffectKey(run.id),
+    kind: "agent_build",
+    intent: {
+      runId: run.id,
+      issueNumber: run.issueNumber,
+      worktreePath: workspace.path,
+      branch: workspace.branch,
+      baseSha: workspace.baseSha,
+      changedFiles: workspace.changedFiles,
+      prompt: prompt.prompt,
+      promptHash: prompt.promptHash,
+      model: intake.builder.model,
+      reasoningEffort: intake.builder.reasoningEffort,
+      attempt: 1,
+    },
+    dispatch: false,
+  };
+}
+
+function verificationIntent(
+  run: RunRecord,
+  intake: IntakeCapture,
+  workspace: WorkspacePreparationReceipt,
+): EffectIntentCommand {
+  return {
+    key: verificationEffectKey(run.id),
+    kind: "verify",
+    intent: {
+      runId: run.id,
+      worktreePath: workspace.path,
+      command: intake.verificationCommand,
+      expectedHeadSha: workspace.headSha,
+      changedFiles: workspace.changedFiles,
+      attempt: 1,
+    },
+    dispatch: false,
+  };
+}
+
 function isDispatchable(effect: EffectRecord): boolean {
   return effect.status === "pending";
 }
@@ -450,12 +907,605 @@ async function schedule(
   });
 }
 
+async function settleVerificationFailure(
+  input: ExecuteClaimedRunInput,
+  run: RunRecord,
+  intake: IntakeCapture,
+  workspace: WorkspacePreparationReceipt,
+  effect: EffectRecord,
+  reason: string,
+  stdout: string,
+  stderr: string,
+  details:
+    | Pick<
+        ValidatedVerificationResult,
+        "command" | "cwd" | "exitCode" | "signal" | "headSha"
+      >
+    | undefined,
+  startedAt: string,
+  now: () => string,
+): Promise<ExecutionOutcome> {
+  const boundedReason = boundedFailureReason(
+    `${reason} stdout=${stdout} stderr=${stderr}`,
+  );
+  const trigger =
+    run.repairRound >= 2
+      ? "verification_failed_exhausted"
+      : "verification_failed_repairable";
+  const failureReceipt = {
+    kind: "failed" as const,
+    command: details?.command ?? intake.verificationCommand,
+    cwd: details?.cwd ?? workspace.path,
+    exitCode: details?.exitCode ?? null,
+    signal: details?.signal ?? null,
+    stdout,
+    stderr,
+    headSha: details?.headSha ?? workspace.headSha,
+    changedFiles: workspace.changedFiles,
+    reason: boundedFailureReason(reason),
+  };
+  try {
+    const settled = await input.coordinator.settleExecution({
+      runId: run.id,
+      expectedRevision: run.revision,
+      effectKey: effect.key,
+      outcome: "failed",
+      trigger,
+      evidence: boundedReason,
+      receipt: failureReceipt,
+      step: {
+        id: `run:${run.id}:verify:attempt:1:step`,
+        runId: run.id,
+        expectedRevision: run.revision,
+        reworkEpoch: run.reworkEpoch,
+        role: "verifier",
+        logicalStep: "verify",
+        attempt: 1,
+        statusSequence: 1,
+        status: "failed",
+        promptHash: verificationPromptHash(intake.verificationCommand),
+        model: intake.builder.model,
+        reasoningEffort: intake.builder.reasoningEffort,
+        startedAt,
+        completedAt: now(),
+        exitResultJson: JSON.stringify(failureReceipt),
+        summary: { text: boundedReason },
+        rawLogReference: `logs/${run.id}/verifier/attempt-1.jsonl`,
+      },
+      at: now(),
+    });
+    return {
+      kind: "verification_failed",
+      run: settled.run,
+      reason: boundedReason,
+    };
+  } catch (error) {
+    if (error instanceof StaleRevisionError) return { kind: "stale", run };
+    throw error;
+  }
+}
+
+async function executeVerificationStage(
+  input: ExecuteClaimedRunInput,
+  run: RunRecord,
+  intake: IntakeCapture,
+  intakeJson: string,
+  workspace: WorkspacePreparationReceipt,
+  now: () => string,
+): Promise<ExecutionOutcome> {
+  if (input.verify === undefined)
+    return { kind: "verifying", run, workspace, intakeJson };
+
+  let verificationEffect: EffectRecord | undefined;
+  try {
+    verificationEffect = await schedule(
+      input.coordinator,
+      run,
+      verificationIntent(run, intake, workspace),
+      now,
+    );
+  } catch (error) {
+    if (error instanceof StaleRevisionError) return { kind: "stale", run };
+    throw error;
+  }
+  if (verificationEffect === undefined) return { kind: "stale", run };
+
+  const startedAt = now();
+  let rawResult: unknown;
+  try {
+    rawResult = await input.verify({
+      command: intake.verificationCommand,
+      worktreePath: workspace.path,
+      intake,
+      expectedHeadSha: workspace.headSha,
+    });
+  } catch (error) {
+    return settleVerificationFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      verificationEffect,
+      `Verification invocation failed: ${errorMessage(error)}`,
+      "",
+      "",
+      undefined,
+      startedAt,
+      now,
+    );
+  }
+
+  let result: ValidatedVerificationResult;
+  try {
+    result = validateVerificationResult(
+      rawResult,
+      intake.verificationCommand,
+      workspace.path,
+      workspace.headSha,
+    );
+  } catch (error) {
+    return settleVerificationFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      verificationEffect,
+      `Malformed verification receipt: ${errorMessage(error)}`,
+      "",
+      "",
+      undefined,
+      startedAt,
+      now,
+    );
+  }
+
+  if (result.kind === "failed")
+    return settleVerificationFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      verificationEffect,
+      `Verification failed: ${result.reason ?? "verification command failed"}`,
+      result.stdout,
+      result.stderr,
+      result,
+      startedAt,
+      now,
+    );
+
+  const verification: VerificationReceipt = {
+    kind: "succeeded",
+    command: result.command,
+    cwd: result.cwd,
+    exitCode: 0,
+    signal: null,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    headSha: result.headSha,
+    changedFiles: workspace.changedFiles,
+  };
+  const completedAt = now();
+  try {
+    const settled = await input.coordinator.settleExecution({
+      runId: run.id,
+      expectedRevision: run.revision,
+      effectKey: verificationEffect.key,
+      outcome: "confirmed",
+      trigger: "verification_passed",
+      evidence: "Verification passed.",
+      receipt: verification,
+      facts: { headSha: verification.headSha },
+      step: {
+        id: `run:${run.id}:verify:attempt:1:step`,
+        runId: run.id,
+        expectedRevision: run.revision,
+        reworkEpoch: run.reworkEpoch,
+        role: "verifier",
+        logicalStep: "verify",
+        attempt: 1,
+        statusSequence: 1,
+        status: "completed",
+        promptHash: verificationPromptHash(intake.verificationCommand),
+        model: intake.builder.model,
+        reasoningEffort: intake.builder.reasoningEffort,
+        startedAt,
+        completedAt,
+        exitResultJson: JSON.stringify(verification),
+        summary: { text: "Verification passed." },
+        rawLogReference: `logs/${run.id}/verifier/attempt-1.jsonl`,
+      },
+      at: completedAt,
+    });
+    return { kind: "reviewing", run: settled.run, verification };
+  } catch (error) {
+    if (error instanceof StaleRevisionError) return { kind: "stale", run };
+    throw error;
+  }
+}
+
+async function settleBuilderFailure(
+  input: ExecuteClaimedRunInput,
+  run: RunRecord,
+  intake: IntakeCapture,
+  workspace: WorkspacePreparationReceipt,
+  prompt: BuilderPromptReceipt,
+  effect: EffectRecord,
+  reason: string,
+  details: BuilderFailureDetails | undefined,
+  startedAt: string,
+  now: () => string,
+): Promise<ExecutionOutcome> {
+  const boundedReason = boundedFailureReason(reason);
+  const failureReceipt = {
+    kind: "failed" as const,
+    promptHash: prompt.promptHash,
+    model: intake.builder.model,
+    reasoningEffort: intake.builder.reasoningEffort,
+    summary: boundedReason,
+    headSha: workspace.headSha,
+    changedFiles: workspace.changedFiles,
+    ...(details?.terminal === undefined ? {} : { terminal: details.terminal }),
+    stdout: details?.stdout ?? "",
+    stderr: details?.stderr ?? "",
+    exitCode: details?.exitCode ?? null,
+    signal: details?.signal ?? null,
+    ...(details?.error === undefined ? {} : { error: details.error }),
+  };
+  try {
+    const settled = await input.coordinator.settleExecution({
+      runId: run.id,
+      expectedRevision: run.revision,
+      effectKey: effect.key,
+      outcome: "failed",
+      trigger: "builder_exhausted",
+      evidence: boundedReason,
+      receipt: failureReceipt,
+      step: {
+        id: `run:${run.id}:builder:attempt:1:step`,
+        runId: run.id,
+        expectedRevision: run.revision,
+        reworkEpoch: run.reworkEpoch,
+        role: "builder",
+        logicalStep: "build",
+        attempt: 1,
+        statusSequence: 1,
+        status: "failed",
+        promptHash: prompt.promptHash,
+        model: intake.builder.model,
+        reasoningEffort: intake.builder.reasoningEffort,
+        startedAt,
+        completedAt: now(),
+        exitResultJson: JSON.stringify(failureReceipt),
+        summary: { text: boundedReason },
+        rawLogReference: `logs/${run.id}/builder/attempt-1.jsonl`,
+      },
+      at: now(),
+    });
+    return { kind: "builder_failed", run: settled.run, reason: boundedReason };
+  } catch (error) {
+    if (error instanceof StaleRevisionError) return { kind: "stale", run };
+    throw error;
+  }
+}
+
+async function executeBuilderStage(
+  input: ExecuteClaimedRunInput,
+  run: RunRecord,
+  intake: IntakeCapture,
+  intakeJson: string,
+  workspace: WorkspacePreparationReceipt,
+  now: () => string,
+): Promise<ExecutionOutcome> {
+  if (input.builder === undefined)
+    return { kind: "building", run, workspace, intakeJson };
+
+  let prompt: BuilderPromptReceipt;
+  try {
+    prompt = validatePromptReceipt(
+      await input.builder.render({
+        issueNumber: run.issueNumber,
+        worktreePath: workspace.path,
+        baseSha: workspace.baseSha,
+        intake,
+      }),
+    );
+  } catch (error) {
+    throw new BuilderReceiptError(
+      `Builder prompt rendering failed: ${errorMessage(error)}`,
+    );
+  }
+
+  let builderEffect: EffectRecord | undefined;
+  try {
+    builderEffect = await schedule(
+      input.coordinator,
+      run,
+      builderIntent(run, intake, workspace, prompt),
+      now,
+    );
+  } catch (error) {
+    if (error instanceof StaleRevisionError) return { kind: "stale", run };
+    throw error;
+  }
+  if (builderEffect === undefined) return { kind: "stale", run };
+
+  const startedAt = now();
+  let rawResult: unknown;
+  try {
+    rawResult = await input.builder.invoke({
+      issueNumber: run.issueNumber,
+      worktreePath: workspace.path,
+      baseSha: workspace.baseSha,
+      intake,
+      prompt: prompt.prompt,
+      promptHash: prompt.promptHash,
+      model: intake.builder.model,
+      reasoningEffort: intake.builder.reasoningEffort,
+    });
+  } catch (error) {
+    return settleBuilderFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      prompt,
+      builderEffect,
+      `Builder invocation failed: ${errorMessage(error)}`,
+      undefined,
+      startedAt,
+      now,
+    );
+  }
+
+  let result: ValidatedBuilderResult;
+  try {
+    if (!isRecord(rawResult))
+      throw new BuilderReceiptError("Builder receipt must be an object.");
+    if (
+      rawResult.promptHash !== undefined &&
+      rawResult.promptHash !== prompt.promptHash
+    )
+      throw new BuilderReceiptError("Builder prompt hash does not match.");
+    if (
+      rawResult.model !== undefined &&
+      rawResult.model !== intake.builder.model
+    )
+      throw new BuilderReceiptError("Builder model does not match intake.");
+    if (
+      rawResult.reasoningEffort !== undefined &&
+      rawResult.reasoningEffort !== intake.builder.reasoningEffort
+    )
+      throw new BuilderReceiptError(
+        "Builder reasoning effort does not match intake.",
+      );
+    result = validateBuilderResult(rawResult);
+  } catch (error) {
+    return settleBuilderFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      prompt,
+      builderEffect,
+      `Malformed builder receipt: ${errorMessage(error)}`,
+      undefined,
+      startedAt,
+      now,
+    );
+  }
+
+  if (result.kind === "failed")
+    return settleBuilderFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      prompt,
+      builderEffect,
+      `Builder failed: ${result.reason}`,
+      result,
+      startedAt,
+      now,
+    );
+
+  if (result.terminal.outcome === "blocked")
+    return settleBuilderFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      prompt,
+      builderEffect,
+      `Builder blocked: ${result.terminal.summary}${
+        result.terminal.requested_action === undefined
+          ? ""
+          : ` Requested action: ${result.terminal.requested_action}`
+      }`,
+      {
+        terminal: result.terminal,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+      },
+      startedAt,
+      now,
+    );
+
+  let observedWorkspace: WorkspacePreparationReceipt;
+  try {
+    observedWorkspace = validateWorkspaceReceipt(
+      await input.workspaceInspect(run, workspace),
+    );
+    assertSameWorkspace(workspace, observedWorkspace);
+    if (isRecord(rawResult) && rawResult.headSha !== undefined) {
+      if (
+        typeof rawResult.headSha !== "string" ||
+        !shaPattern.test(rawResult.headSha) ||
+        rawResult.headSha !== observedWorkspace.headSha
+      )
+        throw new BuilderReceiptError(
+          "Builder head SHA does not match workspace.",
+        );
+    }
+  } catch (error) {
+    return settleBuilderFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      prompt,
+      builderEffect,
+      `Builder workspace inspection failed: ${errorMessage(error)}`,
+      undefined,
+      startedAt,
+      now,
+    );
+  }
+
+  const completedAt = now();
+  const builder: BuilderReceipt = {
+    kind: "succeeded",
+    promptHash: prompt.promptHash,
+    model: intake.builder.model,
+    reasoningEffort: intake.builder.reasoningEffort,
+    terminal: result.terminal,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    headSha: observedWorkspace.headSha,
+    changedFiles: observedWorkspace.changedFiles,
+  };
+  try {
+    const settled = await input.coordinator.settleExecution({
+      runId: run.id,
+      expectedRevision: run.revision,
+      effectKey: builderEffect.key,
+      outcome: "confirmed",
+      trigger: "builder_succeeded",
+      evidence: boundedFailureReason(result.terminal.summary),
+      receipt: builder,
+      facts: { headSha: observedWorkspace.headSha },
+      step: {
+        id: `run:${run.id}:builder:attempt:1:step`,
+        runId: run.id,
+        expectedRevision: run.revision,
+        reworkEpoch: run.reworkEpoch,
+        role: "builder",
+        logicalStep: "build",
+        attempt: 1,
+        statusSequence: 1,
+        status: "completed",
+        promptHash: prompt.promptHash,
+        model: intake.builder.model,
+        reasoningEffort: intake.builder.reasoningEffort,
+        startedAt,
+        completedAt,
+        exitResultJson: JSON.stringify(builder),
+        summary: { text: result.terminal.summary },
+        rawLogReference: `logs/${run.id}/builder/attempt-1.jsonl`,
+      },
+      at: completedAt,
+    });
+    return executeVerificationStage(
+      input,
+      settled.run,
+      intake,
+      intakeJson,
+      observedWorkspace,
+      now,
+    );
+  } catch (error) {
+    if (error instanceof StaleRevisionError) return { kind: "stale", run };
+    throw error;
+  }
+}
+
 export async function executeClaimedRun(
   input: ExecuteClaimedRunInput,
 ): Promise<ExecutionOutcome> {
   const now = input.now ?? (() => new Date().toISOString());
+  if (input.run.state === "verifying") {
+    let intake: IntakeCapture;
+    let intakeJson: string;
+    let workspace: WorkspacePreparationReceipt;
+    try {
+      if (input.run.intakeJson === null)
+        throw new IntakeCaptureError("Verifying run has no persisted intake.");
+      intake = validateIntakeCapture(JSON.parse(input.run.intakeJson));
+      intakeJson = validateJsonIntake(intake);
+      workspace = persistedWorkspaceReceipt(input.run);
+    } catch (error) {
+      throw new BuilderReceiptError(
+        `Verifying run cannot be resumed: ${errorMessage(error)}`,
+      );
+    }
+    if (input.verify !== undefined) {
+      try {
+        const inspected = validateWorkspaceReceipt(
+          await input.workspaceInspect(input.run, workspace),
+        );
+        assertSameWorkspace(workspace, inspected);
+        workspace = inspected;
+      } catch (error) {
+        throw new BuilderReceiptError(
+          `Verifying workspace cannot be resumed: ${errorMessage(error)}`,
+        );
+      }
+    }
+    return executeVerificationStage(
+      input,
+      input.run,
+      intake,
+      intakeJson,
+      workspace,
+      now,
+    );
+  }
+  if (input.run.state === "building") {
+    let intake: IntakeCapture;
+    let intakeJson: string;
+    let workspace: WorkspacePreparationReceipt;
+    try {
+      if (input.run.intakeJson === null)
+        throw new IntakeCaptureError("Building run has no persisted intake.");
+      intake = validateIntakeCapture(JSON.parse(input.run.intakeJson));
+      intakeJson = validateJsonIntake(intake);
+      workspace = persistedWorkspaceReceipt(input.run);
+    } catch (error) {
+      throw new BuilderReceiptError(
+        `Building run cannot be resumed: ${errorMessage(error)}`,
+      );
+    }
+    if (input.builder !== undefined) {
+      try {
+        const inspected = validateWorkspaceReceipt(
+          await input.workspaceInspect(input.run, workspace),
+        );
+        assertSameWorkspace(workspace, inspected);
+        workspace = inspected;
+      } catch (error) {
+        throw new BuilderReceiptError(
+          `Building workspace cannot be resumed: ${errorMessage(error)}`,
+        );
+      }
+    }
+    return executeBuilderStage(
+      input,
+      input.run,
+      intake,
+      intakeJson,
+      workspace,
+      now,
+    );
+  }
   if (input.run.state !== "preparing") return { kind: "stale", run: input.run };
-  const intake = validateIntakeCapture(input.intake ?? input.intakeCapture);
+  const intakeValue = input.intake ?? input.intakeCapture;
+  if (intakeValue === undefined)
+    throw new IntakeCaptureError(
+      "Intake capture is required before preparing.",
+    );
+  const intake = validateIntakeCapture(intakeValue);
   const intakeJson = validateJsonIntake(intake);
 
   let workspaceEffect: EffectRecord | undefined;
@@ -548,10 +1598,12 @@ export async function executeClaimedRun(
     facts: { intakeJson },
     at: now(),
   });
-  return {
-    kind: "building",
-    run: intakeSettled.run,
-    workspace,
+  return executeBuilderStage(
+    input,
+    intakeSettled.run,
+    intake,
     intakeJson,
-  };
+    workspace,
+    now,
+  );
 }

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { cp, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,9 @@ const connections: ReturnType<typeof openDatabase>[] = [];
 const firstAt = "2026-08-09T10:00:00.000Z";
 const baseSha = "a".repeat(40);
 const headSha = "b".repeat(40);
+const builtHeadSha = "c".repeat(40);
+const prompt = "rendered builder prompt";
+const promptHash = createHash("sha256").update(prompt, "utf8").digest("hex");
 
 async function createDatabase(): Promise<ReturnType<typeof openDatabase>> {
   const directory = await mkdtemp(join(tmpdir(), "wheelsparrow-execution-"));
@@ -70,6 +74,7 @@ function receipt(): WorkspacePreparationReceipt {
     baseBranch: "main",
     baseSha,
     headSha,
+    changedFiles: [],
   };
 }
 
@@ -112,6 +117,613 @@ afterEach(async () => {
 });
 
 describe("executeClaimedRun", () => {
+  test("runs builder after committed intake and persists its receipt atomically", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await preparingRun(coordinator, connection);
+    const preparing = await executeClaimedRun({
+      coordinator,
+      run,
+      now: () => "2026-08-09T10:02:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => receipt(),
+    });
+    expect(preparing.kind).toBe("building");
+    const building = await readRun(connection.db, "run-1");
+    const intentStatuses: string[] = [];
+    let inspectCalls = 0;
+
+    const outcome = await executeClaimedRun({
+      coordinator,
+      run: building,
+      now: () => "2026-08-09T10:02:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => {
+        throw new Error("workspace must not run from building");
+      },
+      workspaceInspect: async () => {
+        inspectCalls += 1;
+        return { ...receipt(), headSha: builtHeadSha };
+      },
+      builder: {
+        render: async (input) => {
+          expect(input.worktreePath).toBe(receipt().path);
+          expect(input.intake).toEqual(intakeCapture());
+          return { prompt, promptHash: promptHash };
+        },
+        invoke: async (input) => {
+          intentStatuses.push(
+            (
+              connection.native
+                .prepare("SELECT status FROM side_effects WHERE key = ?")
+                .get("run:run-1:agent:builder:attempt:1") as { status: string }
+            ).status,
+          );
+          expect(input.worktreePath).toBe(receipt().path);
+          expect(input.intake).toEqual(intakeCapture());
+          return {
+            kind: "succeeded" as const,
+            terminal: {
+              outcome: "completed" as const,
+              summary: "Implemented the issue.",
+              validation: ["pnpm test:unit"],
+            },
+            stdout: "builder output",
+            stderr: "",
+            exitCode: 0,
+          };
+        },
+      },
+    });
+
+    expect(inspectCalls).toBe(2);
+    expect(intentStatuses).toEqual(["in_flight"]);
+    expect(outcome).toMatchObject({
+      kind: "verifying",
+      run: {
+        id: "run-1",
+        state: "verifying",
+        revision: building.revision + 1,
+        worktreePath: receipt().path,
+        branch: receipt().branch,
+        baseSha,
+        headSha: builtHeadSha,
+      },
+    });
+
+    expect(
+      connection.native
+        .prepare(
+          `SELECT role, logical_step, attempt, status_sequence, status,
+                  prompt_hash, model, reasoning_effort, started_at,
+                  completed_at, exit_result_json, summary, raw_log_reference
+             FROM steps WHERE run_id = ? ORDER BY rowid`,
+        )
+        .all("run-1"),
+    ).toEqual([
+      {
+        role: "builder",
+        logical_step: "build",
+        attempt: 1,
+        status_sequence: 1,
+        status: "completed",
+        prompt_hash: promptHash,
+        model: "gpt-5.6-sol",
+        reasoning_effort: "high",
+        started_at: "2026-08-09T10:02:00.000Z",
+        completed_at: "2026-08-09T10:02:00.000Z",
+        exit_result_json: JSON.stringify({
+          kind: "succeeded",
+          promptHash: promptHash,
+          model: "gpt-5.6-sol",
+          reasoningEffort: "high",
+          terminal: {
+            outcome: "completed",
+            summary: "Implemented the issue.",
+            validation: ["pnpm test:unit"],
+          },
+          stdout: "builder output",
+          stderr: "",
+          exitCode: 0,
+          headSha: builtHeadSha,
+          changedFiles: [],
+        }),
+        summary: "Implemented the issue.",
+        raw_log_reference: "logs/run-1/builder/attempt-1.jsonl",
+      },
+    ]);
+    await coordinator.close();
+  });
+
+  test("runs workspace, builder, and verification in durable order", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const order: string[] = [];
+    const intentStatuses: string[] = [];
+    let inspectCalls = 0;
+
+    const outcome = await executeClaimedRun({
+      coordinator,
+      run: await preparingRun(coordinator, connection),
+      now: () => "2026-08-09T10:02:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => {
+        order.push("workspace");
+        intentStatuses.push(
+          (
+            connection.native
+              .prepare("SELECT status FROM side_effects WHERE key = ?")
+              .get("run:run-1:workspace:prepare") as { status: string }
+          ).status,
+        );
+        return receipt();
+      },
+      workspaceInspect: async () => {
+        inspectCalls += 1;
+        return inspectCalls === 1
+          ? receipt()
+          : { ...receipt(), headSha: builtHeadSha };
+      },
+      builder: {
+        render: async (input) => {
+          expect(input.worktreePath).toBe(receipt().path);
+          expect(input.intake).toEqual(intakeCapture());
+          return { prompt, promptHash: promptHash };
+        },
+        invoke: async (input) => {
+          order.push("builder");
+          intentStatuses.push(
+            (
+              connection.native
+                .prepare("SELECT status FROM side_effects WHERE key = ?")
+                .get("run:run-1:agent:builder:attempt:1") as { status: string }
+            ).status,
+          );
+          expect(input.worktreePath).toBe(receipt().path);
+          expect(input.intake).toEqual(intakeCapture());
+          return {
+            kind: "succeeded" as const,
+            terminal: {
+              outcome: "completed" as const,
+              summary: "Implemented the issue.",
+              validation: ["pnpm test:unit"],
+            },
+            stdout: "builder output",
+            stderr: "",
+            exitCode: 0,
+          };
+        },
+      },
+      verify: async (input) => {
+        order.push("verify");
+        intentStatuses.push(
+          (
+            connection.native
+              .prepare("SELECT status FROM side_effects WHERE key = ?")
+              .get("run:run-1:verify:attempt:1") as { status: string }
+          ).status,
+        );
+        expect(input.worktreePath).toBe(receipt().path);
+        expect(input.intake).toEqual(intakeCapture());
+        expect(input.command).toBe(intakeCapture().verificationCommand);
+        expect(input.expectedHeadSha).toBe(builtHeadSha);
+        return {
+          kind: "succeeded" as const,
+          command: intakeCapture().verificationCommand,
+          cwd: receipt().path,
+          exitCode: 0,
+          signal: null,
+          stdout: "verification output",
+          stderr: "",
+          headSha: builtHeadSha,
+        };
+      },
+    });
+
+    expect(order).toEqual(["workspace", "builder", "verify"]);
+    expect(intentStatuses).toEqual(["in_flight", "in_flight", "in_flight"]);
+    expect(inspectCalls).toBe(2);
+    expect(outcome).toMatchObject({
+      kind: "reviewing",
+      run: {
+        id: "run-1",
+        state: "reviewing",
+        revision: 6,
+        headSha: builtHeadSha,
+      },
+    });
+    expect(
+      connection.native
+        .prepare(
+          `SELECT role, logical_step, attempt, status_sequence, status,
+                  prompt_hash, model, reasoning_effort, exit_result_json,
+                  summary, raw_log_reference
+             FROM steps WHERE run_id = ? ORDER BY rowid`,
+        )
+        .all("run-1"),
+    ).toHaveLength(2);
+    await coordinator.close();
+  });
+
+  test("rejects a prompt hash that does not hash the rendered prompt", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const preparing = await executeClaimedRun({
+      coordinator,
+      run: await preparingRun(coordinator, connection),
+      now: () => "2026-08-09T10:02:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => receipt(),
+    });
+    expect(preparing.kind).toBe("building");
+    const building = await readRun(connection.db, "run-1");
+    let invokeCalls = 0;
+
+    await expect(
+      executeClaimedRun({
+        coordinator,
+        run: building,
+        now: () => "2026-08-09T10:03:00.000Z",
+        intake: intakeCapture(),
+        workspacePrepare: async () => receipt(),
+        workspaceInspect: async () => receipt(),
+        builder: {
+          render: async () => ({ prompt, promptHash: "a".repeat(64) }),
+          invoke: async () => {
+            invokeCalls += 1;
+            return {};
+          },
+        },
+      }),
+    ).rejects.toThrow(/prompt hash/iu);
+    expect(invokeCalls).toBe(0);
+    expect(
+      connection.native
+        .prepare("SELECT key FROM side_effects WHERE kind = ?")
+        .all("agent_build"),
+    ).toEqual([]);
+    await coordinator.close();
+  });
+
+  test("routes a failed verification to repair without invoking repair", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const builderPhase = await executeClaimedRun({
+      coordinator,
+      run: await preparingRun(coordinator, connection),
+      now: () => "2026-08-09T10:02:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => receipt(),
+      builder: {
+        render: async () => ({ prompt, promptHash: promptHash }),
+        invoke: async () => ({
+          kind: "succeeded" as const,
+          terminal: {
+            outcome: "completed" as const,
+            summary: "Implemented the issue.",
+            validation: ["pnpm test:unit"],
+          },
+          stdout: "builder output",
+          stderr: "",
+          exitCode: 0,
+        }),
+      },
+    });
+    expect(builderPhase).toMatchObject({ kind: "verifying" });
+    const verifying = await readRun(connection.db, "run-1");
+    let verifyCalls = 0;
+
+    const outcome = await executeClaimedRun({
+      coordinator,
+      run: verifying,
+      now: () => "2026-08-09T10:03:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => receipt(),
+      verify: async () => {
+        verifyCalls += 1;
+        return {
+          kind: "failed" as const,
+          reason: "nonzero_exit" as const,
+          command: intakeCapture().verificationCommand,
+          cwd: receipt().path,
+          exitCode: 1,
+          signal: null,
+          stdout: "failing test",
+          stderr: "",
+          headSha: receipt().headSha,
+        };
+      },
+    });
+
+    expect(verifyCalls).toBe(1);
+    expect(outcome).toMatchObject({
+      kind: "verification_failed",
+      run: { state: "repairing", repairRound: 1 },
+    });
+    expect(
+      connection.native
+        .prepare("SELECT key, status FROM side_effects WHERE key = ?")
+        .get("run:run-1:verify:attempt:1"),
+    ).toEqual({
+      key: "run:run-1:verify:attempt:1",
+      status: "failed",
+    });
+    expect(
+      JSON.parse(
+        (
+          connection.native
+            .prepare(
+              "SELECT exit_result_json FROM steps WHERE logical_step = ?",
+            )
+            .get("verify") as { exit_result_json: string }
+        ).exit_result_json,
+      ),
+    ).toMatchObject({
+      kind: "failed",
+      command: intakeCapture().verificationCommand,
+      exitCode: 1,
+      headSha: receipt().headSha,
+      stdout: "failing test",
+    });
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?")
+        .get("run-1"),
+    ).toEqual({ count: 2 });
+    await coordinator.close();
+  });
+
+  test("does not invoke a confirmed verification effect on a stale resume", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const builderPhase = await executeClaimedRun({
+      coordinator,
+      run: await preparingRun(coordinator, connection),
+      now: () => "2026-08-09T10:02:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => receipt(),
+      builder: {
+        render: async () => ({ prompt, promptHash: promptHash }),
+        invoke: async () => ({
+          kind: "succeeded" as const,
+          terminal: {
+            outcome: "completed" as const,
+            summary: "Implemented the issue.",
+            validation: ["pnpm test:unit"],
+          },
+          stdout: "builder output",
+          stderr: "",
+          exitCode: 0,
+        }),
+      },
+    });
+    expect(builderPhase).toMatchObject({ kind: "verifying" });
+    const verifying = await readRun(connection.db, "run-1");
+    let verifyCalls = 0;
+    const verify = async () => {
+      verifyCalls += 1;
+      return {
+        kind: "succeeded" as const,
+        command: intakeCapture().verificationCommand,
+        cwd: receipt().path,
+        exitCode: 0,
+        signal: null,
+        stdout: "verification output",
+        stderr: "",
+        headSha: receipt().headSha,
+      };
+    };
+
+    const first = await executeClaimedRun({
+      coordinator,
+      run: verifying,
+      now: () => "2026-08-09T10:03:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => receipt(),
+      verify,
+    });
+    const resumed = await executeClaimedRun({
+      coordinator,
+      run: verifying,
+      now: () => "2026-08-09T10:04:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => receipt(),
+      verify,
+    });
+
+    expect(first).toMatchObject({ kind: "reviewing" });
+    expect(resumed).toEqual({ kind: "stale", run: verifying });
+    expect(verifyCalls).toBe(1);
+    await coordinator.close();
+  });
+
+  test.each([
+    [
+      "throws",
+      async () => {
+        throw new Error("builder unavailable");
+      },
+    ],
+    [
+      "returns a blocked terminal",
+      async () => ({
+        kind: "succeeded" as const,
+        terminal: {
+          outcome: "blocked" as const,
+          summary: "The builder could not continue.",
+          validation: [],
+          requested_action: "Provide the missing dependency.",
+        },
+        stdout: "builder output",
+        stderr: "",
+        exitCode: 0,
+      }),
+    ],
+    [
+      "returns a failed runner classification",
+      async () => ({
+        kind: "failed" as const,
+        reason: "timeout" as const,
+        stdout: "partial builder output",
+        stderr: "builder timed out",
+        exitCode: null,
+        signal: "SIGTERM" as const,
+        error: "timed out after 30 minutes",
+      }),
+    ],
+  ] as const)(
+    "hands off after a builder %s without verification",
+    async (description, invoke) => {
+      const connection = await createDatabase();
+      const coordinator = new WorkflowCoordinator({ connection });
+      const preparing = await executeClaimedRun({
+        coordinator,
+        run: await preparingRun(coordinator, connection),
+        now: () => "2026-08-09T10:02:00.000Z",
+        intake: intakeCapture(),
+        workspacePrepare: async () => receipt(),
+        workspaceInspect: async () => receipt(),
+      });
+      expect(preparing.kind).toBe("building");
+      const building = await readRun(connection.db, "run-1");
+      let inspectCalls = 0;
+
+      const outcome = await executeClaimedRun({
+        coordinator,
+        run: building,
+        now: () => "2026-08-09T10:03:00.000Z",
+        intake: intakeCapture(),
+        workspacePrepare: async () => {
+          throw new Error("workspace must not run from building");
+        },
+        workspaceInspect: async () => {
+          inspectCalls += 1;
+          return receipt();
+        },
+        builder: {
+          render: async () => ({ prompt, promptHash: promptHash }),
+          invoke,
+        },
+      });
+
+      expect(inspectCalls).toBe(1);
+      expect(outcome).toMatchObject({
+        kind: "builder_failed",
+        run: { state: "review" },
+      });
+      expect((outcome as { reason: string }).reason).toMatch(/builder/iu);
+      expect(
+        connection.native
+          .prepare(
+            "SELECT key, kind, status, failure FROM side_effects WHERE key = ?",
+          )
+          .get("run:run-1:agent:builder:attempt:1"),
+      ).toMatchObject({
+        key: "run:run-1:agent:builder:attempt:1",
+        kind: "agent_build",
+        status: "failed",
+      });
+      expect(
+        connection.native
+          .prepare("SELECT status, summary FROM steps WHERE run_id = ?")
+          .get("run-1"),
+      ).toMatchObject({ status: "failed" });
+      if (description === "returns a blocked terminal") {
+        const step = connection.native
+          .prepare("SELECT exit_result_json FROM steps WHERE logical_step = ?")
+          .get("build") as { exit_result_json: string };
+        expect(JSON.parse(step.exit_result_json)).toMatchObject({
+          terminal: {
+            outcome: "blocked",
+            requested_action: "Provide the missing dependency.",
+          },
+        });
+      }
+      if (description === "returns a failed runner classification") {
+        const step = connection.native
+          .prepare("SELECT exit_result_json FROM steps WHERE logical_step = ?")
+          .get("build") as { exit_result_json: string };
+        expect(JSON.parse(step.exit_result_json)).toMatchObject({
+          kind: "failed",
+          stdout: "partial builder output",
+          stderr: "builder timed out",
+          signal: "SIGTERM",
+          error: "timed out after 30 minutes",
+        });
+      }
+      await coordinator.close();
+    },
+  );
+
+  test("does not invoke a confirmed builder effect on a stale resume", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const preparing = await executeClaimedRun({
+      coordinator,
+      run: await preparingRun(coordinator, connection),
+      now: () => "2026-08-09T10:02:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => receipt(),
+    });
+    expect(preparing.kind).toBe("building");
+    const building = await readRun(connection.db, "run-1");
+    let builderCalls = 0;
+    const builder = {
+      render: async () => ({ prompt, promptHash: promptHash }),
+      invoke: async () => {
+        builderCalls += 1;
+        return {
+          kind: "succeeded" as const,
+          terminal: {
+            outcome: "completed" as const,
+            summary: "Implemented the issue.",
+            validation: ["pnpm test:unit"],
+          },
+          stdout: "builder output",
+          stderr: "",
+          exitCode: 0,
+        };
+      },
+    };
+
+    const first = await executeClaimedRun({
+      coordinator,
+      run: building,
+      now: () => "2026-08-09T10:03:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => ({ ...receipt(), headSha: builtHeadSha }),
+      builder,
+    });
+    const resumed = await executeClaimedRun({
+      coordinator,
+      run: building,
+      now: () => "2026-08-09T10:04:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => ({ ...receipt(), headSha: builtHeadSha }),
+      builder,
+    });
+
+    expect(first).toMatchObject({ kind: "verifying" });
+    expect(resumed).toEqual({ kind: "stale", run: building });
+    expect(builderCalls).toBe(1);
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?")
+        .get("run-1"),
+    ).toEqual({ count: 1 });
+    await coordinator.close();
+  });
+
   test("commits workspace intent before the edge and settles deterministic intake", async () => {
     const connection = await createDatabase();
     const coordinator = new WorkflowCoordinator({ connection });
@@ -194,6 +806,10 @@ describe("executeClaimedRun", () => {
 
   test.each([
     ["malformed inspection", async () => ({ path: "/tmp/not-enough" })],
+    [
+      "inspection changed-files escape",
+      async () => ({ ...receipt(), changedFiles: ["../escape"] }),
+    ],
     [
       "failed edge",
       async () => {
