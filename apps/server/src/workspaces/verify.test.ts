@@ -34,6 +34,22 @@ function invocation(
   };
 }
 
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await readFile(path);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`expected ${path} to be written before timeout`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories
@@ -118,7 +134,7 @@ describe("contained verification process", () => {
   test("times out and terminates a process tree", async () => {
     const { root, worktree } = await temporaryWorktree();
     const descendantPidPath = join(root, "descendant.pid");
-    const result = await runVerification(
+    const resultPromise = runVerification(
       invocation(
         [
           process.execPath,
@@ -133,9 +149,11 @@ describe("contained verification process", () => {
         ],
         worktree,
         join(root, "workspace"),
-        100,
+        1_000,
       ),
     );
+    await waitForFile(descendantPidPath);
+    const result = await resultPromise;
 
     expect(result).toMatchObject({ kind: "failed", reason: "timeout" });
     expect(result.stdout.length).toBeLessThanOrEqual(16_384);

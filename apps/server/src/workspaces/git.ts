@@ -3,7 +3,12 @@ import { lstat, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+const DEFAULT_RAW_DIFF_MAX_BYTES = 256 * 1024;
 const GIT_TIMEOUT_MS = 30_000;
+const RAW_DIFF_DEADLINE_MS = 30_000;
+const MAX_UNTRACKED_PATHS = 128;
+const MAX_UNTRACKED_PATH_BYTES = 512;
+const MAX_UNTRACKED_FILE_BYTES = 256 * 1024;
 const shaPattern = /^[0-9a-f]{40}$/u;
 const refPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u;
 const runIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -40,6 +45,11 @@ export interface InspectRunWorktreeInput {
   readonly git?: GitRunner;
 }
 
+export interface ReadRunWorktreeDiffInput extends InspectRunWorktreeInput {
+  /** Maximum UTF-8 bytes returned to a reviewer prompt. */
+  readonly maxBytes?: number;
+}
+
 export interface RunWorktreeInspection extends RunWorktreeReceipt {
   readonly baseBranch: "main";
   /** Paths changed from the assigned worktree's base, relative to that worktree. */
@@ -69,8 +79,14 @@ function terminateGitProcessTree(child: ChildProcess): void {
   }
 }
 
-export const realGit: GitRunner = (cwd, args) =>
-  new Promise((resolveGit, rejectGit) => {
+function runGitProcess(
+  cwd: string,
+  args: readonly string[],
+  acceptedExitCodes: readonly number[] = [0],
+  timeoutMs = GIT_TIMEOUT_MS,
+  maxOutputBytes = MAX_OUTPUT_BYTES,
+): Promise<string> {
+  return new Promise((resolveGit, rejectGit) => {
     const child = spawn("git", [...args], {
       cwd,
       detached: process.platform !== "win32",
@@ -87,7 +103,7 @@ export const realGit: GitRunner = (cwd, args) =>
 
     const capture = (target: "stdout" | "stderr", chunk: Buffer): void => {
       const current = target === "stdout" ? stdout : stderr;
-      const available = MAX_OUTPUT_BYTES - current.length;
+      const available = maxOutputBytes - current.length;
       if (available <= 0) {
         outputExceeded = true;
         terminateGitProcessTree(child);
@@ -122,7 +138,7 @@ export const realGit: GitRunner = (cwd, args) =>
       timedOut = true;
       terminateGitProcessTree(child);
       rejectBoundary();
-    }, GIT_TIMEOUT_MS);
+    }, timeoutMs);
 
     const rejectBoundary = (): void => {
       if (settled) return;
@@ -130,13 +146,24 @@ export const realGit: GitRunner = (cwd, args) =>
       clearTimeout(timeout);
       // Git can include remotes, credentials, or arbitrary hook output in an
       // exception. Keep the boundary diagnostic deliberately non-sensitive.
-      rejectGit(new WorktreeBoundaryError("Git command failed or timed out"));
+      rejectGit(
+        new WorktreeBoundaryError(
+          outputExceeded
+            ? "Git command output exceeded its bound"
+            : "Git command failed or timed out",
+        ),
+      );
     };
 
     child.once("error", rejectBoundary);
     child.once("close", (exitCode) => {
       if (settled) return;
-      if (timedOut || outputExceeded || exitCode !== 0) {
+      if (
+        timedOut ||
+        outputExceeded ||
+        exitCode === null ||
+        !acceptedExitCodes.includes(exitCode)
+      ) {
         rejectBoundary();
         return;
       }
@@ -145,6 +172,10 @@ export const realGit: GitRunner = (cwd, args) =>
       resolveGit(stdout.toString("utf8"));
     });
   });
+}
+
+export const realGit: GitRunner = (cwd, args) =>
+  runGitProcess(cwd, args, args.includes("--no-index") ? [0, 1] : [0]);
 
 function assertRef(value: string, label: string): void {
   if (
@@ -443,6 +474,11 @@ function assertChangedPathContained(
   if (changedPath.length === 0 || changedPath.includes("\0")) {
     throw new WorktreeBoundaryError("Git reported an invalid changed path");
   }
+  if (Buffer.byteLength(changedPath, "utf8") > MAX_UNTRACKED_PATH_BYTES) {
+    throw new WorktreeBoundaryError(
+      "Git reported an excessively long changed path",
+    );
+  }
   // Git's -z output uses slash separators even on Windows.
   const nativePath = changedPath.split("/").join(sep);
   if (isAbsolute(nativePath)) {
@@ -476,16 +512,126 @@ async function inspectChangedFiles(
     ["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
     "inspect tracked changes",
   );
+  const untrackedPaths = await inspectUntrackedFiles(git, worktreePath);
+  const paths = [...trackedOutput.split("\0"), ...untrackedPaths]
+    .filter((path) => path.length > 0)
+    .map((path) => assertChangedPathContained(worktreePath, path));
+  return [...new Set(paths)].toSorted();
+}
+
+async function inspectUntrackedFiles(
+  git: GitRunner,
+  worktreePath: string,
+): Promise<readonly string[]> {
   const untrackedOutput = await runGit(
     git,
     worktreePath,
     ["ls-files", "--others", "--exclude-standard", "-z"],
     "inspect untracked changes",
   );
-  const paths = [...trackedOutput.split("\0"), ...untrackedOutput.split("\0")]
+  const paths = untrackedOutput
+    .split("\0")
     .filter((path) => path.length > 0)
-    .map((path) => assertChangedPathContained(worktreePath, path));
-  return [...new Set(paths)].toSorted();
+    .map((path) => assertChangedPathContained(worktreePath, path))
+    .toSorted();
+  if (paths.length > MAX_UNTRACKED_PATHS)
+    throw new WorktreeBoundaryError(
+      `worktree has more than ${MAX_UNTRACKED_PATHS} untracked files`,
+    );
+  return paths;
+}
+
+interface UntrackedFileIdentity {
+  readonly path: string;
+  readonly requestedPath: string;
+  readonly canonicalPath: string;
+  readonly dev: number;
+  readonly ino: number;
+  readonly mode: number;
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly ctimeMs: number;
+}
+
+async function inspectReadableUntrackedFile(
+  worktreePath: string,
+  path: string,
+): Promise<UntrackedFileIdentity> {
+  const safePath = assertChangedPathContained(worktreePath, path);
+  const requestedPath = resolve(worktreePath, safePath.split("/").join(sep));
+  let metadata: Awaited<ReturnType<typeof lstat>>;
+  let canonicalPath: string;
+  try {
+    metadata = await lstat(requestedPath);
+    if (metadata.isSymbolicLink())
+      throw new WorktreeBoundaryError(
+        "untracked diff path must not be a symbolic link",
+      );
+    if (!metadata.isFile())
+      throw new WorktreeBoundaryError("untracked diff path must be a file");
+    if (metadata.size > MAX_UNTRACKED_FILE_BYTES)
+      throw new WorktreeBoundaryError(
+        "untracked diff file exceeds its bounded readback limit",
+      );
+    canonicalPath = await realpath(requestedPath);
+    if (canonicalPath !== requestedPath)
+      throw new WorktreeBoundaryError(
+        "untracked diff path must resolve within the worktree",
+      );
+  } catch (cause) {
+    if (cause instanceof WorktreeBoundaryError) throw cause;
+    throw new WorktreeBoundaryError("untracked diff path is not readable");
+  }
+  return {
+    path: safePath,
+    requestedPath,
+    canonicalPath,
+    dev: metadata.dev,
+    ino: metadata.ino,
+    mode: metadata.mode,
+    size: metadata.size,
+    mtimeMs: metadata.mtimeMs,
+    ctimeMs: metadata.ctimeMs,
+  };
+}
+
+function sameUntrackedIdentity(
+  before: UntrackedFileIdentity,
+  after: UntrackedFileIdentity,
+): boolean {
+  return (
+    before.path === after.path &&
+    before.requestedPath === after.requestedPath &&
+    before.canonicalPath === after.canonicalPath &&
+    before.dev === after.dev &&
+    before.ino === after.ino &&
+    before.mode === after.mode &&
+    before.size === after.size &&
+    before.mtimeMs === after.mtimeMs &&
+    before.ctimeMs === after.ctimeMs
+  );
+}
+
+function boundedRawDiffGit(
+  git: GitRunner,
+  deadline: number,
+  maximumBytes: number,
+): GitRunner {
+  if (git !== realGit) return git;
+  return (cwd, args) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0)
+      return Promise.reject(
+        new WorktreeBoundaryError("raw diff read exceeded its time limit"),
+      );
+    return runGitProcess(
+      cwd,
+      args,
+      args.includes("--no-index") ? [0, 1] : [0],
+      Math.min(GIT_TIMEOUT_MS, remaining),
+      Math.min(MAX_OUTPUT_BYTES, maximumBytes + 1),
+    );
+  };
 }
 
 async function inspectGitCommonDirectory(
@@ -645,4 +791,101 @@ export async function inspectRunWorktree(
     headSha: actualHeadSha,
     changedFiles,
   };
+}
+
+/**
+ * Revalidate the assigned worktree before reading its canonical tracked diff.
+ *
+ * The receipt is intentionally inspected again rather than trusting a caller's
+ * path or SHA. The raw patch is read from the recorded origin/main base to the
+ * current worktree HEAD, and is rejected if it exceeds the prompt boundary.
+ */
+export async function readRunWorktreeDiff(
+  input: ReadRunWorktreeDiffInput,
+): Promise<string> {
+  const maximumBytes = input.maxBytes ?? DEFAULT_RAW_DIFF_MAX_BYTES;
+  if (
+    !Number.isSafeInteger(maximumBytes) ||
+    maximumBytes < 1 ||
+    maximumBytes > DEFAULT_RAW_DIFF_MAX_BYTES
+  ) {
+    throw new WorktreeBoundaryError(
+      `raw diff byte limit must be an integer between 1 and ${DEFAULT_RAW_DIFF_MAX_BYTES}`,
+    );
+  }
+
+  const git = input.git ?? realGit;
+  const deadline = Date.now() + RAW_DIFF_DEADLINE_MS;
+  const rawGit = boundedRawDiffGit(git, deadline, maximumBytes);
+  const inspected = await inspectRunWorktree({ ...input, git: rawGit });
+  let rawDiff = await runGit(
+    rawGit,
+    inspected.path,
+    [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "--binary",
+      "--full-index",
+      "--no-renames",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      inspected.baseSha,
+      "--",
+    ],
+    "read worktree raw diff",
+  );
+  if (Buffer.byteLength(rawDiff, "utf8") > maximumBytes) {
+    throw new WorktreeBoundaryError(
+      "raw diff exceeds its bounded readback limit",
+    );
+  }
+
+  // The tracked diff reads the worktree/index, not just an immutable pair of
+  // commits. Revalidate every assigned identity after the read so a branch,
+  // repository, base, HEAD, or worktree replacement cannot make the returned
+  // patch belong to a different checkout than the inspected receipt.
+  const revalidated = await inspectRunWorktree({ ...input, git: rawGit });
+  if (
+    revalidated.path !== inspected.path ||
+    revalidated.branch !== inspected.branch ||
+    revalidated.baseSha !== inspected.baseSha ||
+    revalidated.headSha !== inspected.headSha
+  ) {
+    throw new WorktreeBoundaryError(
+      "assigned worktree identity changed while reading its tracked diff",
+    );
+  }
+
+  const untrackedPaths = await inspectUntrackedFiles(rawGit, inspected.path);
+  for (const path of untrackedPaths) {
+    const before = await inspectReadableUntrackedFile(inspected.path, path);
+    const untrackedDiff = await rawGit(inspected.path, [
+      "diff",
+      "--no-index",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "--binary",
+      "--full-index",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      "--",
+      process.platform === "win32" ? "NUL" : "/dev/null",
+      before.path,
+    ]);
+    const after = await inspectReadableUntrackedFile(inspected.path, path);
+    if (!sameUntrackedIdentity(before, after))
+      throw new WorktreeBoundaryError(
+        "untracked diff path changed while it was being read",
+      );
+    rawDiff += `${rawDiff.length === 0 ? "" : "\n"}${untrackedDiff}`;
+    if (Buffer.byteLength(rawDiff, "utf8") > maximumBytes) {
+      throw new WorktreeBoundaryError(
+        "raw diff exceeds its bounded readback limit",
+      );
+    }
+  }
+  return rawDiff;
 }

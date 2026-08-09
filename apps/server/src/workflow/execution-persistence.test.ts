@@ -297,7 +297,7 @@ describe("atomic execution settlement persistence", () => {
     const verifyEffect = await createInFlightEffect(
       coordinator,
       run,
-      effectInput("verify", "run:run-1:verify:attempt:1"),
+      effectInput("verify", "run:run-1:rework:0:verify:attempt:1"),
     );
     const verifyStep = step(run, "step-verify-1", "verify");
     const verifySettled = await coordinator.settleExecution({

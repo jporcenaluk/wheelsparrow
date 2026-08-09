@@ -14,6 +14,7 @@ import {
   type CreateClaimInput,
   createRunMutationRepository,
   type ExecutionFactsPatch,
+  type NewFindingRecord,
   type NewStepRecord,
   type RunRecord,
   readRun,
@@ -114,6 +115,10 @@ export interface ExecutionSettlementCommand {
   at?: string;
   facts?: ExecutionFactsPatch;
   step?: NewStepRecord;
+  /** Findings belong to the review step and are appended in this transaction. */
+  findings?: readonly NewFindingRecord[];
+  /** Durable operator guidance for a handoff to Review. */
+  requiredAction?: string;
 }
 
 export interface ExecutionSettlement {
@@ -190,6 +195,7 @@ const FAILED_EFFECT_TRIGGERS = {
 const WORKFLOW_TRIGGER_SET = new Set<string>(WORKFLOW_TRIGGERS);
 const maximumEvidenceBytes = 4 * 1024;
 const maximumJsonBytes = 1024 * 1024;
+const maximumSettlementFindings = 32;
 // A fixed event kind plus structured effect-key details is durable quarantine
 // state; adapter evidence remains free-form and is never used as a marker.
 const quarantinedEffectEventKind = "effect_quarantined";
@@ -586,7 +592,7 @@ export class WorkflowCoordinator {
           throw new StaleRevisionError(command.expectedRevision);
         const currentEffect = await tx
           .selectFrom("side_effects")
-          .select(["run_id", "rework_epoch", "target_revision"])
+          .select(["run_id", "rework_epoch", "target_revision", "kind"])
           .where("key", "=", command.effectKey)
           .executeTakeFirst();
         if (
@@ -608,6 +614,61 @@ export class WorkflowCoordinator {
             throw new StaleRevisionError(command.expectedRevision);
           await repository.appendStep(command.step);
         }
+        if (command.findings !== undefined) {
+          if (
+            !Array.isArray(command.findings) ||
+            command.findings.length > maximumSettlementFindings
+          )
+            throw new RangeError(
+              `A settlement may append at most ${maximumSettlementFindings} findings.`,
+            );
+          const exhaustedReviewHandoff =
+            command.trigger === "handoff_required" &&
+            currentEffect.kind === "agent_review" &&
+            current.repairRound >= 2;
+          if (
+            command.outcome !== "failed" ||
+            (command.trigger !== "review_needs_repair" &&
+              !exhaustedReviewHandoff &&
+              command.trigger !== "handoff_required") ||
+            command.findings.length === 0
+          )
+            throw new TypeError(
+              "Findings require failed review_needs_repair with nonempty findings.",
+            );
+          if (command.step === undefined)
+            throw new TypeError("Findings require an appended review step.");
+          if (
+            currentEffect.kind !== "agent_review" ||
+            command.step?.role !== "reviewer" ||
+            command.step.logicalStep !== "review"
+          )
+            throw new TypeError(
+              "Findings require an agent_review effect and reviewer review step.",
+            );
+          if (command.trigger === "handoff_required" && !exhaustedReviewHandoff)
+            throw new TypeError(
+              "Only an exhausted agent_review may hand off with findings.",
+            );
+          for (const finding of command.findings) {
+            if (finding.expectedRevision !== command.expectedRevision)
+              throw new StaleRevisionError(command.expectedRevision);
+            if (
+              finding.runId !== command.runId ||
+              finding.reviewStepId !== command.step?.id
+            )
+              throw new TypeError(
+                "Finding must reference the settled reviewer step.",
+              );
+            await repository.appendFinding(finding);
+          }
+        } else if (
+          command.outcome === "failed" &&
+          command.trigger === "review_needs_repair"
+        )
+          throw new TypeError(
+            "review_needs_repair requires a nonempty findings array.",
+          );
         if (command.facts !== undefined)
           await repository.updateExecutionFacts({
             runId: command.runId,
@@ -615,6 +676,10 @@ export class WorkflowCoordinator {
             facts: command.facts,
             at,
           });
+        const exhaustedReview =
+          currentEffect.kind === "agent_review" &&
+          command.trigger === "review_needs_repair" &&
+          current.repairRound >= 2;
         const observation: EffectObservation = {
           runId: command.runId,
           expectedRevision: command.expectedRevision,
@@ -623,9 +688,13 @@ export class WorkflowCoordinator {
           evidence: command.evidence,
         };
         if (command.trigger !== undefined)
-          observation.trigger = command.trigger;
+          observation.trigger = exhaustedReview
+            ? "handoff_required"
+            : command.trigger;
         if (command.receipt !== undefined)
           observation.receipt = command.receipt;
+        if (command.requiredAction !== undefined)
+          observation.requiredAction = command.requiredAction;
         const effect = await createEffectMutationRepository(
           tx,
         ).recordEffectObservation(observation, at);

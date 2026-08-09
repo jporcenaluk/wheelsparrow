@@ -13,6 +13,7 @@
     "lint": "biome check . && markdownlint-cli2 \"**/*.md\"",
     "smoke:production": "node scripts/production-smoke.mjs",
     "test:unit": "vitest run",
+    "test:prompts": "vitest run apps/server/src/agents/builder.test.ts apps/server/src/agents/reviewer.test.ts apps/server/src/agents/repair.test.ts",
     "typecheck": "pnpm -r --if-present run typecheck && tsc -p tsconfig.tests.json --noEmit",
     "verify:policy": "vitest run scripts/repository-policy.test.ts",
     "verify:toolchain": "node scripts/verify-toolchain.mjs",

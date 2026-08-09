@@ -88,30 +88,30 @@ required product outcomes.
 | 2 | SQLite storage, migrations, and single-process ownership | 1 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-1a-sqlite-storage.md` | — | `e6899f48ab2c6d5499eae4de16a96c8dd5ec6eca` |
 | 3 | Canonical state, serialized coordinator, durable effects, and restart recovery | 2 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-1b-coordinator.md` | [#28](https://github.com/jporcenaluk/wheelsparrow/pull/28) | `d79b3810ee7a53bf9d37bd191b6b7471bda55538` |
 | 4 | GitHub discovery and claim through a verified local candidate | 3 | `merged` | — | `docs/superpowers/plans/2026-08-08-block-2-github-discovery.md` | [#29](https://github.com/jporcenaluk/wheelsparrow/pull/29) | `5c53b95c2293bf65b1154ed03b696c176c2ec9bc` |
-| 5 | Contained worktree, builder, verification, and durable execution | 4 | `review` | `.worktrees/block3-builder`; `feat/block-3-builder` | `docs/superpowers/plans/2026-08-09-block-3-builder-workspaces.md` | — | — |
-| 6 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 5 | `pending` | — | — | — | — |
+| 5 | Contained worktree, builder, verification, and durable execution | 4 | `merged` | `.worktrees/block3-builder`; `feat/block-3-builder` | `docs/superpowers/plans/2026-08-09-block-3-builder-workspaces.md` | [#30](https://github.com/jporcenaluk/wheelsparrow/pull/30) | `3410fbfa6384fad8d8f1898f4212ca13d55d875b` |
+| 6 | Independent review, bounded repair, publication, exact-head CI, and Review handoff | 5 | `review` | `.worktrees/block4-review`; `feat/block-4-review-main` | `docs/superpowers/plans/2026-08-09-block-4-review-repair.md` | — | — |
 | 7 | Operator API and browser controls | 3 and stable read contract | `pending` | — | — | — | — |
 | 8 | Exact-SHA approval, merge, staging, smoke, and Done transition | 6 and 7 | `pending` | — | — | — | — |
 | 9 | Integration, security, artifact, and requirement-conformance closure | 8 | `pending` | — | — | — | — |
 
 ## Current Resume Point
 
-- Branch base: merged Block 2 SHA
-  `5c53b95c2293bf65b1154ed03b696c176c2ec9bc`.
-- Active slice: merge-train row 5, Block 3 contained builder execution.
-- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block3-builder`.
-- Branch: `feat/block-3-builder`.
-- Observed executable head before this ledger edit: `3fb5607732e79625ccc695ec117cd95eaf789a2a`.
-- Active plan: `docs/superpowers/plans/2026-08-09-block-3-builder-workspaces.md`; code and focused
-  boundary tests are complete, with publication evidence still pending.
-- Last verification: at `3fb5607732e79625ccc695ec117cd95eaf789a2a`, unrestricted Node 24.18.0 `make verify-agent` passed formatting,
-  Markdownlint, frozen install, all TypeScript projects, and 28 test files / 614 tests; `make build`,
-  `make smoke-production`, and diff hygiene passed. The managed sandbox suppresses detached-child
-  output, so unrestricted evidence is authoritative for ownership/process tests.
-- Publication state: Block 3 is pre-PR; the exact-head local gate is green and a fresh whole-block
-  review is approved.
-- Next safe command: publish a non-draft Block 3 PR, observe exact-head CI, and merge under the
-  authorized workflow once the fresh review is clean.
+- Branch base: protected `main` at
+  `3410fbfa6384fad8d8f1898f4212ca13d55d875b`.
+- Active slice: merge-train row 6, Block 4 independent review and bounded repair.
+- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block4-review`.
+- Branch: `feat/block-4-review-main`.
+- Observed executable head before this ledger edit:
+  `dc7386c9a8dcffdb18cb581243ca2f00c227680a`.
+- Active plan: `docs/superpowers/plans/2026-08-09-block-4-review-repair.md`; review, repair,
+  prompt, raw-diff, and finding-persistence code is complete locally, with publication evidence
+  still pending.
+- Focused local evidence: the Block 4 review/persistence/raw-diff suites passed 69/69 tests and
+  `mise exec node@24.18.0 -- make test-prompts` passed 55/55; the pinned production build passed.
+- Publication state: Block 4 has no PR, CI, or merge evidence. Do not treat local evidence as
+  protected-main or exact-head CI evidence.
+- Next safe command: publish a non-draft Block 4 PR, then observe exact-head CI before any merge
+  decision.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 

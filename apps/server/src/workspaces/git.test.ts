@@ -17,6 +17,7 @@ import {
   inspectRunWorktree,
   type PrepareRunWorktreeInput,
   prepareRunWorktree,
+  readRunWorktreeDiff,
   realGit,
   WorktreeBoundaryError,
 } from "./git.js";
@@ -120,6 +121,379 @@ describe("contained Git worktree boundary", () => {
     expect(
       inspected.changedFiles.every((path) => !path.startsWith("../")),
     ).toBe(true);
+  });
+
+  test("reads a bounded canonical diff only after revalidating the assigned worktree", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await writeFile(join(prepared.path, "README.md"), "changed\n", "utf8");
+
+    const diff = await readRunWorktreeDiff({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      expected: {
+        path: prepared.path,
+        branch: prepared.branch,
+        baseSha: prepared.baseSha,
+        headSha: prepared.baseSha,
+      },
+      git: realGit,
+    });
+
+    expect(diff).toContain("diff --git a/README.md b/README.md");
+    expect(diff).toContain("+changed");
+    expect(Buffer.byteLength(diff, "utf8")).toBeLessThanOrEqual(256 * 1024);
+  });
+
+  test("includes safe untracked files in the bounded canonical diff", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await writeFile(join(prepared.path, "new-file.txt"), "untracked\n", "utf8");
+
+    const diff = await readRunWorktreeDiff({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      expected: {
+        path: prepared.path,
+        branch: prepared.branch,
+        baseSha: prepared.baseSha,
+        headSha: prepared.baseSha,
+      },
+      git: realGit,
+    });
+
+    expect(diff).toContain("new-file.txt");
+    expect(diff).toContain("+untracked");
+
+    await writeFile(
+      join(prepared.path, "new-file.txt"),
+      `${"x".repeat(2_000)}\n`,
+      "utf8",
+    );
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        maxBytes: 128,
+        git: realGit,
+      }),
+    ).rejects.toThrow(/raw diff|size|bound/u);
+  });
+
+  test("rejects untracked symlinks instead of reading outside the worktree", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    const outside = join(repositoryRoot, "outside-secret.txt");
+    await writeFile(outside, "secret\n", "utf8");
+    await symlink(outside, join(prepared.path, "leak.txt"));
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/symbolic|symlink|contained|outside/u);
+  });
+
+  test("rejects an untracked file replaced during the Git diff read", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    const path = join(prepared.path, "race.txt");
+    const outside = join(repositoryRoot, "race-secret.txt");
+    await writeFile(path, "safe\n", "utf8");
+    await writeFile(outside, "secret\n", "utf8");
+    let replaced = false;
+    const racingGit = async (cwd: string, args: readonly string[]) => {
+      const output = await realGit(cwd, args);
+      if (!replaced && args.includes("--no-index")) {
+        replaced = true;
+        await rm(path);
+        await symlink(outside, path);
+      }
+      return output;
+    };
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: racingGit,
+      }),
+    ).rejects.toThrow(/changed|symbolic|symlink|outside/u);
+  });
+
+  test("rejects an assigned worktree with unrelated history before reading its diff", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await runGit(prepared.path, "checkout", "--orphan", "unrelated-history");
+    await writeFile(join(prepared.path, "README.md"), "unrelated\n", "utf8");
+    await runGit(prepared.path, "add", "README.md");
+    await runGit(prepared.path, "commit", "-m", "unrelated history");
+    const unrelatedHead = await runGit(prepared.path, "rev-parse", "HEAD");
+    await runGit(prepared.path, "branch", "-f", prepared.branch, unrelatedHead);
+    await runGit(prepared.path, "checkout", prepared.branch);
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: unrelatedHead,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/ancestry|descend|origin\/main|base/u);
+  });
+
+  test("bounds the number of untracked files before launching per-file diffs", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await Promise.all(
+      Array.from({ length: 129 }, (_, index) =>
+        writeFile(join(prepared.path, `untracked-${index}.txt`), "x\n", "utf8"),
+      ),
+    );
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/more than 128|untracked/u);
+  });
+
+  test("rejects a raw diff that exceeds its bounded readback limit", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await writeFile(
+      join(prepared.path, "README.md"),
+      `${"x".repeat(2_000)}\n`,
+      "utf8",
+    );
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        maxBytes: 128,
+        git: realGit,
+      }),
+    ).rejects.toThrow(/raw diff|size|bound/u);
+  });
+
+  test("revalidates worktree identity before reading the diff", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: "b".repeat(40),
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/HEAD|SHA|receipt/u);
+  });
+
+  test("rejects a tracked diff when HEAD changes during the raw read", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    let raced = false;
+    const racingGit = async (cwd: string, args: readonly string[]) => {
+      const output = await realGit(cwd, args);
+      if (!raced && args.includes("--binary") && !args.includes("--no-index")) {
+        raced = true;
+        await writeFile(join(prepared.path, "README.md"), "raced\n", "utf8");
+        await runGit(prepared.path, "add", "README.md");
+        await runGit(prepared.path, "commit", "-m", "raced HEAD");
+      }
+      return output;
+    };
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: racingGit,
+      }),
+    ).rejects.toThrow(/HEAD|SHA|receipt/u);
+  });
+
+  test("rejects a tracked diff when the assigned worktree is replaced during the raw read", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    let raced = false;
+    const racingGit = async (cwd: string, args: readonly string[]) => {
+      const output = await realGit(cwd, args);
+      if (!raced && args.includes("--binary") && !args.includes("--no-index")) {
+        raced = true;
+        await rm(prepared.path, { recursive: true, force: true });
+        await symlink(repositoryRoot, prepared.path);
+      }
+      return output;
+    };
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: racingGit,
+      }),
+    ).rejects.toThrow(/symbolic|symlink|worktree|boundary/u);
   });
 
   test("rejects a workspace root outside the repository data root", async () => {

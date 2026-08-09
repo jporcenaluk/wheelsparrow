@@ -1,6 +1,6 @@
 PNPM := corepack pnpm
 
-.PHONY: setup fix lint typecheck test-unit verify-policy verify-toolchain verify-agent build preflight dev start smoke-production
+.PHONY: setup fix lint typecheck test-unit test-prompts verify-policy verify-toolchain verify-agent build preflight dev start smoke-production
 
 setup:
 	$(PNPM) install --frozen-lockfile
@@ -16,6 +16,9 @@ typecheck:
 
 test-unit:
 	$(PNPM) test:unit
+
+test-prompts:
+	$(PNPM) test:prompts
 
 verify-policy:
 	$(PNPM) verify:policy
