@@ -255,10 +255,10 @@ describe("durable review and repair sequencing", () => {
           };
         },
       },
-      workspaceInspect: async (run, expected) => {
+      workspaceInspect: async (_run, expected) => {
         const receipt = expected as ReturnType<typeof workspace>;
         return workspace(
-          run.state === "repairing" ? repairedHeadSha : receipt.headSha,
+          calls.includes("repair:1") ? repairedHeadSha : receipt.headSha,
         );
       },
       verify: async ({ expectedHeadSha }) => ({
@@ -289,6 +289,21 @@ describe("durable review and repair sequencing", () => {
       { key: `run:${run.id}:rework:${run.reworkEpoch}:agent:review:attempt:2` },
       { key: `run:${run.id}:rework:${run.reworkEpoch}:verify:attempt:2` },
     ]);
+    const reviewIntents = connection.native
+      .prepare(
+        "SELECT key, intent_json FROM side_effects WHERE run_id = ? AND kind IN ('agent_review', 'agent_repair') ORDER BY key",
+      )
+      .all(run.id) as Array<{ key: string; intent_json: string }>;
+    expect(
+      reviewIntents.map(({ intent_json: intent }) => JSON.parse(intent)),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          model: "review-model",
+          reasoningEffort: "high",
+        }),
+      ]),
+    );
     expect(
       connection.native
         .prepare("SELECT COUNT(*) AS count FROM findings WHERE run_id = ?")
@@ -399,7 +414,10 @@ describe("durable review and repair sequencing", () => {
           };
         },
       },
-      workspaceInspect: async (_run, expected) => expected,
+      workspaceInspect: async (_run, expected) => ({
+        ...(expected as ReturnType<typeof workspace>),
+        changedFiles: workspace(firstHeadSha).changedFiles,
+      }),
       now: () => at,
     });
     expect(result.kind).toBe("human");

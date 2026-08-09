@@ -1384,6 +1384,8 @@ async function _dispatchVerificationEffect(
         intake,
         expectedHeadSha: intent.expectedHeadSha,
       });
+      const inspected = await inspectCapabilityWorkspace(input, run, expected);
+      assertCapabilityWorkspaceStable(expected, inspected);
     } catch (error) {
       return capabilityFailure(
         effect,
@@ -1789,6 +1791,28 @@ async function executeVerificationStage(
       workspace,
       verificationEffect,
       `Verification invocation failed: ${errorMessage(error)}`,
+      "",
+      "",
+      undefined,
+      startedAt,
+      now,
+    );
+  }
+
+  try {
+    const inspected = validateWorkspaceReceipt(
+      await input.workspaceInspect(run, workspace),
+    );
+    assertCapabilityWorkspaceStable(workspace, inspected);
+    workspace = inspected;
+  } catch (error) {
+    return settleVerificationFailure(
+      input,
+      run,
+      intake,
+      workspace,
+      verificationEffect,
+      `Verification workspace changed after the command: ${errorMessage(error)}`,
       "",
       "",
       undefined,

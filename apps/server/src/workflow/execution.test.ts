@@ -388,7 +388,7 @@ describe("executeClaimedRun", () => {
 
     expect(order).toEqual(["workspace", "builder", "verify"]);
     expect(intentStatuses).toEqual(["in_flight", "in_flight", "in_flight"]);
-    expect(inspectCalls).toBe(2);
+    expect(inspectCalls).toBe(3);
     expect(outcome).toMatchObject({
       kind: "reviewing",
       run: {
@@ -408,6 +408,55 @@ describe("executeClaimedRun", () => {
         )
         .all("run-1"),
     ).toHaveLength(2);
+    await coordinator.close();
+  });
+
+  test("fails closed when verification changes the assigned worktree", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    let inspectCalls = 0;
+    const outcome = await executeClaimedRun({
+      coordinator,
+      run: await preparingRun(coordinator, connection),
+      now: () => "2026-08-09T10:02:00.000Z",
+      intake: intakeCapture(),
+      workspacePrepare: async () => receipt(),
+      workspaceInspect: async () => {
+        inspectCalls += 1;
+        if (inspectCalls === 1) return receipt();
+        if (inspectCalls === 2) return { ...receipt(), headSha: builtHeadSha };
+        return { ...receipt(), headSha: "d".repeat(40) };
+      },
+      builder: {
+        render: async () => ({ prompt, promptHash }),
+        invoke: async () => ({
+          kind: "succeeded" as const,
+          terminal: {
+            outcome: "completed" as const,
+            summary: "Implemented the issue.",
+            validation: ["pnpm test:unit"],
+          },
+          stdout: "builder output",
+          stderr: "",
+          exitCode: 0,
+        }),
+      },
+      verify: async () => ({
+        kind: "succeeded" as const,
+        command: intakeCapture().verificationCommand,
+        cwd: receipt().path,
+        exitCode: 0,
+        signal: null,
+        stdout: "verification output",
+        stderr: "",
+        headSha: builtHeadSha,
+      }),
+    });
+    if (outcome.kind !== "verification_failed")
+      throw new Error(`Expected verification failure, got ${outcome.kind}.`);
+    expect(outcome.run.state).toBe("repairing");
+    expect(outcome.reason).toMatch(/changed after the command/iu);
+    expect(inspectCalls).toBe(3);
     await coordinator.close();
   });
 
