@@ -1,6 +1,8 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { lstat, realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
@@ -137,7 +139,19 @@ export function parseBuilderTerminalResult(
     throw new Error("Invalid builder terminal result");
   }
 
-  return candidate as BuilderTerminalResult;
+  const result = candidate as BuilderTerminalResult;
+  const sanitized: BuilderTerminalResult = {
+    outcome: result.outcome,
+    summary: redactOutput(result.summary),
+    validation: result.validation.map((entry) => redactOutput(entry)),
+    ...(result.requested_action === undefined
+      ? {}
+      : { requested_action: redactOutput(result.requested_action) }),
+  };
+  if (!Value.Check(BuilderTerminalResultSchema, sanitized)) {
+    throw new Error("Invalid builder terminal result");
+  }
+  return sanitized;
 }
 
 export interface BuilderInvocation {
@@ -146,7 +160,12 @@ export interface BuilderInvocation {
   readonly reasoningEffort: string;
   readonly timeoutMs: number;
   readonly worktreePath: string;
+  readonly workspaceRoot: string;
   readonly prompt: string;
+}
+
+export class BuilderBoundaryError extends Error {
+  override name = "BuilderBoundaryError";
 }
 
 export type BuilderRunFailureReason =
@@ -214,6 +233,10 @@ function redactOutput(output: string): string {
     .replace(
       /\b(authorization|access[_ -]?token|api[_ -]?key|token)(\s*[:=]\s*)\S+/gi,
       "$1$2[REDACTED]",
+    )
+    .replace(
+      /\b((?:[a-z0-9]+_)*(?:access[_ -]?key(?:[_ -]?id)?|secret[_ -]?access[_ -]?key|client[_ -]?secret|password|credential(?:s)?))(\s*[:=]\s*)\S+/gi,
+      "$1$2[REDACTED]",
     );
 }
 
@@ -276,6 +299,59 @@ function builderEnvironment(worktreePath: string): NodeJS.ProcessEnv {
   return environment;
 }
 
+function assertContained(root: string, candidate: string): void {
+  const descendant = relative(root, candidate);
+  if (
+    descendant === "" ||
+    descendant === ".." ||
+    descendant.startsWith("..\\") ||
+    descendant.startsWith("../") ||
+    isAbsolute(descendant)
+  ) {
+    throw new BuilderBoundaryError(
+      "builder worktree must be a contained descendant of workspace root",
+    );
+  }
+}
+
+async function canonicalDirectory(
+  path: string,
+  label: string,
+): Promise<string> {
+  try {
+    const requestedPath = resolve(path);
+    const metadata = await lstat(requestedPath);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new BuilderBoundaryError(
+        `${label} must be a real directory without symbolic links`,
+      );
+    }
+    const canonicalPath = await realpath(requestedPath);
+    if (canonicalPath !== requestedPath) {
+      throw new BuilderBoundaryError(
+        `${label} must not resolve through a symbolic link`,
+      );
+    }
+    return canonicalPath;
+  } catch (cause) {
+    if (cause instanceof BuilderBoundaryError) throw cause;
+    throw new BuilderBoundaryError(`${label} is not a usable directory`);
+  }
+}
+
+async function validateWorktree(input: BuilderInvocation): Promise<string> {
+  const workspaceRoot = await canonicalDirectory(
+    input.workspaceRoot,
+    "workspace root",
+  );
+  const worktreePath = await canonicalDirectory(
+    input.worktreePath,
+    "builder worktree",
+  );
+  assertContained(workspaceRoot, worktreePath);
+  return worktreePath;
+}
+
 function inspectTerminalLine(line: string, state: TerminalScanState): void {
   const trimmed = line.trim();
   if (trimmed.length === 0) return;
@@ -321,7 +397,7 @@ interface TerminalScanState {
   malformed: boolean;
 }
 
-export function runBuilder(
+export async function runBuilder(
   input: BuilderInvocation,
 ): Promise<BuilderRunResult> {
   const stdout: CapturedOutput = { buffer: Buffer.alloc(0) };
@@ -339,6 +415,8 @@ export function runBuilder(
     );
   }
 
+  const cwd = await validateWorktree(input);
+
   return new Promise((resolve) => {
     const [executable, ...args] = input.command;
     const child = spawn(
@@ -351,9 +429,9 @@ export function runBuilder(
         input.reasoningEffort,
       ],
       {
-        cwd: input.worktreePath,
+        cwd,
         detached: process.platform !== "win32",
-        env: builderEnvironment(input.worktreePath),
+        env: builderEnvironment(cwd),
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
       },

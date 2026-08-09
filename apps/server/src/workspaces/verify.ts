@@ -3,7 +3,31 @@ import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 
 const MAX_OUTPUT_BYTES = 16_384;
-const SHELL_SYNTAX = /[\s;|&<>$`'"\\()[\]{}*?!]/u;
+const SHELL_SYNTAX = /[;|&<>$`'"\\()[\]{}*?!]/u;
+const VERIFICATION_SAFE_ENV_KEYS = [
+  "PATH",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "USER",
+  "LOGNAME",
+  "PWD",
+  "SystemRoot",
+  "ComSpec",
+  "PATHEXT",
+  "WINDIR",
+] as const;
+
+function containsCommandControl(value: string): boolean {
+  return (
+    value.includes(String.fromCharCode(0)) ||
+    value.includes(String.fromCharCode(13)) ||
+    value.includes(String.fromCharCode(10))
+  );
+}
 
 /** An executable and its arguments. Arguments are never interpreted by a shell. */
 export type VerificationCommand = string | readonly string[];
@@ -126,13 +150,19 @@ function normalizeCommand(input: VerificationInvocation): readonly string[] {
         "verification arguments must be strings",
       );
     }
-    assertSafeExecutable(input.command);
-    if (SHELL_SYNTAX.test(input.command)) {
+    const configuredCommand = input.command.trim();
+    if (
+      configuredCommand.length === 0 ||
+      containsCommandControl(configuredCommand) ||
+      SHELL_SYNTAX.test(configuredCommand)
+    ) {
       throw new VerificationBoundaryError(
-        "configured command strings with whitespace or shell syntax are unsupported; provide executable and args",
+        "configured command strings must contain only an executable and simple arguments",
       );
     }
-    return [input.command, ...(input.args ?? [])];
+    const [executable, ...configuredArgs] = configuredCommand.split(/\s+/u);
+    assertSafeExecutable(executable as string);
+    return [executable as string, ...configuredArgs, ...(input.args ?? [])];
   }
 
   if (input.args !== undefined) {
@@ -171,6 +201,17 @@ function assertContained(root: string, candidate: string): void {
       "verification worktree must be a contained descendant of workspace root",
     );
   }
+}
+
+function verificationEnvironment(worktreePath: string): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    HOME: worktreePath,
+  };
+  for (const key of VERIFICATION_SAFE_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) environment[key] = value;
+  }
+  return environment;
 }
 
 async function canonicalDirectory(
@@ -268,7 +309,7 @@ export async function runVerification(
     const child = spawn(executable as string, args, {
       cwd,
       detached: process.platform !== "win32",
-      env: process.env,
+      env: verificationEnvironment(cwd),
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });

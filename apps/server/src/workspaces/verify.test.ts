@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -182,7 +182,63 @@ describe("contained verification process", () => {
     );
   });
 
-  test("rejects an unsafe worktree and shell-like command string", async () => {
+  test("does not pass authority-bearing credentials to verification", async () => {
+    const { root, worktree } = await temporaryWorktree();
+    const credentialNames = [
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "GITHUB_PAT",
+      "GIT_ASKPASS",
+      "SSH_ASKPASS",
+      "OPENAI_API_KEY",
+      "CODEX_API_KEY",
+      "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "CLOUDSDK_AUTH_ACCESS_TOKEN",
+      "AZURE_CLIENT_SECRET",
+    ] as const;
+    const previous = new Map<string, string | undefined>();
+    for (const name of credentialNames) {
+      previous.set(name, process.env[name]);
+      process.env[name] = `sentinel-${name.toLowerCase()}`;
+    }
+
+    try {
+      const result = await runVerification(
+        invocation(
+          [
+            process.execPath,
+            "-e",
+            `
+              const fs = require("node:fs");
+              const forbidden = ${JSON.stringify(credentialNames)}.filter(
+                (name) => process.env[name] !== undefined,
+              );
+              fs.writeFileSync(process.argv[1], forbidden.length === 0 ? "safe environment" : forbidden.join(","));
+            `,
+            join(root, "verification-env.txt"),
+          ],
+          worktree,
+          join(root, "workspace"),
+        ),
+      );
+
+      expect(result).toMatchObject({
+        kind: "succeeded",
+      });
+      expect(await readFile(join(root, "verification-env.txt"), "utf8")).toBe(
+        "safe environment",
+      );
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  test("accepts the configured make command as argv and rejects shell syntax", async () => {
     const { root, worktree } = await temporaryWorktree();
     const outside = await mkdtemp(join(tmpdir(), "wheelsparrow-outside-"));
     temporaryDirectories.push(outside);
@@ -197,10 +253,31 @@ describe("contained verification process", () => {
       ),
     ).rejects.toThrow(/worktree|workspace/u);
 
+    const configured = await runVerification(
+      invocation("make verify-agent", worktree, join(root, "workspace")),
+    );
+    expect(configured.command).toEqual(["make", "verify-agent"]);
+
     await expect(
       runVerification(
-        invocation("node fixture.js", worktree, join(root, "workspace")),
+        invocation(
+          "make verify-agent && touch unsafe",
+          worktree,
+          join(root, "workspace"),
+        ),
       ),
     ).rejects.toThrow(/command|shell/u);
+
+    const linked = join(root, "linked-worktree");
+    await symlink(worktree, linked, "junction");
+    await expect(
+      runVerification(
+        invocation(
+          [process.execPath, "-e", ""],
+          linked,
+          join(root, "workspace"),
+        ),
+      ),
+    ).rejects.toThrow(/symbolic link|worktree/u);
   });
 });

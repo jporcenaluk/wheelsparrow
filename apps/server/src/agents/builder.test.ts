@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Value } from "typebox/value";
 import { afterEach, describe, expect, test } from "vitest";
 import {
@@ -27,6 +27,7 @@ function invocation(
   command: readonly string[],
   worktreePath: string,
   timeoutMs = 1_000,
+  workspaceRoot = dirname(worktreePath),
 ) {
   return {
     command,
@@ -34,6 +35,7 @@ function invocation(
     reasoningEffort: "high" as const,
     timeoutMs,
     worktreePath,
+    workspaceRoot,
     prompt: "trusted prompt",
   };
 }
@@ -161,6 +163,31 @@ describe("builder terminal result", () => {
     expect(parseBuilderTerminalResult(JSON.stringify(result))).toEqual(result);
   });
 
+  test("redacts authority-bearing values in terminal fields", () => {
+    const result = parseBuilderTerminalResult({
+      outcome: "blocked",
+      summary: "token=ghp_terminal-secret",
+      validation: [
+        "Bearer terminal-secret",
+        "github_pat_terminal-secret",
+        "AWS_SECRET_ACCESS_KEY=terminal-secret",
+      ],
+      requested_action: "api_key=terminal-secret",
+    });
+
+    expect(result).toEqual({
+      outcome: "blocked",
+      summary: "token=[REDACTED]",
+      validation: [
+        "Bearer [REDACTED]",
+        "[REDACTED]",
+        "AWS_SECRET_ACCESS_KEY=[REDACTED]",
+      ],
+      requested_action: "api_key=[REDACTED]",
+    });
+    expect(JSON.stringify(result)).not.toContain("terminal-secret");
+  });
+
   test.each([
     [
       "an extra property",
@@ -243,7 +270,6 @@ describe("bounded builder process", () => {
         worktreePath,
       ),
     );
-
     expect(result.kind).toBe("succeeded");
     if (result.kind !== "succeeded") return;
     expect(result.terminal).toEqual({
@@ -330,6 +356,38 @@ describe("bounded builder process", () => {
     expect(result).toMatchObject({ kind: "failed", reason: "spawn_error" });
   });
 
+  test("rejects worktrees outside the workspace root and symlinked paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "wheelsparrow-builder-root-"));
+    const outside = await mkdtemp(
+      join(tmpdir(), "wheelsparrow-builder-outside-"),
+    );
+    fixtureDirectories.push(root, outside);
+    const linked = join(root, "linked-worktree");
+    await symlink(outside, linked, "junction");
+
+    await expect(
+      runBuilder(
+        invocation(
+          ["/definitely/missing/wheelsparrow-builder"],
+          outside,
+          1_000,
+          root,
+        ),
+      ),
+    ).rejects.toThrow(/contained descendant|workspace root|worktree/u);
+
+    await expect(
+      runBuilder(
+        invocation(
+          ["/definitely/missing/wheelsparrow-builder"],
+          linked,
+          1_000,
+          root,
+        ),
+      ),
+    ).rejects.toThrow(/symbolic link|worktree/u);
+  });
+
   test("does not pass authority-bearing credentials to the builder", async () => {
     const credentialNames = [
       "GH_TOKEN",
@@ -341,6 +399,9 @@ describe("bounded builder process", () => {
       "CODEX_API_KEY",
       "AWS_ACCESS_KEY_ID",
       "AWS_SECRET_ACCESS_KEY",
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "CLOUDSDK_AUTH_ACCESS_TOKEN",
+      "AZURE_CLIENT_SECRET",
     ] as const;
     const previous = new Map<string, string | undefined>();
     for (const name of credentialNames) {
