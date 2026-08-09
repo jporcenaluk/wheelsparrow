@@ -173,6 +173,20 @@ function assertContained(root: string, candidate: string): void {
   }
 }
 
+function assertPrivateDirectory(
+  path: string,
+  metadata: { readonly mode: number; readonly uid: number },
+): void {
+  if (
+    typeof process.getuid === "function" &&
+    (metadata.uid !== process.getuid() || (metadata.mode & 0o077) !== 0)
+  ) {
+    throw new WorktreeBoundaryError(
+      `workspace directory is not private to the current user: ${path}`,
+    );
+  }
+}
+
 async function assertSafeWorkspacePath(
   repositoryRoot: string,
   workspaceRoot: string,
@@ -195,6 +209,7 @@ async function assertSafeWorkspacePath(
           "workspace root components must be directories",
         );
       }
+      assertPrivateDirectory(current, metadata);
     } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw cause;

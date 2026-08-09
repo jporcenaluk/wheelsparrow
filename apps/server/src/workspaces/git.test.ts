@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -135,6 +136,28 @@ describe("contained Git worktree boundary", () => {
     };
 
     await expect(prepareRunWorktree(input)).rejects.toThrow("workspace root");
+  });
+
+  test("rejects an existing workspace root that is not private", async () => {
+    if (typeof process.getuid !== "function") return;
+    const { repositoryRoot } = await temporaryGitRepository();
+    const dataRoot = join(repositoryRoot, ".wheelsparrow");
+    const workspaceRoot = join(dataRoot, "workspaces");
+    await mkdir(dataRoot, { recursive: true, mode: 0o700 });
+    await chmod(dataRoot, 0o700);
+    await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
+    await chmod(workspaceRoot, 0o755);
+
+    await expect(
+      prepareRunWorktree({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        baseBranch: "main",
+        git: realGit,
+      }),
+    ).rejects.toThrow(/private|permission/u);
   });
 
   test("rejects a base branch other than origin/main", async () => {
