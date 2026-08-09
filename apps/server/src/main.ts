@@ -1,5 +1,10 @@
 import { resolve } from "node:path";
+import {
+  type Configuration,
+  ConfigurationSchema,
+} from "@wheelsparrow/contracts";
 import type { FastifyInstance } from "fastify";
+import { Value } from "typebox/value";
 
 import { buildApp } from "./app.js";
 import {
@@ -11,10 +16,15 @@ import type { DatabaseConnection } from "./database/connection.js";
 import { openDatabase } from "./database/connection.js";
 import { migrateDatabase } from "./database/migrate.js";
 import { acquireOwnership } from "./database/ownership.js";
+import {
+  createGitHubProjectGateway,
+  type GitHubProjectClientOptions,
+} from "./github/project-client.js";
 import { registerOperatorRoutes } from "./http/routes.js";
 import { createReadinessGate, type ReadinessGate } from "./readiness.js";
 import { registerWeb } from "./web.js";
 import { WorkflowCoordinator } from "./workflow/coordinator.js";
+import { discoverReadyQueue } from "./workflow/operator-discovery.js";
 import { reconcileEffects } from "./workflow/reconciliation.js";
 
 interface Ownership {
@@ -79,6 +89,60 @@ export interface StartDependencies {
         },
       ) => Promise<void>)
     | undefined;
+}
+
+export interface ProductionDiscoveryOptions {
+  readonly connection: DatabaseConnection;
+  readonly configuration: Configuration;
+  readonly token?: string;
+  readonly fetch?: typeof globalThis.fetch;
+  readonly endpoint?: string;
+}
+
+function requireConfiguration(value: unknown): Configuration {
+  if (!Value.Check(ConfigurationSchema, value)) {
+    throw new Error("Validated runtime configuration is unavailable.");
+  }
+  return value as Configuration;
+}
+
+/**
+ * Compose the production read-only Ready queue from configured GitHub scope,
+ * existing credentials, and the durable ownership query. The returned
+ * callback deliberately performs no work until the operator reads Queue.
+ */
+export function createProductionReadyDiscovery(
+  options: ProductionDiscoveryOptions,
+): () => ReturnType<typeof discoverReadyQueue> {
+  const configuredRepository = options.configuration.github.repository.includes(
+    "/",
+  )
+    ? options.configuration.github.repository
+    : `${options.configuration.github.owner}/${options.configuration.github.repository}`;
+  const clientOptions: GitHubProjectClientOptions = {
+    owner: options.configuration.github.owner,
+    repository: configuredRepository,
+    projectNumber: options.configuration.github.project_number,
+    statusField: options.configuration.github.status_field,
+    readyStatus: options.configuration.github.lanes.ready,
+    requiredLabels: options.configuration.github.required_labels,
+    priorityField: options.configuration.github.priority_field,
+    ...(options.token === undefined ? {} : { token: options.token }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+  };
+  const gateway = createGitHubProjectGateway(clientOptions);
+  return () =>
+    discoverReadyQueue({
+      connection: options.connection,
+      gateway,
+      configuration: {
+        repository: clientOptions.repository,
+        projectNumber: clientOptions.projectNumber,
+        readyStatus: clientOptions.readyStatus,
+        requiredLabels: clientOptions.requiredLabels,
+      },
+    });
 }
 
 export function parsePort(value: string | undefined): number {
@@ -340,10 +404,16 @@ const productionDependencies: StartDependencies = {
   signalTarget: productionSignalTarget(),
   registerWeb,
   async registerOperator(app, context) {
+    const configuration = requireConfiguration(context.configuration);
+    const discoverReady = createProductionReadyDiscovery({
+      connection: context.database as DatabaseConnection,
+      configuration,
+    });
     registerOperatorRoutes(app, {
       connection: context.database as DatabaseConnection,
       coordinator: context.coordinator as WorkflowCoordinator,
-      configuration: context.configuration,
+      configuration,
+      discoverReady,
     });
   },
 };

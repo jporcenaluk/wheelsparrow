@@ -1,10 +1,13 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { Configuration } from "@wheelsparrow/contracts";
 import { afterEach, describe, expect, test } from "vitest";
-
 import type { LocalPaths } from "./config.js";
+import type { DatabaseConnection } from "./database/connection.js";
+import { GitHubCredentialsUnavailableError } from "./github/project-client.js";
 import {
+  createProductionReadyDiscovery,
   parsePort,
   type RunningService,
   resolveMigrationsDirectory,
@@ -14,6 +17,32 @@ import {
 } from "./main.js";
 
 const temporaryDirectories: string[] = [];
+
+const productionConfiguration: Configuration = {
+  github: {
+    owner: "owner",
+    repository: "repository",
+    project_number: 1,
+    status_field: "Status",
+    lanes: { ready: "Ready", todo: "Todo", review: "Review", done: "Done" },
+    required_labels: ["mvp"],
+    priority_field: "Priority",
+  },
+  poll_interval_seconds: 30,
+  workspace_root: ".wheelsparrow/workspaces",
+  agent: {
+    command: "codex",
+    model: "gpt-5.6-sol",
+    reasoning_effort: "high",
+    timeout_minutes: 30,
+  },
+  verification: { command: "pnpm test" },
+  staging: {
+    workflow: "deploy.yml",
+    environment: "staging",
+    smoke_command: "pnpm smoke",
+  },
+};
 
 afterEach(async () => {
   await Promise.all(
@@ -192,6 +221,24 @@ function lifecycleFakes({
 }
 
 describe("start", () => {
+  test("composes a credential-backed discovery callback that fails closed without credentials", async () => {
+    let fetchCalls = 0;
+    const discoverReady = createProductionReadyDiscovery({
+      connection: {} as DatabaseConnection,
+      configuration: productionConfiguration,
+      token: "",
+      fetch: async () => {
+        fetchCalls += 1;
+        throw new Error("the provider must not be reached without credentials");
+      },
+    });
+
+    await expect(discoverReady()).rejects.toBeInstanceOf(
+      GitHubCredentialsUnavailableError,
+    );
+    expect(fetchCalls).toBe(0);
+  });
+
   test.each([
     ["source", "/repo/apps/server/src"],
     ["built", "/repo/apps/server/dist"],
