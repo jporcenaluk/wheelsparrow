@@ -189,6 +189,18 @@ export interface PublicationFactsUpdateRequest {
   at: string;
 }
 
+/** The only run fact a coordinator may persist from a merge receipt. */
+export interface DeliveryFactsPatch {
+  mergeSha: string;
+}
+
+export interface DeliveryFactsUpdateRequest {
+  runId: string;
+  expectedRevision: number;
+  facts: DeliveryFactsPatch;
+  at: string;
+}
+
 export interface NewFindingRecord {
   id: string;
   runId: string;
@@ -809,6 +821,7 @@ export interface RunMutationRepository {
   updatePublicationFacts(
     request: PublicationFactsUpdateRequest,
   ): Promise<RunRecord>;
+  updateDeliveryFacts(request: DeliveryFactsUpdateRequest): Promise<RunRecord>;
   appendStep(input: NewStepRecord): Promise<StepRecord>;
   appendFinding(input: NewFindingRecord): Promise<FindingRecord>;
   appendApproval(input: NewApprovalRecord): Promise<ApprovalRecord>;
@@ -957,7 +970,13 @@ export function createRunMutationRepository(
         if (Number(update.numUpdatedRows) === 0)
           throw new StaleRevisionError(expectedRevision);
 
-        if (next === "queued_rework" || next === "returning_to_todo")
+        if (
+          next === "queued_rework" ||
+          next === "returning_to_todo" ||
+          request.trigger === "delivery_failed" ||
+          request.trigger === "smoke_failed" ||
+          request.trigger === "done_projection_failed"
+        )
           await appendApprovalInvalidations(tx, runId, at, summary);
         await appendEvent(
           tx,
@@ -1112,6 +1131,37 @@ export function createRunMutationRepository(
           branch,
           updated_at: at,
         })
+        .where("id", "=", runId)
+        .where("revision", "=", current.revision)
+        .executeTakeFirst();
+      if (Number(updated.numUpdatedRows) !== 1)
+        throw new StaleRevisionError(request.expectedRevision);
+      return mapRun(await readRunRow(tx, runId));
+    },
+
+    async updateDeliveryFacts(request): Promise<RunRecord> {
+      const runId = identifier(request.runId, "Run ID");
+      const at = identifier(request.at, "Timestamp");
+      const current = await assertRunRevision(
+        tx,
+        runId,
+        request.expectedRevision,
+      );
+      const facts = request.facts;
+      if (
+        facts === null ||
+        typeof facts !== "object" ||
+        Array.isArray(facts) ||
+        (Object.getPrototypeOf(facts) !== Object.prototype &&
+          Object.getPrototypeOf(facts) !== null)
+      )
+        throw new TypeError("Delivery facts patch must be a plain object.");
+      if (Object.keys(facts).length !== 1 || !Object.hasOwn(facts, "mergeSha"))
+        throw new TypeError("Delivery facts patch may contain only mergeSha.");
+      const mergeSha = sha(facts.mergeSha, "Merge SHA");
+      const updated = await tx
+        .updateTable("runs")
+        .set({ merge_sha: mergeSha, updated_at: at })
         .where("id", "=", runId)
         .where("revision", "=", current.revision)
         .executeTakeFirst();

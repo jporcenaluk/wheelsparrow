@@ -11,8 +11,10 @@ import {
   StaleEffectError,
 } from "../database/effects.js";
 import {
+  type ApprovalRecord,
   type CreateClaimInput,
   createRunMutationRepository,
+  type DeliveryFactsPatch,
   type ExecutionFactsPatch,
   type NewFindingRecord,
   type NewStepRecord,
@@ -134,6 +136,8 @@ export interface ExecutionSettlementCommand {
   facts?: ExecutionFactsPatch;
   /** PR receipt facts may settle only the coordinator-owned publish effect. */
   publicationFacts?: PublicationFactsPatch;
+  /** Merge receipt facts may settle only the coordinator-owned merge effect. */
+  deliveryFacts?: DeliveryFactsPatch;
   step?: NewStepRecord;
   /** Findings belong to the review step and are appended in this transaction. */
   findings?: readonly NewFindingRecord[];
@@ -143,6 +147,29 @@ export interface ExecutionSettlementCommand {
 
 export interface ExecutionSettlement {
   run: RunRecord;
+  effect: EffectRecord;
+}
+
+/** A human's exact-head approval and the coordinator-owned merge intent. */
+export interface ApproveMergeCommand {
+  runId: string;
+  expectedRevision: number;
+  operator: string;
+  approvedHeadSha: string;
+  /** The base SHA shown to the operator when approval was granted. */
+  observedBaseSha?: string;
+  /** Compatibility spelling used by the operator/API contract. */
+  approvedBaseSha?: string;
+  at?: string;
+  /** Override is useful for deterministic callers; the default key is stable. */
+  effectKey?: string;
+  /** Keep the intent pending for an external dispatcher or test. */
+  dispatch?: boolean;
+}
+
+export interface MergeApprovalResult {
+  run: RunRecord;
+  approval: ApprovalRecord;
   effect: EffectRecord;
 }
 
@@ -216,6 +243,11 @@ const WORKFLOW_TRIGGER_SET = new Set<string>(WORKFLOW_TRIGGERS);
 const maximumEvidenceBytes = 4 * 1024;
 const maximumJsonBytes = 1024 * 1024;
 const maximumSettlementFindings = 32;
+const deliveryEffectKinds = new Set<EffectKind>([
+  "merge",
+  "observe_staging",
+  "smoke",
+]);
 // A fixed event kind plus structured effect-key details is durable quarantine
 // state; adapter evidence remains free-form and is never used as a marker.
 const quarantinedEffectEventKind = "effect_quarantined";
@@ -571,6 +603,12 @@ export class WorkflowCoordinator {
     request: TransitionRequest,
     options: TransitionCommandOptions = {},
   ): Promise<RunRecord> {
+    if (request.trigger === "merge_authorized")
+      return Promise.reject(
+        new TypeError(
+          "Merge authorization is coordinator-owned; use approveMerge.",
+        ),
+      );
     return this.enqueue(async () => {
       const result = await this.connection.db
         .transaction()
@@ -594,6 +632,120 @@ export class WorkflowCoordinator {
       )
         await this.beginAndDispatch(result.effect.key, request.at);
       return result.run;
+    });
+  }
+
+  /**
+   * Atomically approve the exact Review candidate and queue its merge effect.
+   *
+   * The approval, run facts, state transition, and effect intent are one
+   * SQLite transaction.  Dispatch begins only after that transaction commits,
+   * so an adapter can never observe a merge intent without its approval and
+   * `merging` state.  A later retry must supply the new run revision and can
+   * therefore never replay a stale browser approval.
+   */
+  approveMerge(command: ApproveMergeCommand): Promise<MergeApprovalResult> {
+    return this.enqueue(async () => {
+      const at = asTimestamp(this.now, command.at);
+      const result = await this.connection.db
+        .transaction()
+        .execute(async (tx) => {
+          const current = await readRun(tx, command.runId);
+          if (current.revision !== command.expectedRevision)
+            throw new StaleRevisionError(command.expectedRevision);
+          if (current.state !== "review")
+            throw new TypeError("Merge approval requires a Review run.");
+          if (
+            current.headSha === null ||
+            current.baseSha === null ||
+            current.pullRequestNumber === null ||
+            current.pullRequestNodeId === null ||
+            current.pullRequestUrl === null ||
+            current.branch === null
+          )
+            throw new TypeError(
+              "Merge approval requires complete pull-request and SHA facts.",
+            );
+          if (current.mergeSha !== null)
+            throw new TypeError(
+              "Merge approval cannot repeat after a merge SHA was recorded.",
+            );
+
+          const observedBaseSha =
+            command.observedBaseSha ?? command.approvedBaseSha;
+          if (observedBaseSha === undefined)
+            throw new TypeError(
+              "Merge approval requires the observed base SHA.",
+            );
+          if (
+            command.approvedHeadSha !== current.headSha ||
+            observedBaseSha !== current.baseSha
+          )
+            throw new TypeError(
+              "Merge approval does not match the current exact head and base candidate.",
+            );
+
+          const repository = createRunMutationRepository(tx);
+          const approval = await repository.appendApproval({
+            id: randomUUID(),
+            runId: current.id,
+            expectedRevision: current.revision,
+            operator: command.operator,
+            approvedHeadSha: command.approvedHeadSha,
+            observedBaseSha,
+            decision: "approved",
+            at,
+          });
+          const factsUpdated = await tx
+            .updateTable("runs")
+            .set({
+              approved_head_sha: command.approvedHeadSha,
+              observed_base_sha: observedBaseSha,
+              updated_at: at,
+            })
+            .where("id", "=", current.id)
+            .where("revision", "=", current.revision)
+            .executeTakeFirst();
+          if (Number(factsUpdated.numUpdatedRows) !== 1)
+            throw new StaleRevisionError(command.expectedRevision);
+
+          const authorized = await repository.transitionRun({
+            runId: current.id,
+            expectedRevision: current.revision,
+            trigger: "merge_authorized",
+            at,
+            summary: {
+              text: `Merge approved for exact head ${command.approvedHeadSha}.`,
+            },
+          });
+          const effectKey =
+            command.effectKey ??
+            `run:${current.id}:rework:${current.reworkEpoch}:merge`;
+          const effect = await createEffectMutationRepository(
+            tx,
+          ).insertEffectIntent(
+            authorized,
+            {
+              key: effectKey,
+              kind: "merge",
+              targetRevision: authorized.revision,
+              intent: {
+                repository: authorized.repository,
+                pullRequestNumber: authorized.pullRequestNumber,
+                pullRequestNodeId: authorized.pullRequestNodeId,
+                pullRequestUrl: authorized.pullRequestUrl,
+                branch: authorized.branch,
+                baseSha: observedBaseSha,
+                headSha: command.approvedHeadSha,
+              },
+            },
+            at,
+          );
+          return { run: authorized, approval, effect: effect.effect };
+        });
+      if (result.effect.status === "pending" && command.dispatch !== false)
+        await this.beginAndDispatch(result.effect.key, at);
+      return result;
     });
   }
 
@@ -626,6 +778,16 @@ export class WorkflowCoordinator {
             command.expectedRevision,
           );
         const hasPublicationFacts = command.publicationFacts !== undefined;
+        const hasDeliveryFacts = command.deliveryFacts !== undefined;
+        if (hasDeliveryFacts && currentEffect.kind !== "merge")
+          throw new TypeError("Delivery facts may settle only a merge effect.");
+        if (
+          deliveryEffectKinds.has(currentEffect.kind as EffectKind) &&
+          command.facts !== undefined
+        )
+          throw new TypeError(
+            "Delivery settlements require the narrow delivery facts patch.",
+          );
         if (hasPublicationFacts && currentEffect.kind !== "publish")
           throw new TypeError(
             "Publication facts may settle only a publish effect.",
@@ -649,6 +811,45 @@ export class WorkflowCoordinator {
         )
           throw new TypeError(
             "Publication facts require a confirmed publish settlement.",
+          );
+        if (
+          currentEffect.kind === "merge" &&
+          command.outcome === "confirmed" &&
+          !hasDeliveryFacts
+        )
+          throw new TypeError(
+            "A confirmed merge settlement requires delivery facts.",
+          );
+        if (currentEffect.kind === "merge" && command.outcome === "confirmed") {
+          const receipt = command.receipt;
+          if (
+            typeof receipt !== "object" ||
+            receipt === null ||
+            Array.isArray(receipt) ||
+            !Object.hasOwn(receipt, "mergeSha") ||
+            (receipt as { mergeSha?: unknown }).mergeSha !==
+              command.deliveryFacts?.mergeSha
+          )
+            throw new TypeError(
+              "A confirmed merge settlement requires a receipt matching mergeSha.",
+            );
+        }
+        if (
+          currentEffect.kind === "merge" &&
+          command.outcome !== "confirmed" &&
+          hasDeliveryFacts
+        )
+          throw new TypeError(
+            "Delivery facts require a confirmed merge settlement.",
+          );
+        if (
+          (currentEffect.kind === "observe_staging" ||
+            currentEffect.kind === "smoke") &&
+          command.outcome === "confirmed" &&
+          command.receipt === undefined
+        )
+          throw new TypeError(
+            "A confirmed staging or smoke settlement requires its receipt.",
           );
         const repository = createRunMutationRepository(tx);
         if (command.step !== undefined) {
@@ -719,6 +920,13 @@ export class WorkflowCoordinator {
             runId: command.runId,
             expectedRevision: command.expectedRevision,
             facts: command.publicationFacts,
+            at,
+          });
+        else if (command.deliveryFacts !== undefined)
+          await repository.updateDeliveryFacts({
+            runId: command.runId,
+            expectedRevision: command.expectedRevision,
+            facts: command.deliveryFacts,
             at,
           });
         else if (command.facts !== undefined)
@@ -1614,6 +1822,7 @@ export class WorkflowCoordinator {
 export type CoordinatorCommand =
   | ReturnType<WorkflowCoordinator["createClaim"]>
   | ReturnType<WorkflowCoordinator["transition"]>
+  | ReturnType<WorkflowCoordinator["approveMerge"]>
   | ReturnType<WorkflowCoordinator["settleExecution"]>
   | ReturnType<WorkflowCoordinator["createEffectIntent"]>
   | ReturnType<WorkflowCoordinator["beginEffect"]>
