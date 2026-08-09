@@ -13,8 +13,8 @@ const MAX_NODE_ID_BYTES = 256;
 const MAX_URL_BYTES = 2_000;
 const MAX_CHECK_NAME_BYTES = 256;
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
-const REPOSITORY_PATTERN = /^[^/\s]+\/[^/\s]+$/u;
-const BRANCH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u;
+const REPOSITORY_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+const BRANCH_COMPONENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const NODE_ID_PATTERN = /^[A-Za-z0-9_:-]+$/u;
 const CHECK_STATES = ["pending", "success", "failure"] as const;
 
@@ -174,23 +174,26 @@ function sha(value: unknown): value is string {
 }
 
 function repository(value: unknown): value is string {
+  if (!text(value, "repository", MAX_REPOSITORY_BYTES)) return false;
+  const components = value.split("/");
   return (
-    text(value, "repository", MAX_REPOSITORY_BYTES) &&
-    REPOSITORY_PATTERN.test(value)
+    components.length === 2 &&
+    components.every((component) => REPOSITORY_SEGMENT_PATTERN.test(component))
   );
 }
 
 function branch(value: unknown): value is string {
-  if (!text(value, "branch", MAX_BRANCH_BYTES) || !BRANCH_PATTERN.test(value))
-    return false;
+  if (!text(value, "branch", MAX_BRANCH_BYTES)) return false;
+  const components = value.split("/");
   return (
+    components.every(
+      (component) =>
+        BRANCH_COMPONENT_PATTERN.test(component) &&
+        !component.endsWith(".") &&
+        !component.endsWith(".lock"),
+    ) &&
     !value.includes("..") &&
-    !value.includes("//") &&
-    !value.endsWith("/") &&
-    !value.endsWith(".") &&
-    !value.endsWith(".lock") &&
-    !value.includes("@{") &&
-    value.split("/").every((component) => !component.startsWith("."))
+    !value.includes("@{")
   );
 }
 
@@ -205,9 +208,24 @@ function canonicalPullRequestUrl(
   repositoryName: string,
   number: number,
 ): value is string {
+  if (!text(value, "pull request URL", MAX_URL_BYTES)) return false;
+  const canonical = `https://github.com/${repositoryName}/pull/${number}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
   return (
-    text(value, "pull request URL", MAX_URL_BYTES) &&
-    value === `https://github.com/${repositoryName}/pull/${number}`
+    parsed.protocol === "https:" &&
+    parsed.hostname === "github.com" &&
+    parsed.port === "" &&
+    parsed.username === "" &&
+    parsed.password === "" &&
+    parsed.search === "" &&
+    parsed.hash === "" &&
+    parsed.pathname === `/${repositoryName}/pull/${number}` &&
+    parsed.href === canonical
   );
 }
 

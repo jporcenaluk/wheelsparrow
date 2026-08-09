@@ -311,8 +311,28 @@ describe("GitHub publication gateway seam", () => {
     ["non-canonical URL", { url: "https://example.test/octo/widget/pull/1" }],
     ["double-slash branch", { headBranch: "ticket//publish" }],
     ["dot-dot branch", { headBranch: "ticket/../publish" }],
+    ["lock component branch", { headBranch: "foo.lock/bar" }],
+    ["dot component branch", { headBranch: "foo./bar" }],
+    ["dash-leading component branch", { headBranch: "foo/-bar" }],
+    ["underscore-leading component branch", { headBranch: "foo/_bar" }],
+    ["leading punctuation branch", { headBranch: "-foo/bar" }],
     ["trailing-slash branch", { headBranch: "ticket/publish/" }],
     ["trailing-space branch", { headBranch: "ticket/publish " }],
+    ["URL query", { url: "https://github.com/octo/widget/pull/1?x=1" }],
+    ["URL fragment", { url: "https://github.com/octo/widget/pull/1#x" }],
+    ["URL userinfo", { url: "https://user@github.com/octo/widget/pull/1" }],
+    [
+      "URL path delimiter",
+      { url: "https://github.com/octo/widget/pull/1/extra" },
+    ],
+    [
+      "URL encoded path delimiter",
+      { url: "https://github.com/octo%2Fwidget/pull/1" },
+    ],
+    ["repository query", { repository: "octo/widget?x=1" }],
+    ["repository fragment", { repository: "octo/widget#x" }],
+    ["repository userinfo", { repository: "octo@widget/repo" }],
+    ["repository path delimiter", { repository: "octo/widget/extra" }],
   ] as const)("rejects %s pull request receipts", (_label, change) => {
     const valid = {
       repository,
