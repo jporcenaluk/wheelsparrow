@@ -86,10 +86,12 @@ describe("operator read projections", () => {
       "ghp_123456789012345678901234567890123456",
     ].join(" ");
 
-    const projected = projectQueue({
+    const [review] = projectQueue({
       scheduler,
       runs: [{ ...run, requiredAction }],
-    }).review[0].required_action;
+    }).review;
+    if (review === undefined) throw new Error("Expected Review projection.");
+    const projected = review.required_action;
 
     expect(projected).toContain("Safe fact: deployment is ready.");
     expect(projected).toContain("Keep the token budget at 10.");
@@ -99,10 +101,12 @@ describe("operator read projections", () => {
 
   test("redacts before applying the bounded text limit", () => {
     const requiredAction = `{"token":"SECRET_BOUNDED"} ${"safe ".repeat(2_000)}`;
-    const projected = projectQueue({
+    const [review] = projectQueue({
       scheduler,
       runs: [{ ...run, requiredAction }],
-    }).review[0].required_action;
+    }).review;
+    if (review === undefined) throw new Error("Expected Review projection.");
+    const projected = review.required_action;
 
     expect(projected).not.toContain("SECRET_BOUNDED");
     expect(projected).toHaveLength(4096);
