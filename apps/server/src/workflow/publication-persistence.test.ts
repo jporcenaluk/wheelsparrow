@@ -222,6 +222,26 @@ describe("atomic publication facts settlement", () => {
   test.each([
     ["pull request number", { pullRequestNumber: 0 }],
     ["pull request URL", { pullRequestUrl: "not-a-url" }],
+    [
+      "leading whitespace URL",
+      { pullRequestUrl: " https://github.com/owner/repository/pull/123" },
+    ],
+    [
+      "trailing whitespace URL",
+      { pullRequestUrl: "https://github.com/owner/repository/pull/123 " },
+    ],
+    [
+      "newline URL",
+      { pullRequestUrl: "https://github.com/owner/repository/pull/123\n" },
+    ],
+    [
+      "default port URL",
+      { pullRequestUrl: "https://github.com:443/owner/repository/pull/123" },
+    ],
+    [
+      "normalized path URL",
+      { pullRequestUrl: "https://github.com/owner/repository/./pull/123" },
+    ],
     ["base SHA", { baseSha: "not-a-sha" }],
     ["head SHA", { headSha: "not-a-sha" }],
   ] as const)("rejects an invalid %s", async (_label, invalid) => {
@@ -244,9 +264,15 @@ describe("atomic publication facts settlement", () => {
           ...validPublicationFacts(),
           ...invalid,
         },
+        step: publicationStep(run),
       }),
     ).rejects.toThrow();
     expect(await readRun(connection.db, run.id)).toEqual(run);
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?")
+        .get(run.id),
+    ).toEqual({ count: 0 });
     expect(
       connection.native
         .prepare("SELECT status FROM side_effects WHERE key = ?")

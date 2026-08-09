@@ -25,6 +25,8 @@ const maximumJsonBytes = 1024 * 1024;
 const maximumPullRequestTitleBytes = 2 * 1024;
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const gitRefComponentPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+const githubPathSegmentPattern =
+  /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u;
 const runStates = new Set<string>(RUN_STATES);
 const repairableTriggers = new Set<WorkflowTrigger>([
   "verification_failed_repairable",
@@ -416,23 +418,18 @@ function validatePullRequestUrl(
   pullRequestNumber: number,
 ): string {
   const text = boundedText(value, "Pull request URL", maximumIdentifierBytes);
-  let parsed: URL;
-  try {
-    parsed = new URL(text);
-  } catch {
-    throw new TypeError("Pull request URL must be a valid URL.");
-  }
+  const repositoryParts = repository.split("/");
   if (
-    parsed.protocol !== "https:" ||
-    parsed.hostname !== "github.com" ||
-    parsed.username.length > 0 ||
-    parsed.password.length > 0 ||
-    parsed.search.length > 0 ||
-    parsed.hash.length > 0 ||
-    parsed.pathname !== `/${repository}/pull/${pullRequestNumber}`
+    repositoryParts.length !== 2 ||
+    repositoryParts.some((part) => !githubPathSegmentPattern.test(part))
   )
     throw new TypeError(
-      "Pull request URL must be the canonical HTTPS GitHub pull request URL.",
+      "Run repository must contain safe GitHub owner and repository names.",
+    );
+  const expected = `https://github.com/${repository}/pull/${pullRequestNumber}`;
+  if (text !== expected)
+    throw new TypeError(
+      "Pull request URL must be the raw canonical HTTPS GitHub URL.",
     );
   return text;
 }
