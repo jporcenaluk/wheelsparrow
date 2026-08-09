@@ -101,15 +101,15 @@ required product outcomes.
 - Active slice: merge-train row 5, Block 3 contained builder execution.
 - Active worktree: `/home/jporc/wheelsparrow/.worktrees/block3-builder`.
 - Branch: `feat/block-3-builder`.
-- Observed executable head before this ledger edit: `cb32433`.
+- Observed executable head before this ledger edit: `3fb5607732e79625ccc695ec117cd95eaf789a2a`.
 - Active plan: `docs/superpowers/plans/2026-08-09-block-3-builder-workspaces.md`; code and focused
   boundary tests are complete, with publication evidence still pending.
-- Last verification: at `cb32433`, unrestricted Node 24.18.0 `make verify-agent` passed formatting,
-  Markdownlint, frozen install, all TypeScript projects, and 28 test files / 611 tests; `make build`,
+- Last verification: at `3fb5607732e79625ccc695ec117cd95eaf789a2a`, unrestricted Node 24.18.0 `make verify-agent` passed formatting,
+  Markdownlint, frozen install, all TypeScript projects, and 28 test files / 613 tests; `make build`,
   `make smoke-production`, and diff hygiene passed. The managed sandbox suppresses detached-child
   output, so unrestricted evidence is authoritative for ownership/process tests.
 - Publication state: Block 3 is pre-PR; the exact-head local gate is green and a fresh whole-block
-  review is in progress.
+  review is approved.
 - Next safe command: publish a non-draft Block 3 PR, observe exact-head CI, and merge under the
   authorized workflow once the fresh review is clean.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
@@ -247,7 +247,7 @@ programme status or delivery order; only the merge train and current resume poin
 | 2026-08-08 | B1 service lifecycle integration | Commit `e604a39` runs durable reconciliation after migration and before listener startup, and closes the coordinator before database resources during shutdown and failure cleanup. |
 | 2026-08-08 | Row 3 exact-head pre-PR whole gate | At `e604a39f9de8b81026798cc82796a509d117b12d`, unrestricted Node 24.18.0 `make verify-agent` passed formatting, Markdownlint, frozen install, all TypeScript projects, 19 test files / 410 tests, and diff hygiene; `make build` and `make smoke-production` passed. No PR, CI, approval, or merge evidence exists yet. |
 | 2026-08-09 | Row 4 GitHub discovery and durable claim | Commits `6561df7`, `7738af7`, `8cf0f31`, `a3707e7`, `4b5f19a`, and `43ad161` add a narrow typed GitHub project boundary, test-only stateful fake, fail-closed deterministic eligibility, active durable-ownership lookup, durable exact-item claim, atomic claim rejection, late-callback quarantine, and restart-safe reconciliation. The fake detects revision, identity, duplicate-mutation, dependency, receipt, ordering, and timestamp drift. Fresh requirements, quality/security, and whole-block reviewers approved after repairing malformed duplicate IDs, post-mutation ambiguity, observer uncertainty, and representation-order drift. At `43ad161`, unrestricted Node 24.18.0 `make verify-agent` passed 23 files / 538 tests; `make build`, Markdownlint, and diff hygiene passed. Publication remains pending. |
-| 2026-08-09 | Row 5 Block 3 local execution gate | Commits `6cf96f2`, `a6d130c`, `f84d307`, `89ac50f`, `a4fba31`, `db35268`, `4665f0e`, `41d8c5a`, `74abb97`, `0ef7471`, and `cb32433` create/reinspect contained run worktrees, render and run bounded credential-free builder subprocesses, run bounded verification, atomically persist receipts and append-only steps through the coordinator, and advance `preparing -> intaking -> building -> verifying -> reviewing`. Fresh process and Git boundary reviews drove containment, credential, redaction, command, timeout, changed-file, and restart repairs. At `cb32433`, unrestricted Node 24.18.0 `make verify-agent` passed 28 files / 611 tests; `make build`, `make smoke-production`, and diff hygiene passed. Fresh combined review and publication remain pending. |
+| 2026-08-09 | Row 5 Block 3 local execution gate | Commits `6cf96f2`, `a6d130c`, `f84d307`, `89ac50f`, `a4fba31`, `db35268`, `4665f0e`, `41d8c5a`, `74abb97`, `0ef7471`, `4aa4210`, `cb32433`, `e281685`, and `3fb5607` create/reinspect contained run worktrees, render and run bounded credential-free builder subprocesses, run bounded verification, atomically persist receipts and append-only steps through the coordinator, and advance `preparing -> intaking -> building -> verifying -> reviewing`. Fresh process, Git boundary, and durability reviews drove containment, credential, redaction, command, timeout, changed-file, restart, and coordinator-settlement repairs. At `3fb5607`, unrestricted Node 24.18.0 `make verify-agent` passed 28 files / 613 tests; `make build`, `make smoke-production`, and diff hygiene passed. Publication remains pending. |
 
 ## Open Decisions and Risks
 
