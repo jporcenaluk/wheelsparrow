@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Value } from "typebox/value";
@@ -12,6 +12,31 @@ import {
 } from "./reviewer.js";
 
 const fixtureDirectories: string[] = [];
+
+describe("prompt test command", () => {
+  test("covers every repository-owned prompt contract", async () => {
+    const packageContents = JSON.parse(
+      await readFile(
+        new URL("../../../../package.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { scripts?: Record<string, string> };
+    const promptTestScript = packageContents.scripts?.["test:prompts"] ?? "";
+    expect(promptTestScript).toContain(
+      "apps/server/src/agents/builder.test.ts",
+    );
+    expect(promptTestScript).toContain(
+      "apps/server/src/agents/reviewer.test.ts",
+    );
+    expect(promptTestScript).toContain("apps/server/src/agents/repair.test.ts");
+
+    const makefile = await readFile(
+      new URL("../../../../Makefile", import.meta.url),
+      "utf8",
+    );
+    expect(makefile).toMatch(/test-prompts:\n\s+\$\(PNPM\) test:prompts/u);
+  });
+});
 
 async function childFixture(
   source: string,
