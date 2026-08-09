@@ -44,6 +44,40 @@ function claimInput() {
   };
 }
 
+function mergeReceipt(overrides: Record<string, unknown> = {}) {
+  return {
+    repository: "owner/repository",
+    number: 123,
+    issueNumber: 42,
+    nodeId: "PR_node_delivery",
+    method: "squash",
+    baseBranch: "main",
+    baseSha,
+    headBranch: "wheelsparrow/42-delivery",
+    headSha: approvedHeadSha,
+    mergeSha,
+    ...overrides,
+  };
+}
+
+async function approvedMergeEffect(
+  connection: ReturnType<typeof openDatabase>,
+  coordinator: WorkflowCoordinator,
+) {
+  const review = await enterReview(connection, coordinator);
+  const approved = await coordinator.approveMerge({
+    runId: review.id,
+    expectedRevision: review.revision,
+    operator: "operator@example.test",
+    approvedHeadSha,
+    observedBaseSha: baseSha,
+    at,
+    dispatch: false,
+  });
+  await coordinator.beginEffect({ effectKey: approved.effect.key });
+  return { review, approved };
+}
+
 async function enterReview(
   connection: ReturnType<typeof openDatabase>,
   coordinator: WorkflowCoordinator,
@@ -299,7 +333,7 @@ describe("coordinator-owned delivery persistence", () => {
       outcome: "confirmed",
       trigger: "merge_observed",
       evidence: "Merge receipt observed for the approved candidate.",
-      receipt: { mergeSha },
+      receipt: mergeReceipt(),
       deliveryFacts: { mergeSha },
       at,
     });
@@ -312,6 +346,177 @@ describe("coordinator-owned delivery persistence", () => {
     expect(JSON.parse(settled.effect.receipt as string)).toMatchObject({
       mergeSha,
     });
+    await coordinator.close();
+  });
+
+  test("rejects a null generic merge receipt without advancing or writing facts", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { approved } = await approvedMergeEffect(connection, coordinator);
+
+    await expect(
+      coordinator.observeEffect({
+        runId: approved.run.id,
+        expectedRevision: approved.run.revision,
+        effectKey: approved.effect.key,
+        outcome: "confirmed",
+        trigger: "merge_observed",
+        evidence: "The callback omitted its receipt.",
+        receipt: null,
+        at,
+      }),
+    ).rejects.toThrow(/receipt|merge/i);
+    expect(await readRun(connection.db, approved.run.id)).toEqual(approved.run);
+    expect(
+      connection.native
+        .prepare("SELECT status FROM side_effects WHERE key = ?")
+        .get(approved.effect.key),
+    ).toEqual({ status: "in_flight" });
+    await coordinator.close();
+  });
+
+  test.each([
+    ["empty", {}],
+    ["missing merge SHA", { ...mergeReceipt(), mergeSha: undefined }],
+  ])("rejects a %s generic merge receipt", async (_label, receipt) => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { approved } = await approvedMergeEffect(connection, coordinator);
+
+    await expect(
+      coordinator.observeEffect({
+        runId: approved.run.id,
+        expectedRevision: approved.run.revision,
+        effectKey: approved.effect.key,
+        outcome: "confirmed",
+        trigger: "merge_observed",
+        evidence: "The callback omitted a required merge fact.",
+        receipt,
+        at,
+      }),
+    ).rejects.toThrow(/receipt|merge|SHA/i);
+    expect(await readRun(connection.db, approved.run.id)).toEqual(approved.run);
+    await coordinator.close();
+  });
+
+  test("quarantines a malformed confirmed merge callback instead of advancing the run", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({
+      connection,
+      dispatcher: (effect, complete) => {
+        if (effect.kind !== "merge") return;
+        complete({
+          outcome: "confirmed",
+          trigger: "merge_observed",
+          evidence: "The callback omitted its merge receipt.",
+          receipt: null,
+        });
+      },
+    });
+    const review = await enterReview(connection, coordinator);
+    const approved = await coordinator.approveMerge({
+      runId: review.id,
+      expectedRevision: review.revision,
+      operator: "operator@example.test",
+      approvedHeadSha,
+      observedBaseSha: baseSha,
+      at,
+      dispatch: false,
+    });
+    await coordinator.beginEffect({ effectKey: approved.effect.key });
+    await coordinator.waitForIdle();
+
+    expect(await readRun(connection.db, approved.run.id)).toMatchObject({
+      state: "merging",
+      revision: approved.run.revision + 1,
+      mergeSha: null,
+    });
+    expect(
+      connection.native
+        .prepare("SELECT status FROM side_effects WHERE key = ?")
+        .get(approved.effect.key),
+    ).toEqual({ status: "ambiguous" });
+    await coordinator.close();
+  });
+
+  test("persists merge SHA before a valid generic observation transitions the run", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { approved } = await approvedMergeEffect(connection, coordinator);
+
+    const settled = await coordinator.observeEffect({
+      runId: approved.run.id,
+      expectedRevision: approved.run.revision,
+      effectKey: approved.effect.key,
+      outcome: "confirmed",
+      trigger: "merge_observed",
+      evidence: "The exact merge receipt was observed.",
+      receipt: mergeReceipt(),
+      at,
+    });
+
+    expect(settled.status).toBe("confirmed");
+    expect(await readRun(connection.db, approved.run.id)).toMatchObject({
+      state: "waiting_for_staging",
+      mergeSha,
+      revision: approved.run.revision + 1,
+    });
+    await coordinator.close();
+  });
+
+  test("rejects a generic merge receipt whose candidate SHA differs from intent", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { approved } = await approvedMergeEffect(connection, coordinator);
+
+    await expect(
+      coordinator.observeEffect({
+        runId: approved.run.id,
+        expectedRevision: approved.run.revision,
+        effectKey: approved.effect.key,
+        outcome: "confirmed",
+        trigger: "merge_observed",
+        evidence: "The callback reports a changed candidate.",
+        receipt: mergeReceipt({ headSha: "e".repeat(40) }),
+        at,
+      }),
+    ).rejects.toThrow(/head|intent|match/i);
+    expect(await readRun(connection.db, approved.run.id)).toEqual(approved.run);
+    await coordinator.close();
+  });
+
+  test("rejects a generic merge receipt when the durable intent fingerprint is tampered", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const { approved } = await approvedMergeEffect(connection, coordinator);
+    connection.native
+      .prepare("UPDATE side_effects SET intent_json = ? WHERE key = ?")
+      .run(
+        JSON.stringify({
+          baseSha,
+          branch: "wheelsparrow/42-delivery",
+          headSha: "e".repeat(40),
+          pullRequestNodeId: "PR_node_delivery",
+          pullRequestNumber: 123,
+          pullRequestUrl: "https://github.com/owner/repository/pull/123",
+          repository: "owner/repository",
+        }),
+        approved.effect.key,
+      );
+
+    await expect(
+      coordinator.observeEffect({
+        runId: approved.run.id,
+        expectedRevision: approved.run.revision,
+        effectKey: approved.effect.key,
+        outcome: "confirmed",
+        trigger: "merge_observed",
+        evidence: "The callback is bound to a tampered intent.",
+        receipt: mergeReceipt(),
+        at,
+      }),
+    ).rejects.toThrow(/intent|integrity|fingerprint/i);
+    expect(await readRun(connection.db, approved.run.id)).toEqual(approved.run);
     await coordinator.close();
   });
 

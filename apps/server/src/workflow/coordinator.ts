@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type { DatabaseConnection } from "../database/connection.js";
 import {
@@ -247,7 +247,11 @@ const deliveryEffectKinds = new Set<EffectKind>([
   "merge",
   "observe_staging",
   "smoke",
+  "project_done",
 ]);
+const deliveryShaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+const maximumDeliveryReceiptBytes = 1024 * 1024;
+const maximumDeliveryTextBytes = 512;
 // A fixed event kind plus structured effect-key details is durable quarantine
 // state; adapter evidence remains free-form and is never used as a marker.
 const quarantinedEffectEventKind = "effect_quarantined";
@@ -307,6 +311,355 @@ function isJsonValue(value: unknown, seen = new Set<object>()): boolean {
     return value.every((item) => isJsonValue(item, seen));
   if (Object.getPrototypeOf(value) !== Object.prototype) return false;
   return Object.values(value).every((item) => isJsonValue(item, seen));
+}
+
+function canonicalJsonValue(value: unknown, seen = new Set<object>()): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean")
+    return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("JSON number is invalid.");
+    return JSON.stringify(value);
+  }
+  if (typeof value !== "object" || seen.has(value))
+    throw new TypeError("JSON value is invalid or cyclic.");
+  seen.add(value);
+  if (Array.isArray(value))
+    return `[${value.map((item) => canonicalJsonValue(item, seen)).join(",")}]`;
+  if (Object.getPrototypeOf(value) !== Object.prototype)
+    throw new TypeError("JSON object is not plain.");
+  return `{${Object.keys(value)
+    .toSorted()
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalJsonValue(
+          (value as Record<string, unknown>)[key],
+          seen,
+        )}`,
+    )
+    .join(",")}}`;
+}
+
+function durableIntent(effect: {
+  intent_json: string;
+  fingerprint: string;
+}): Record<string, unknown> {
+  if (
+    Buffer.byteLength(effect.intent_json, "utf8") > maximumJsonBytes ||
+    !/^[0-9a-f]{64}$/u.test(effect.fingerprint)
+  )
+    throw new TypeError("Delivery effect intent integrity is invalid.");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(effect.intent_json) as unknown;
+    if (!isJsonValue(parsed)) throw new TypeError("Intent is not JSON data.");
+    const canonical = canonicalJsonValue(parsed);
+    if (
+      canonical !== effect.intent_json ||
+      createHash("sha256").update(canonical, "utf8").digest("hex") !==
+        effect.fingerprint
+    )
+      throw new TypeError("Delivery effect intent integrity is invalid.");
+  } catch (error) {
+    if (error instanceof TypeError) throw error;
+    throw new TypeError("Delivery effect intent integrity is invalid.");
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.getPrototypeOf(parsed) !== Object.prototype
+  )
+    throw new TypeError("Delivery effect intent must be a plain object.");
+  return parsed as Record<string, unknown>;
+}
+
+function deliveryRecord(
+  value: unknown,
+  label: string,
+): Record<string, unknown> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  )
+    throw new TypeError(`${label} must be a plain object.`);
+  try {
+    const serialized = JSON.stringify(value);
+    if (
+      serialized === undefined ||
+      Buffer.byteLength(serialized, "utf8") > maximumDeliveryReceiptBytes
+    )
+      throw new TypeError(`${label} exceeds its size limit.`);
+  } catch (error) {
+    if (error instanceof TypeError) throw error;
+    throw new TypeError(`${label} must be JSON data.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function deliveryKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  label: string,
+): void {
+  const keys = new Set(allowed);
+  if (Object.keys(value).some((key) => !keys.has(key)))
+    throw new TypeError(`${label} contains unsupported fields.`);
+}
+
+function deliveryText(
+  value: unknown,
+  label: string,
+  maximum = maximumDeliveryTextBytes,
+): string {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    Buffer.byteLength(value, "utf8") > maximum
+  )
+    throw new TypeError(`${label} is invalid.`);
+  return value;
+}
+
+function deliverySha(value: unknown, label: string): string {
+  if (typeof value !== "string" || !deliveryShaPattern.test(value))
+    throw new TypeError(`${label} is invalid.`);
+  return value;
+}
+
+function deliveryNumber(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0)
+    throw new TypeError(`${label} is invalid.`);
+  return value as number;
+}
+
+function equalDelivery(
+  actual: unknown,
+  expected: unknown,
+  label: string,
+): void {
+  if (actual !== expected)
+    throw new TypeError(`${label} does not match intent.`);
+}
+
+function intentAlias(
+  intent: Record<string, unknown>,
+  keys: readonly string[],
+  label: string,
+): unknown {
+  for (const key of keys) {
+    if (Object.hasOwn(intent, key)) return intent[key];
+  }
+  throw new TypeError(`Delivery intent is missing ${label}.`);
+}
+
+interface DeliveryObservationFacts {
+  mergeSha?: string;
+}
+
+function validateDeliveryObservation(
+  effect: Pick<SideEffectsTable, "kind" | "intent_json" | "fingerprint">,
+  run: RunRecord,
+  outcome: EffectObservation["outcome"],
+  receipt: unknown,
+): DeliveryObservationFacts {
+  const kind = effect.kind as EffectKind;
+  if (!deliveryEffectKinds.has(kind) || outcome !== "confirmed") return {};
+  const intent = durableIntent(effect);
+  const value = deliveryRecord(receipt, `${kind} receipt`);
+  if (kind === "merge") {
+    deliveryKeys(
+      value,
+      [
+        "repository",
+        "number",
+        "issueNumber",
+        "nodeId",
+        "method",
+        "baseBranch",
+        "baseSha",
+        "headBranch",
+        "headSha",
+        "mergeSha",
+      ],
+      "Merge receipt",
+    );
+    const repository = deliveryText(value.repository, "Merge repository");
+    const number = deliveryNumber(value.number, "Merge pull request number");
+    const issueNumber = deliveryNumber(value.issueNumber, "Merge issue number");
+    const nodeId = deliveryText(value.nodeId, "Merge pull request node ID");
+    const baseBranch = deliveryText(value.baseBranch, "Merge base branch");
+    const base = deliverySha(value.baseSha, "Merge base SHA");
+    const headBranch = deliveryText(value.headBranch, "Merge head branch");
+    const head = deliverySha(value.headSha, "Merge head SHA");
+    const merged = deliverySha(value.mergeSha, "Merge SHA");
+    const expectedNumber = deliveryNumber(
+      intentAlias(
+        intent,
+        ["pullRequestNumber", "number"],
+        "pull request number",
+      ),
+      "Intent pull request number",
+    );
+    const expectedNodeId = deliveryText(
+      intentAlias(
+        intent,
+        ["pullRequestNodeId", "nodeId"],
+        "pull request node ID",
+      ),
+      "Intent pull request node ID",
+    );
+    const expectedBase = deliverySha(intent.baseSha, "Intent base SHA");
+    const expectedHead = deliverySha(intent.headSha, "Intent head SHA");
+    const expectedBranch = deliveryText(intent.branch, "Intent branch");
+    equalDelivery(repository, run.repository, "Merge repository");
+    equalDelivery(number, expectedNumber, "Merge pull request number");
+    equalDelivery(issueNumber, run.issueNumber, "Merge issue number");
+    equalDelivery(nodeId, expectedNodeId, "Merge pull request node ID");
+    equalDelivery(baseBranch, run.baseBranch, "Merge base branch");
+    equalDelivery(base, expectedBase, "Merge base SHA");
+    equalDelivery(base, run.baseSha, "Merge base SHA");
+    equalDelivery(headBranch, expectedBranch, "Merge head branch");
+    equalDelivery(head, expectedHead, "Merge head SHA");
+    equalDelivery(head, run.approvedHeadSha ?? run.headSha, "Merge head SHA");
+    return { mergeSha: merged };
+  }
+
+  const expectedMergeSha = deliverySha(run.mergeSha, "Durable merge SHA");
+  const intentMergeSha = deliverySha(intent.mergeSha, "Intent merge SHA");
+  equalDelivery(intentMergeSha, expectedMergeSha, "Delivery merge SHA");
+  equalDelivery(intent.runId, run.id, "Delivery run ID");
+  if (kind === "observe_staging") {
+    const expectedWorkflow = deliveryText(intent.workflow, "Staging workflow");
+    const expectedEnvironment = deliveryText(
+      intent.environment,
+      "Staging environment",
+    );
+    deliveryKeys(
+      value,
+      [
+        "repository",
+        "workflow",
+        "environment",
+        "mergeSha",
+        "workflowRun",
+        "deployment",
+        "outcome",
+      ],
+      "Staging receipt",
+    );
+    equalDelivery(value.repository, run.repository, "Staging repository");
+    equalDelivery(value.workflow, expectedWorkflow, "Staging workflow");
+    equalDelivery(
+      value.environment,
+      expectedEnvironment,
+      "Staging environment",
+    );
+    equalDelivery(value.mergeSha, expectedMergeSha, "Staging merge SHA");
+    if (value.outcome !== "deployed")
+      throw new TypeError("Confirmed staging requires a deployed receipt.");
+    const workflowRun = deliveryRecord(
+      value.workflowRun,
+      "Staging workflow run",
+    );
+    deliveryKeys(
+      workflowRun,
+      ["id", "workflow", "headSha", "status", "conclusion"],
+      "Staging workflow run",
+    );
+    equalDelivery(
+      workflowRun.workflow,
+      expectedWorkflow,
+      "Staging workflow run",
+    );
+    equalDelivery(
+      workflowRun.headSha,
+      expectedMergeSha,
+      "Staging workflow SHA",
+    );
+    equalDelivery(workflowRun.status, "completed", "Staging workflow status");
+    equalDelivery(
+      workflowRun.conclusion,
+      "success",
+      "Staging workflow conclusion",
+    );
+    const deployment = deliveryRecord(value.deployment, "Staging deployment");
+    deliveryKeys(
+      deployment,
+      ["id", "environment", "deployedSha", "state"],
+      "Staging deployment",
+    );
+    equalDelivery(
+      deployment.environment,
+      expectedEnvironment,
+      "Staging deployment environment",
+    );
+    equalDelivery(
+      deployment.deployedSha,
+      expectedMergeSha,
+      "Staging deployed SHA",
+    );
+    equalDelivery(deployment.state, "success", "Staging deployment state");
+    return {};
+  }
+
+  if (kind === "smoke") {
+    deliveryKeys(
+      value,
+      ["outcome", "exitCode", "durationMs", "summary", "command", "mergeSha"],
+      "Smoke receipt",
+    );
+    if (!["passed", "succeeded", "success"].includes(value.outcome as string))
+      throw new TypeError("Confirmed smoke requires a successful receipt.");
+    if (
+      value.exitCode !== null &&
+      value.exitCode !== undefined &&
+      value.exitCode !== 0
+    )
+      throw new TypeError("Confirmed smoke requires exit code zero.");
+    if (
+      value.durationMs !== null &&
+      value.durationMs !== undefined &&
+      (!Number.isSafeInteger(value.durationMs) ||
+        (value.durationMs as number) < 0)
+    )
+      throw new TypeError("Smoke duration is invalid.");
+    if (value.command !== undefined)
+      equalDelivery(value.command, intent.command, "Smoke command");
+    if (value.mergeSha !== undefined)
+      equalDelivery(value.mergeSha, expectedMergeSha, "Smoke merge SHA");
+    return {};
+  }
+
+  deliveryKeys(value, ["outcome", "item"], "Done receipt");
+  if (!["moved", "already_applied"].includes(value.outcome as string))
+    throw new TypeError("Confirmed Done projection requires a move receipt.");
+  const item = deliveryRecord(value.item, "Done project item");
+  const expectedRepository = deliveryText(intent.repository, "Done repository");
+  const expectedProjectId = deliveryText(intent.projectId, "Done project ID");
+  const expectedProjectNumber = deliveryNumber(
+    intent.projectNumber,
+    "Done project number",
+  );
+  const expectedItemId = intentAlias(
+    intent,
+    ["itemId", "projectItemId"],
+    "project item ID",
+  );
+  equalDelivery(item.repository, expectedRepository, "Done repository");
+  equalDelivery(item.projectId, expectedProjectId, "Done project");
+  equalDelivery(
+    item.projectNumber,
+    expectedProjectNumber,
+    "Done project number",
+  );
+  equalDelivery(item.projectItemId, expectedItemId, "Done project item");
+  equalDelivery(item.issueNodeId, run.issueNodeId, "Done issue node");
+  equalDelivery(item.issueNumber, run.issueNumber, "Done issue number");
+  equalDelivery(item.status, intent.toStatus ?? "Done", "Done project status");
+  return {};
 }
 
 function malformedResult(
@@ -764,7 +1117,7 @@ export class WorkflowCoordinator {
           throw new StaleRevisionError(command.expectedRevision);
         const currentEffect = await tx
           .selectFrom("side_effects")
-          .select(["run_id", "rework_epoch", "target_revision", "kind"])
+          .selectAll()
           .where("key", "=", command.effectKey)
           .executeTakeFirst();
         if (
@@ -820,20 +1173,6 @@ export class WorkflowCoordinator {
           throw new TypeError(
             "A confirmed merge settlement requires delivery facts.",
           );
-        if (currentEffect.kind === "merge" && command.outcome === "confirmed") {
-          const receipt = command.receipt;
-          if (
-            typeof receipt !== "object" ||
-            receipt === null ||
-            Array.isArray(receipt) ||
-            !Object.hasOwn(receipt, "mergeSha") ||
-            (receipt as { mergeSha?: unknown }).mergeSha !==
-              command.deliveryFacts?.mergeSha
-          )
-            throw new TypeError(
-              "A confirmed merge settlement requires a receipt matching mergeSha.",
-            );
-        }
         if (
           currentEffect.kind === "merge" &&
           command.outcome !== "confirmed" &&
@@ -843,13 +1182,26 @@ export class WorkflowCoordinator {
             "Delivery facts require a confirmed merge settlement.",
           );
         if (
-          (currentEffect.kind === "observe_staging" ||
-            currentEffect.kind === "smoke") &&
+          deliveryEffectKinds.has(currentEffect.kind as EffectKind) &&
           command.outcome === "confirmed" &&
           command.receipt === undefined
         )
           throw new TypeError(
-            "A confirmed staging or smoke settlement requires its receipt.",
+            "A confirmed delivery settlement requires its receipt.",
+          );
+        const deliveryFacts = validateDeliveryObservation(
+          currentEffect,
+          current,
+          command.outcome,
+          command.receipt,
+        );
+        if (
+          currentEffect.kind === "merge" &&
+          command.outcome === "confirmed" &&
+          command.deliveryFacts?.mergeSha !== deliveryFacts.mergeSha
+        )
+          throw new TypeError(
+            "Merge delivery facts must match the confirmed receipt.",
           );
         const repository = createRunMutationRepository(tx);
         if (command.step !== undefined) {
@@ -1445,7 +1797,7 @@ export class WorkflowCoordinator {
       return this.connection.db.transaction().execute(async (tx) => {
         const current = await tx
           .selectFrom("side_effects")
-          .select(["run_id", "status"])
+          .selectAll()
           .where("key", "=", command.effectKey)
           .executeTakeFirst();
         if (current === undefined)
@@ -1475,6 +1827,27 @@ export class WorkflowCoordinator {
             command.effectKey,
             command.expectedRevision,
           );
+        if (
+          deliveryEffectKinds.has(current.kind as EffectKind) &&
+          command.outcome === "confirmed" &&
+          command.receipt === undefined
+        )
+          throw new TypeError(
+            "A confirmed delivery settlement requires its receipt.",
+          );
+        const deliveryFacts = validateDeliveryObservation(
+          current,
+          run,
+          command.outcome,
+          command.receipt,
+        );
+        if (deliveryFacts.mergeSha !== undefined)
+          await createRunMutationRepository(tx).updateDeliveryFacts({
+            runId: run.id,
+            expectedRevision: command.expectedRevision,
+            facts: { mergeSha: deliveryFacts.mergeSha },
+            at,
+          });
         return createEffectMutationRepository(tx).recordEffectObservation(
           command,
           at,
