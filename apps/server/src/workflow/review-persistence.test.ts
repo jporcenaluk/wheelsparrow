@@ -128,6 +128,25 @@ async function reviewEffect(
   });
 }
 
+async function repairEffect(
+  coordinator: WorkflowCoordinator,
+  run: Awaited<ReturnType<typeof enterReviewing>>,
+) {
+  const key = `run:${run.id}:agent:repair:attempt:1`;
+  await coordinator.createEffectIntent({
+    runId: run.id,
+    expectedRevision: run.revision,
+    key,
+    kind: "agent_repair",
+    intent: { runId: run.id, attempt: 1 },
+    dispatch: false,
+  });
+  return coordinator.beginEffect({
+    effectKey: key,
+    expectedRevision: run.revision,
+  });
+}
+
 afterEach(async () => {
   for (const connection of connections.splice(0)) await connection.close();
   await Promise.all(
@@ -189,6 +208,93 @@ describe("atomic review findings settlement", () => {
         .prepare("UPDATE findings SET evidence = ? WHERE id = ?")
         .run("rewritten", finding.id),
     ).toThrow(/append-only/u);
+    await coordinator.close();
+  });
+
+  test("rejects findings from non-review effects without partial writes", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterReviewing(
+      coordinator,
+      connection,
+      "run-effect-boundary",
+    );
+    const effect = await repairEffect(coordinator, run);
+    const step = reviewStep(run);
+    const finding = reviewFinding(run, step.id);
+
+    await expect(
+      coordinator.settleExecution({
+        runId: run.id,
+        expectedRevision: run.revision,
+        effectKey: effect.key,
+        outcome: "failed",
+        trigger: "handoff_required",
+        evidence: "Repair effect cannot settle review findings.",
+        at,
+        step,
+        findings: [finding],
+      }),
+    ).rejects.toThrow(/agent_review|review effect|findings/u);
+
+    expect(await readRun(connection.db, run.id)).toMatchObject({
+      state: "reviewing",
+      revision: run.revision,
+    });
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?")
+        .get(run.id),
+    ).toEqual({ count: 0 });
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM findings WHERE run_id = ?")
+        .get(run.id),
+    ).toEqual({ count: 0 });
+    expect(
+      connection.native
+        .prepare("SELECT status FROM side_effects WHERE key = ?")
+        .get(effect.key),
+    ).toEqual({ status: "in_flight" });
+    await coordinator.close();
+  });
+
+  test("requires a reviewer review step for review findings", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterReviewing(
+      coordinator,
+      connection,
+      "run-step-boundary",
+    );
+    const effect = await reviewEffect(coordinator, run);
+    const step = reviewStep(run);
+    const finding = reviewFinding(run, step.id);
+
+    await expect(
+      coordinator.settleExecution({
+        runId: run.id,
+        expectedRevision: run.revision,
+        effectKey: effect.key,
+        outcome: "failed",
+        trigger: "review_needs_repair",
+        evidence: "A builder step cannot own reviewer findings.",
+        at,
+        step: { ...step, role: "builder", logicalStep: "build" },
+        findings: [finding],
+      }),
+    ).rejects.toThrow(/reviewer|review step/u);
+
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?")
+        .get(run.id),
+    ).toEqual({ count: 0 });
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM findings WHERE run_id = ?")
+        .get(run.id),
+    ).toEqual({ count: 0 });
     await coordinator.close();
   });
 
@@ -280,7 +386,9 @@ describe("atomic review findings settlement", () => {
           { ...reviewFinding(run, step.id), reviewStepId: "missing-step" },
         ],
       }),
-    ).rejects.toThrow(/foreign key|constraint|durable run write/u);
+    ).rejects.toThrow(
+      /foreign key|constraint|durable run write|reviewer step/u,
+    );
 
     expect(
       connection.native

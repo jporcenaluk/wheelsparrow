@@ -155,6 +155,91 @@ describe("contained Git worktree boundary", () => {
     expect(Buffer.byteLength(diff, "utf8")).toBeLessThanOrEqual(256 * 1024);
   });
 
+  test("includes safe untracked files in the bounded canonical diff", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    await writeFile(join(prepared.path, "new-file.txt"), "untracked\n", "utf8");
+
+    const diff = await readRunWorktreeDiff({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      expected: {
+        path: prepared.path,
+        branch: prepared.branch,
+        baseSha: prepared.baseSha,
+        headSha: prepared.baseSha,
+      },
+      git: realGit,
+    });
+
+    expect(diff).toContain("new-file.txt");
+    expect(diff).toContain("+untracked");
+
+    await writeFile(
+      join(prepared.path, "new-file.txt"),
+      `${"x".repeat(2_000)}\n`,
+      "utf8",
+    );
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        maxBytes: 128,
+        git: realGit,
+      }),
+    ).rejects.toThrow(/raw diff|size|bound/u);
+  });
+
+  test("rejects untracked symlinks instead of reading outside the worktree", async () => {
+    const { repositoryRoot } = await temporaryGitRepository();
+    const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");
+    const prepared = await prepareRunWorktree({
+      repositoryRoot,
+      workspaceRoot,
+      runId: "run-7",
+      issueNumber: 42,
+      baseBranch: "main",
+      git: realGit,
+    });
+    const outside = join(repositoryRoot, "outside-secret.txt");
+    await writeFile(outside, "secret\n", "utf8");
+    await symlink(outside, join(prepared.path, "leak.txt"));
+
+    await expect(
+      readRunWorktreeDiff({
+        repositoryRoot,
+        workspaceRoot,
+        runId: "run-7",
+        issueNumber: 42,
+        expected: {
+          path: prepared.path,
+          branch: prepared.branch,
+          baseSha: prepared.baseSha,
+          headSha: prepared.baseSha,
+        },
+        git: realGit,
+      }),
+    ).rejects.toThrow(/symbolic|symlink|contained|outside/u);
+  });
+
   test("rejects a raw diff that exceeds its bounded readback limit", async () => {
     const { repositoryRoot } = await temporaryGitRepository();
     const workspaceRoot = join(repositoryRoot, ".wheelsparrow", "workspaces");

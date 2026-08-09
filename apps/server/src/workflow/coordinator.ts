@@ -590,7 +590,7 @@ export class WorkflowCoordinator {
           throw new StaleRevisionError(command.expectedRevision);
         const currentEffect = await tx
           .selectFrom("side_effects")
-          .select(["run_id", "rework_epoch", "target_revision"])
+          .select(["run_id", "rework_epoch", "target_revision", "kind"])
           .where("key", "=", command.effectKey)
           .executeTakeFirst();
         if (
@@ -622,12 +622,25 @@ export class WorkflowCoordinator {
             );
           if (command.findings.length > 0 && command.step === undefined)
             throw new TypeError("Findings require an appended review step.");
+          if (
+            command.findings.length > 0 &&
+            (currentEffect.kind !== "agent_review" ||
+              command.step?.role !== "reviewer" ||
+              command.step.logicalStep !== "review")
+          )
+            throw new TypeError(
+              "Findings require an agent_review effect and reviewer review step.",
+            );
           for (const finding of command.findings) {
+            if (finding.expectedRevision !== command.expectedRevision)
+              throw new StaleRevisionError(command.expectedRevision);
             if (
               finding.runId !== command.runId ||
-              finding.expectedRevision !== command.expectedRevision
+              finding.reviewStepId !== command.step?.id
             )
-              throw new StaleRevisionError(command.expectedRevision);
+              throw new TypeError(
+                "Finding must reference the settled reviewer step.",
+              );
             await repository.appendFinding(finding);
           }
         }
