@@ -10,9 +10,10 @@
 
 ---
 
-### Task 1: Typed GitHub Project seam and stateful fake
+## Task 1: Typed GitHub Project seam and stateful fake
 
 **Files:**
+
 - Create: `apps/server/src/github/project.ts`
 - Create: `tests/fakes/github.ts`
 - Test: `apps/server/src/github/project.test.ts`
@@ -54,9 +55,10 @@ Run: `mise exec node@24.18.0 -- corepack pnpm vitest run apps/server/src/github/
 
 Expected: all focused tests and type checks pass.
 
-### Task 2: Pure deterministic candidate discovery
+## Task 2: Pure deterministic candidate discovery
 
 **Files:**
+
 - Create: `apps/server/src/workflow/discovery.ts`
 - Test: `apps/server/src/workflow/discovery.test.ts`
 - Modify: `apps/server/src/database/runs.ts`
@@ -99,9 +101,10 @@ Run: `mise exec node@24.18.0 -- corepack pnpm vitest run apps/server/src/workflo
 
 Expected: all focused tests and server type check pass.
 
-### Task 3: Durable claim orchestration through the fake
+## Task 3: Durable claim orchestration through the fake
 
 **Files:**
+
 - Create: `apps/server/src/workflow/claim.ts`
 - Test: `apps/server/src/workflow/claim.test.ts`
 - Modify: `apps/server/src/workflow/coordinator.ts` only if a typed dispatcher bridge cannot be expressed as a consumer-local adapter
