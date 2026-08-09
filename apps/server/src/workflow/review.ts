@@ -138,6 +138,18 @@ export type ReviewStageOutcome =
 
 type AdapterResult = Record<string, unknown>;
 
+type ReviewQuarantineCoordinator = ExecutionCoordinator & {
+  readonly quarantineEffect?: (command: {
+    readonly runId: string;
+    readonly expectedRevision: number;
+    readonly effectKey: string;
+    readonly outcome: "ambiguous";
+    readonly trigger: null;
+    readonly evidence: string;
+    readonly at?: string;
+  }) => Promise<EffectRecord>;
+};
+
 function isRecord(value: unknown): value is AdapterResult {
   return (
     typeof value === "object" &&
@@ -189,6 +201,43 @@ function bounded(value: string): string {
   while (Buffer.byteLength(result, "utf8") > maximumEvidenceBytes)
     result = result.slice(0, -1);
   return result || "Review handoff required.";
+}
+
+async function quarantineReviewEffect(
+  input: ReviewRepairInput,
+  run: RunRecord,
+  effect: EffectRecord,
+  reason: string,
+  now: () => string,
+): Promise<ReviewStageOutcome> {
+  const coordinator = input.coordinator as ReviewQuarantineCoordinator;
+  if (coordinator.quarantineEffect === undefined) return { kind: "stale", run };
+  const evidence = bounded(
+    `Review effect ${effect.key} was quarantined after settlement failed: ${reason}`,
+  );
+  try {
+    const quarantined = await coordinator.quarantineEffect({
+      runId: run.id,
+      expectedRevision: run.revision,
+      effectKey: effect.key,
+      outcome: "ambiguous",
+      trigger: null,
+      evidence,
+      at: now(),
+    });
+    if (quarantined.status !== "ambiguous") return { kind: "stale", run };
+    const handedOff = await input.coordinator.transition({
+      runId: run.id,
+      expectedRevision: run.revision + 1,
+      trigger: "handoff_required",
+      at: now(),
+      summary: { text: evidence },
+      requiredAction: evidence,
+    });
+    return { kind: "human", run: handedOff, reason: evidence };
+  } catch {
+    return { kind: "stale", run };
+  }
 }
 
 function json(value: unknown): string {
@@ -565,9 +614,10 @@ async function settleReviewHandoff(
     return { kind: "human", run: settled.run, reason: safeReason };
   } catch (error) {
     if (isStaleError(error)) return { kind: "stale", run };
-    return handoff(
+    return quarantineReviewEffect(
       input,
       run,
+      effect,
       `Independent review handoff settlement failed closed: ${errorMessage(error)}`,
       now,
     );
@@ -1175,31 +1225,19 @@ async function executeRepairStage(
     assertSameObservedFiles(workspace, beforeInvoke);
   } catch (error) {
     const handoffReason = `Repair worktree changed before invocation: ${errorMessage(error)}`;
-    const completedAt = now();
-    const settled = await input.coordinator.settleExecution({
-      runId: run.id,
-      expectedRevision: run.revision,
-      effectKey: effect.key,
-      outcome: "failed",
-      trigger: "handoff_required",
-      evidence: bounded(handoffReason),
-      receipt: {},
-      step: repairStep(
-        run,
-        attempt,
-        {},
-        rendered,
-        model,
-        reasoningEffort,
-        "failed",
-        completedAt,
-        completedAt,
-        handoffReason,
-      ),
-      requiredAction: bounded(handoffReason),
-      at: completedAt,
-    });
-    return { kind: "human", run: settled.run, reason: bounded(handoffReason) };
+    return settleRepairHandoff(
+      effectiveInput,
+      run,
+      effect,
+      rendered,
+      attempt,
+      {},
+      model,
+      reasoningEffort,
+      now(),
+      handoffReason,
+      now,
+    );
   }
   const startedAt = now();
   let rawResult: unknown;

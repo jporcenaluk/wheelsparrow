@@ -604,6 +604,76 @@ describe("durable review and repair sequencing", () => {
     await coordinator.close();
   });
 
+  test("quarantines the review effect when its handoff settlement fails", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterReviewing(coordinator, connection);
+    let settleCalls = 0;
+    coordinator.settleExecution = async () => {
+      settleCalls += 1;
+      throw new Error("coordinator unavailable");
+    };
+    const result = await executeReviewRepair({
+      coordinator,
+      run,
+      verification: {
+        kind: "succeeded" as const,
+        command: "pnpm test:unit",
+        cwd: workspace(firstHeadSha).path,
+        exitCode: 0,
+        signal: null,
+        stdout: "verified",
+        stderr: "",
+        headSha: firstHeadSha,
+        changedFiles: workspace(firstHeadSha).changedFiles,
+      },
+      readDiff: async () => "raw diff",
+      reviewer: {
+        render: async () => ({ prompt: "review", promptHash: hash("review") }),
+        invoke: async () => ({
+          kind: "succeeded" as const,
+          terminal: {
+            outcome: "needs_repair" as const,
+            summary: "Malformed finding evidence.",
+            validation: [],
+            findings: [
+              {
+                stable_key: "review.invalid-evidence",
+                severity: "high" as const,
+                evidence: " ",
+              },
+            ],
+          },
+          stdout: "review output",
+          stderr: "",
+        }),
+      },
+      workspaceInspect: async (_run, expected) => ({
+        ...(expected as ReturnType<typeof workspace>),
+        changedFiles: workspace(firstHeadSha).changedFiles,
+      }),
+      now: () => at,
+    });
+    expect(result.kind).toBe("human");
+    expect(result.run.state).toBe("review");
+    expect(settleCalls).toBe(1);
+    expect(
+      connection.native
+        .prepare(
+          "SELECT status FROM side_effects WHERE run_id = ? AND kind = 'agent_review'",
+        )
+        .get(run.id),
+    ).toEqual({ status: "ambiguous" });
+    expect(
+      connection.native
+        .prepare(
+          "SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ? AND status = 'in_flight'",
+        )
+        .get(run.id),
+    ).toEqual({ count: 0 });
+    await coordinator.close();
+  });
+
   test("returns stale when repair handoff settlement is stale", async () => {
     const connection = await createDatabase();
     const coordinator = new WorkflowCoordinator({ connection });
@@ -611,13 +681,15 @@ describe("durable review and repair sequencing", () => {
     coordinator.settleExecution = async () => {
       throw new StaleRevisionError(run.revision);
     };
+    let inspectCalls = 0;
     const result = await executeReviewRepair(
-      repairInput(coordinator, run, async (_run, expected) => ({
-        ...(expected as ReturnType<typeof workspace>),
-        changedFiles: workspace(firstHeadSha).changedFiles,
-      })),
+      repairInput(coordinator, run, async () => {
+        inspectCalls += 1;
+        return workspace(inspectCalls >= 3 ? "d".repeat(40) : firstHeadSha);
+      }),
     );
     expect(result.kind).toBe("stale");
+    expect(inspectCalls).toBe(3);
     expect(
       connection.native
         .prepare(
