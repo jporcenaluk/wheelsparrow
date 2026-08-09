@@ -58,6 +58,24 @@ export async function buildApp({
     },
   );
 
+  app.setErrorHandler((error, _request, reply) => {
+    const status =
+      (error as { statusCode?: number }).statusCode === 400 ? 400 : 500;
+    return reply
+      .code(status)
+      .type("application/json")
+      .send({
+        schema_version: 1,
+        error: {
+          code: status === 400 ? "invalid_request" : "internal_error",
+          message:
+            status === 400
+              ? "The request could not be parsed or validated."
+              : "The operator capability is unavailable.",
+        },
+      });
+  });
+
   try {
     await registerOperator?.(app);
     await registerWeb?.(app);

@@ -2,15 +2,20 @@ import { cp, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-
-import Fastify, { type FastifyInstance } from "fastify";
+import {
+  type OperatorQueueRun,
+  ReturnToTodoRequestSchema,
+} from "@wheelsparrow/contracts";
+import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, test } from "vitest";
+import { buildApp } from "../app.js";
 
 import {
   type DatabaseConnection,
   openDatabase,
 } from "../database/connection.js";
 import { migrateDatabase } from "../database/migrate.js";
+import { createReadinessGate } from "../readiness.js";
 import { WorkflowCoordinator } from "../workflow/coordinator.js";
 import { registerOperatorRoutes } from "./routes.js";
 
@@ -64,14 +69,52 @@ async function createApp() {
     connection,
     ownerToken: "route-test-owner",
   });
-  const app = Fastify();
-  const routes = registerOperatorRoutes(app, {
-    connection,
-    configuration,
-    coordinator,
-    origin: "http://localhost:4321",
+  let routes!: ReturnType<typeof registerOperatorRoutes>;
+  const app = await buildApp({
+    readiness: createReadinessGate(),
+    registerOperator: async (server) => {
+      routes = registerOperatorRoutes(server, {
+        connection,
+        configuration,
+        coordinator,
+        origin: "http://localhost:4321",
+        discoverReady: async () => [
+          {
+            run_id: "ready-2",
+            issue_number: 2,
+            repository: "owner/repository",
+            state: "claiming",
+            revision: 0,
+            rework_epoch: 0,
+            repair_round: 0,
+            branch: null,
+            pull_request_number: null,
+            pull_request_title: null,
+            pull_request_url: null,
+            required_action: null,
+            blocked_reason: null,
+            updated_at: "2026-08-09T10:00:00.000Z",
+          } satisfies OperatorQueueRun,
+          {
+            run_id: "ready-1",
+            issue_number: 1,
+            repository: "owner/repository",
+            state: "claiming",
+            revision: 0,
+            rework_epoch: 0,
+            repair_round: 0,
+            branch: null,
+            pull_request_number: null,
+            pull_request_title: null,
+            pull_request_url: null,
+            required_action: null,
+            blocked_reason: "blocked_dependency_open",
+            updated_at: "2026-08-09T10:00:00.000Z",
+          } satisfies OperatorQueueRun,
+        ],
+      });
+    },
   });
-  await app.ready();
   apps.push(app);
   return { app, coordinator, routes, connection };
 }
@@ -149,6 +192,52 @@ describe("operator routes", () => {
     });
     expect(queue.body).not.toContain("owner-secret");
     expect(queue.body).not.toContain("project-run-1");
+    expect(
+      queue.json().ready.map((item: OperatorQueueRun) => item.issue_number),
+    ).toEqual([1, 2]);
+    expect(queue.json().ready[0].blocked_reason).toBe(
+      "blocked_dependency_open",
+    );
+  });
+
+  test("returns a versioned malformed JSON error", async () => {
+    const { app } = await createApp();
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/operator/scheduler",
+      headers: {
+        origin: "http://localhost:4321",
+        "content-type": "application/json",
+      },
+      payload: '{"schema_version":1',
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      schema_version: 1,
+      error: { code: "invalid_request" },
+    });
+  });
+
+  test("uses the contract for Return-to-Todo requests", async () => {
+    expect(ReturnToTodoRequestSchema).toBeDefined();
+    const { app, routes, connection } = await createApp();
+    insertReviewRun(connection);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/operator/runs/run-1/return-to-todo",
+      headers: {
+        origin: "http://localhost:4321",
+        "x-csrf-token": routes.csrfToken,
+      },
+      payload: {
+        schema_version: 1,
+        expected_revision: 3,
+        feedback: "",
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
   });
 
   test("requires same-origin and CSRF for scheduler mutations", async () => {

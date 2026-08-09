@@ -336,6 +336,40 @@ export type SchedulerControlPatch = Static<typeof SchedulerControlPatchSchema>;
 export const SchedulerControlRequestSchema = SchedulerControlPatchSchema;
 export type SchedulerControlRequest = SchedulerControlPatch;
 
+export const ReturnToTodoRequestSchema = Type.Object(
+  {
+    schema_version: SchemaVersion,
+    expected_revision: NonNegativeInteger,
+    feedback: Text,
+  },
+  { additionalProperties: false },
+);
+export type ReturnToTodoRequest = Static<typeof ReturnToTodoRequestSchema>;
+
+/** The command returns the same redacted snapshot as a run-detail read. */
+export const ReturnToTodoResponseSchema = OperatorRunDetailSchema;
+export type ReturnToTodoResponse = Static<typeof ReturnToTodoResponseSchema>;
+
+export const OperatorSessionResponseSchema = Type.Object(
+  { schema_version: SchemaVersion, csrf_token: Text },
+  { additionalProperties: false },
+);
+export type OperatorSessionResponse = Static<
+  typeof OperatorSessionResponseSchema
+>;
+
+export const OperatorErrorResponseSchema = Type.Object(
+  {
+    schema_version: SchemaVersion,
+    error: Type.Object(
+      { code: Identifier, message: Text },
+      { additionalProperties: false },
+    ),
+  },
+  { additionalProperties: false },
+);
+export type OperatorErrorResponse = Static<typeof OperatorErrorResponseSchema>;
+
 export const SseNotificationSchema = Type.Object(
   { schema_version: SchemaVersion, kind: Type.Literal("snapshot_changed") },
   { additionalProperties: false },

@@ -23,6 +23,8 @@ import type {
 } from "../database/runs.js";
 
 const MAX_TEXT_LENGTH = 4096;
+const credentialPattern =
+  /\b(?:access[_-]?token|api[_-]?key|authorization|credential|password|private[_-]?key|secret|token)\b(?:\s*[:=]\s*|\s+)(?:"[^"]*"|'[^']*'|\S+)/giu;
 const codingStates = new Set<RunRecord["state"]>([
   "claiming",
   "preparing",
@@ -39,16 +41,15 @@ const codingStates = new Set<RunRecord["state"]>([
 
 function text(value: string, fallback = "Unavailable"): string {
   const candidate = typeof value === "string" ? value.trim() : "";
-  return (candidate.length > 0 ? candidate : fallback).slice(
-    0,
-    MAX_TEXT_LENGTH,
-  );
+  return (candidate.length > 0 ? candidate : fallback)
+    .replace(credentialPattern, "[REDACTED]")
+    .slice(0, MAX_TEXT_LENGTH);
 }
 
 function nullableText(value: string | null): string | null {
   if (value === null) return null;
   const candidate = value.trim();
-  return candidate.length === 0 ? null : candidate.slice(0, MAX_TEXT_LENGTH);
+  return candidate.length === 0 ? null : text(candidate);
 }
 
 function nullableSha(value: string | null): string | null {
@@ -127,25 +128,51 @@ function byIssueNumber(left: RunRecord, right: RunRecord): number {
   );
 }
 
+const humanAttentionStates = new Set<RunRecord["state"]>([
+  "review",
+  "claim_failed",
+  "stopped",
+]);
+
+function attentionReason(run: RunRecord): string | null {
+  if (run.state === "claim_failed") return "claim_failed";
+  if (run.state === "stopped") return "stopped_by_operator";
+  if (run.requiredAction !== null && run.requiredAction.trim().length > 0)
+    return text(run.requiredAction);
+  return null;
+}
+
 export interface QueueProjectionInput {
   scheduler: SchedulerControl;
   runs: readonly RunRecord[];
   /** Optional externally-discovered Ready items, already reduced to RunRecord shape. */
   ready?: readonly RunRecord[];
+  /** Safe, dependency-injected GitHub discovery projection. */
+  discoveredReady?: readonly OperatorQueueRun[];
 }
 
 export function projectQueue(input: QueueProjectionInput): QueueResponse {
   const sorted = [...input.runs].sort(byIssueNumber);
   const active = sorted.find((run) => codingStates.has(run.state));
-  const reviews = sorted.filter((run) => run.state === "review");
+  const reviews = sorted.filter(
+    (run) =>
+      humanAttentionStates.has(run.state) || attentionReason(run) !== null,
+  );
   return {
     schema_version: 1,
     scheduler: schedulerProjection(input.scheduler),
     active_todo: active === undefined ? null : queueProjection(active),
-    ready: [...(input.ready ?? [])]
-      .sort(byIssueNumber)
-      .map((run) => queueProjection(run)),
-    review: reviews.map((run) => queueProjection(run)),
+    ready: [
+      ...[...(input.ready ?? [])]
+        .sort(byIssueNumber)
+        .map((run) => queueProjection(run)),
+      ...(input.discoveredReady ?? []),
+    ].toSorted(
+      (left, right) =>
+        left.issue_number - right.issue_number ||
+        left.run_id.localeCompare(right.run_id),
+    ),
+    review: reviews.map((run) => queueProjection(run, attentionReason(run))),
     review_count: reviews.length,
   };
 }
@@ -234,13 +261,16 @@ export interface ReviewProjectionInput {
 
 export function projectReview(input: ReviewProjectionInput): ReviewResponse {
   const items: OperatorReviewItem[] = [...input.runs]
-    .filter((run) => run.state === "review")
+    .filter(
+      (run) =>
+        humanAttentionStates.has(run.state) || attentionReason(run) !== null,
+    )
     .sort(byIssueNumber)
     .map((run) => {
       const approvals = input.approvals?.get(run.id) ?? [];
       const latestApproval = approvals.at(-1);
       return {
-        ...queueProjection(run),
+        ...queueProjection(run, attentionReason(run)),
         findings: (input.findings?.get(run.id) ?? []).map(findingProjection),
         approval:
           latestApproval === undefined

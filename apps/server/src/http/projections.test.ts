@@ -74,7 +74,7 @@ describe("operator read projections", () => {
           sequence: 1,
           runRevision: run.revision,
           kind: "state_changed",
-          summary: "Changed",
+          summary: "token: super-secret",
           detailsJson: JSON.stringify({ receipt: "raw" }),
           logReference: "/tmp/raw.log",
           createdAt: run.updatedAt,
@@ -109,7 +109,7 @@ describe("operator read projections", () => {
           stableKey: "SEC-1",
           dispositionSequence: 1,
           severity: "high",
-          evidence: "Safe evidence",
+          evidence: "password=super-secret",
           disposition: "open",
           resolvingStepId: null,
           createdAt: run.updatedAt,
@@ -133,6 +133,7 @@ describe("operator read projections", () => {
     expect(serialized).not.toContain("owner-secret");
     expect(serialized).not.toContain("do not expose me");
     expect(serialized).not.toContain("raw");
+    expect(serialized).not.toContain("super-secret");
     expect(serialized).not.toContain("process_id");
     expect(projection.run.worktree_path).toBe("/tmp/wheelsparrow/run-1");
     expect(projection.events[0]).not.toHaveProperty("details_json");
@@ -178,5 +179,32 @@ describe("operator read projections", () => {
     });
     expect(JSON.stringify(configuration)).not.toContain("credential");
     expect(configuration.configuration.github).not.toHaveProperty("token");
+  });
+
+  test("includes terminal and handoff runs in the human-attention inbox", () => {
+    const stopped = { ...run, id: "stopped", state: "stopped" as const };
+    const failed = { ...run, id: "failed", state: "claim_failed" as const };
+    const handoff = {
+      ...run,
+      id: "handoff",
+      state: "building" as const,
+      requiredAction: "secret=never-show-this",
+    };
+
+    const review = projectReview({
+      runs: [stopped, failed, handoff],
+      findings: new Map(),
+      approvals: new Map(),
+    });
+
+    expect(review.items.map((item) => item.run_id)).toEqual([
+      "failed",
+      "handoff",
+      "stopped",
+    ]);
+    expect(
+      review.items.find((item) => item.run_id === "failed")?.blocked_reason,
+    ).toBe("claim_failed");
+    expect(JSON.stringify(review)).not.toContain("never-show-this");
   });
 });

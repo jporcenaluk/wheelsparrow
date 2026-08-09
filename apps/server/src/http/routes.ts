@@ -1,7 +1,20 @@
 import type { ServerResponse } from "node:http";
+import type {
+  OperatorQueueRun,
+  ReturnToTodoRequest,
+} from "@wheelsparrow/contracts";
 import {
+  ConfigurationResponseSchema,
+  OperatorErrorResponseSchema,
+  OperatorQueueRunSchema,
+  OperatorSessionResponseSchema,
+  QueueResponseSchema,
+  ReturnToTodoRequestSchema,
+  ReturnToTodoResponseSchema,
+  ReviewResponseSchema,
   type SchedulerControlPatch,
   SchedulerControlPatchSchema,
+  SchedulerControlResponseSchema,
 } from "@wheelsparrow/contracts";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { Value } from "typebox/value";
@@ -39,6 +52,8 @@ export interface OperatorRoutesOptions extends OperatorSecurityOptions {
   coordinator: WorkflowCoordinator;
   /** Effective validated configuration; only safe fields are projected. */
   configuration: unknown;
+  /** Read-only projection of the current GitHub discovery result. */
+  discoverReady?: () => Promise<readonly OperatorQueueRun[]>;
 }
 
 export interface OperatorRoutesHandle {
@@ -249,29 +264,14 @@ function parseRunId(request: FastifyRequest): string {
   return runId;
 }
 
-function record(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
-}
-
 function returnTodoRequest(request: FastifyRequest, runId: string) {
-  const body = record(request.body);
-  const expectedRevision = body.expected_revision;
-  const feedback = body.feedback;
-  if (
-    body.schema_version !== OPERATOR_SCHEMA_VERSION ||
-    !Number.isSafeInteger(expectedRevision) ||
-    (expectedRevision as number) < 0 ||
-    typeof feedback !== "string" ||
-    feedback.trim().length === 0 ||
-    feedback.length > 4096
-  )
+  if (!Value.Check(ReturnToTodoRequestSchema, request.body))
     throw new TypeError("The return-to-todo request is invalid.");
+  const body = request.body as ReturnToTodoRequest;
   return {
     runId,
-    expectedRevision: expectedRevision as number,
-    feedback,
+    expectedRevision: body.expected_revision,
+    feedback: body.feedback,
   };
 }
 
@@ -306,14 +306,23 @@ export function registerOperatorRoutes(
       kind: "snapshot_changed",
     })}\n\n`;
 
+  const removeClient = (client: ServerResponse, destroy = false): void => {
+    clients.delete(client);
+    if (destroy && !client.destroyed) client.destroy();
+  };
+
   const notifySnapshotChanged = (): void => {
     const payload = notificationPayload();
     for (const client of clients) {
-      if (client.destroyed) {
-        clients.delete(client);
+      if (client.destroyed || client.writableEnded || !client.writable) {
+        removeClient(client);
         continue;
       }
-      client.write(payload);
+      try {
+        client.write(payload);
+      } catch {
+        removeClient(client, true);
+      }
     }
   };
   // Workflow adapters are deliberately outside the HTTP layer. A bounded
@@ -321,107 +330,196 @@ export function registerOperatorRoutes(
   // durable changes without carrying a replayable event log over SSE.
   const heartbeat = setInterval(notifySnapshotChanged, 5_000);
   heartbeat.unref();
-  app.addHook("onClose", async () => clearInterval(heartbeat));
-
-  app.get(`${OPERATOR_ROOT}/session`, async (_, reply) => {
-    reply.header("x-csrf-token", security.csrfToken);
-    reply.header(
-      "set-cookie",
-      `ws_csrf=${security.csrfToken}; Path=${OPERATOR_ROOT}; HttpOnly; SameSite=Strict`,
-    );
-    return {
-      schema_version: OPERATOR_SCHEMA_VERSION,
-      csrf_token: security.csrfToken,
-    };
+  app.addHook("onClose", async () => {
+    clearInterval(heartbeat);
+    for (const client of clients) removeClient(client, true);
   });
 
-  app.get(`${OPERATOR_ROOT}/queue`, async (_, reply) => {
-    try {
-      const [scheduler, runs] = await Promise.all([
-        readSchedulerControl(options.connection.db),
-        listRuns(options.connection),
-      ]);
-      return projectQueue({ scheduler, runs });
-    } catch (error) {
-      return handleError(error, reply);
-    }
-  });
-
-  app.get(`${OPERATOR_ROOT}/review`, async (_, reply) => {
-    try {
-      const runs = await listRuns(options.connection);
-      const findings = new Map<string, FindingRecord[]>();
-      const approvals = new Map<string, ApprovalRecord[]>();
-      for (const run of runs.filter(
-        (candidate) => candidate.state === "review",
-      )) {
-        const records = await readDetailRecords(options.connection, run.id);
-        findings.set(run.id, records.findings);
-        approvals.set(run.id, records.approvals);
-      }
-      return projectReview({ runs, findings, approvals });
-    } catch (error) {
-      return handleError(error, reply);
-    }
-  });
-
-  app.get(`${OPERATOR_ROOT}/configuration`, async (_, reply) => {
-    try {
-      return projectConfiguration(options.configuration);
-    } catch (error) {
-      if (error instanceof TypeError) return handleError(error, reply);
-      return sendError(
-        reply,
-        503,
-        "capability_unavailable",
-        "The configuration capability is unavailable.",
+  app.get(
+    `${OPERATOR_ROOT}/session`,
+    { schema: { response: { 200: OperatorSessionResponseSchema } } },
+    async (_, reply) => {
+      reply.header("x-csrf-token", security.csrfToken);
+      reply.header(
+        "set-cookie",
+        `ws_csrf=${security.csrfToken}; Path=${OPERATOR_ROOT}; HttpOnly; SameSite=Strict`,
       );
-    }
-  });
+      return {
+        schema_version: OPERATOR_SCHEMA_VERSION,
+        csrf_token: security.csrfToken,
+      };
+    },
+  );
 
-  app.get(`${OPERATOR_ROOT}/runs/:runId`, async (request, reply) => {
-    try {
-      const runId = parseRunId(request);
-      const [run, records] = await Promise.all([
-        readRun(options.connection.db, runId),
-        readDetailRecords(options.connection, runId),
-      ]);
-      return projectRunDetail(run, records);
-    } catch (error) {
-      return handleError(error, reply);
-    }
-  });
-
-  app.patch(`${OPERATOR_ROOT}/scheduler`, async (request, reply) => {
-    try {
-      security.checkMutation(request);
-      const patch = schedulerRequest(request);
-      const scheduler = await options.coordinator.updateSchedulerControl({
-        expectedRevision: patch.expected_revision,
-        patch: {
-          ...(patch.paused === undefined ? {} : { paused: patch.paused }),
-          ...(patch.stop_after_current === undefined
-            ? {}
-            : { stopAfterCurrent: patch.stop_after_current }),
+  app.get(
+    `${OPERATOR_ROOT}/queue`,
+    {
+      schema: {
+        response: {
+          200: QueueResponseSchema,
+          400: OperatorErrorResponseSchema,
+          503: OperatorErrorResponseSchema,
         },
-        at: new Date().toISOString(),
-      });
-      notifySnapshotChanged();
-      return schedulerProjection(scheduler);
-    } catch (error) {
-      if (error instanceof Error && error.name === "OperatorSecurityError")
+      },
+    },
+    async (_, reply) => {
+      try {
+        if (options.discoverReady === undefined)
+          throw new Error("Ready discovery is unavailable.");
+        const [scheduler, runs] = await Promise.all([
+          readSchedulerControl(options.connection.db),
+          listRuns(options.connection),
+        ]);
+        const discoveredReady = await options.discoverReady();
+        if (
+          !discoveredReady.every((item) =>
+            Value.Check(OperatorQueueRunSchema, item),
+          )
+        )
+          throw new Error("Ready discovery returned an invalid projection.");
+        return projectQueue({ scheduler, runs, discoveredReady });
+      } catch (error) {
+        return handleError(error, reply);
+      }
+    },
+  );
+
+  app.get(
+    `${OPERATOR_ROOT}/review`,
+    {
+      schema: {
+        response: {
+          200: ReviewResponseSchema,
+          503: OperatorErrorResponseSchema,
+        },
+      },
+    },
+    async (_, reply) => {
+      try {
+        const runs = await listRuns(options.connection);
+        const findings = new Map<string, FindingRecord[]>();
+        const approvals = new Map<string, ApprovalRecord[]>();
+        for (const run of runs) {
+          const records = await readDetailRecords(options.connection, run.id);
+          findings.set(run.id, records.findings);
+          approvals.set(run.id, records.approvals);
+        }
+        return projectReview({ runs, findings, approvals });
+      } catch (error) {
+        return handleError(error, reply);
+      }
+    },
+  );
+
+  app.get(
+    `${OPERATOR_ROOT}/configuration`,
+    {
+      schema: {
+        response: {
+          200: ConfigurationResponseSchema,
+          503: OperatorErrorResponseSchema,
+        },
+      },
+    },
+    async (_, reply) => {
+      try {
+        return projectConfiguration(options.configuration);
+      } catch (error) {
+        if (error instanceof TypeError) return handleError(error, reply);
         return sendError(
           reply,
-          403,
-          "csrf_forbidden",
-          "The request origin or CSRF token is invalid.",
+          503,
+          "capability_unavailable",
+          "The configuration capability is unavailable.",
         );
-      return handleError(error, reply);
-    }
-  });
+      }
+    },
+  );
+
+  app.get(
+    `${OPERATOR_ROOT}/runs/:runId`,
+    {
+      schema: {
+        response: {
+          200: ReturnToTodoResponseSchema,
+          400: OperatorErrorResponseSchema,
+          404: OperatorErrorResponseSchema,
+          503: OperatorErrorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        const runId = parseRunId(request);
+        const [run, records] = await Promise.all([
+          readRun(options.connection.db, runId),
+          readDetailRecords(options.connection, runId),
+        ]);
+        return projectRunDetail(run, records);
+      } catch (error) {
+        return handleError(error, reply);
+      }
+    },
+  );
+
+  app.patch(
+    `${OPERATOR_ROOT}/scheduler`,
+    {
+      schema: {
+        body: SchedulerControlPatchSchema,
+        response: {
+          200: SchedulerControlResponseSchema,
+          400: OperatorErrorResponseSchema,
+          403: OperatorErrorResponseSchema,
+          409: OperatorErrorResponseSchema,
+          503: OperatorErrorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        security.checkMutation(request);
+        const patch = schedulerRequest(request);
+        const scheduler = await options.coordinator.updateSchedulerControl({
+          expectedRevision: patch.expected_revision,
+          patch: {
+            ...(patch.paused === undefined ? {} : { paused: patch.paused }),
+            ...(patch.stop_after_current === undefined
+              ? {}
+              : { stopAfterCurrent: patch.stop_after_current }),
+          },
+          at: new Date().toISOString(),
+        });
+        notifySnapshotChanged();
+        return schedulerProjection(scheduler);
+      } catch (error) {
+        if (error instanceof Error && error.name === "OperatorSecurityError")
+          return sendError(
+            reply,
+            403,
+            "csrf_forbidden",
+            "The request origin or CSRF token is invalid.",
+          );
+        return handleError(error, reply);
+      }
+    },
+  );
 
   app.post(
     `${OPERATOR_ROOT}/runs/:runId/return-to-todo`,
+    {
+      schema: {
+        body: ReturnToTodoRequestSchema,
+        response: {
+          200: ReturnToTodoResponseSchema,
+          400: OperatorErrorResponseSchema,
+          403: OperatorErrorResponseSchema,
+          404: OperatorErrorResponseSchema,
+          409: OperatorErrorResponseSchema,
+          503: OperatorErrorResponseSchema,
+        },
+      },
+    },
     async (request, reply) => {
       try {
         security.checkMutation(request);
@@ -458,7 +556,8 @@ export function registerOperatorRoutes(
       });
       reply.raw.write(notificationPayload());
       clients.add(reply.raw);
-      request.raw.once("close", () => clients.delete(reply.raw));
+      request.raw.once("close", () => removeClient(reply.raw));
+      request.raw.once("error", () => removeClient(reply.raw, true));
     } catch (error) {
       return handleError(error, reply);
     }
