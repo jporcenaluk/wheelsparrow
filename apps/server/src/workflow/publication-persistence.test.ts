@@ -6,7 +6,11 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { openDatabase } from "../database/connection.js";
 import { migrateDatabase } from "../database/migrate.js";
-import { readRun } from "../database/runs.js";
+import {
+  createRunMutationRepository,
+  type PublicationFactsPatch,
+  readRun,
+} from "../database/runs.js";
 import { WorkflowCoordinator } from "./coordinator.js";
 
 const migrationSource = fileURLToPath(
@@ -48,6 +52,14 @@ async function enterPublishing(
 ) {
   await coordinator.createClaim(claimInput());
   let run = await readRun(connection.db, "run-publication");
+  run = await connection.db.transaction().execute((tx) =>
+    createRunMutationRepository(tx).updateExecutionFacts({
+      runId: run.id,
+      expectedRevision: run.revision,
+      facts: { branch: "wheelsparrow/42-publication" },
+      at,
+    }),
+  );
   for (const trigger of [
     "todo_observed",
     "workspace_prepared",
@@ -95,6 +107,27 @@ function validPublicationFacts() {
     headSha,
     branch: "wheelsparrow/42-publication",
   };
+}
+
+function publicationStep(run: Awaited<ReturnType<typeof enterPublishing>>) {
+  return {
+    id: "publication-step",
+    runId: run.id,
+    expectedRevision: run.revision,
+    reworkEpoch: run.reworkEpoch,
+    role: "publisher",
+    logicalStep: "publish",
+    attempt: 1,
+    statusSequence: 1,
+    status: "completed",
+    promptHash: "c".repeat(64),
+    model: "gpt-5.6-sol",
+    reasoningEffort: "high",
+    startedAt: at,
+    completedAt: at,
+    exitResultJson: JSON.stringify({ outcome: "completed" }),
+    summary: { text: "Publication attempted." },
+  } as const;
 }
 
 afterEach(async () => {
@@ -166,25 +199,9 @@ describe("atomic publication facts settlement", () => {
           pullRequestUrl: "not-a-url",
           baseSha: "not-a-sha",
           headSha,
+          branch: "wheelsparrow/42-publication",
         },
-        step: {
-          id: "publication-step",
-          runId: run.id,
-          expectedRevision: run.revision,
-          reworkEpoch: run.reworkEpoch,
-          role: "publisher",
-          logicalStep: "publish",
-          attempt: 1,
-          statusSequence: 1,
-          status: "completed",
-          promptHash: "c".repeat(64),
-          model: "gpt-5.6-sol",
-          reasoningEffort: "high",
-          startedAt: at,
-          completedAt: at,
-          exitResultJson: JSON.stringify({ outcome: "completed" }),
-          summary: { text: "Publication attempted." },
-        },
+        step: publicationStep(run),
       }),
     ).rejects.toThrow(/publication|pull request|url|number|sha/i);
 
@@ -237,6 +254,55 @@ describe("atomic publication facts settlement", () => {
     ).toEqual({ status: "in_flight" });
     await coordinator.close();
   });
+
+  test.each([
+    ["omitted", undefined],
+    ["bad branch", "bad branch"],
+    ["parent ref", "../x"],
+    ["trailing slash", "trailing/"],
+    ["mismatch", "wheelsparrow/43-other"],
+  ] as const)(
+    "rejects a %s publication branch and rolls back",
+    async (_label, branch) => {
+      const connection = await createDatabase();
+      const coordinator = new WorkflowCoordinator({ connection });
+      const run = await enterPublishing(connection, coordinator);
+      const effectKey = `run:run-publication:publish-branch-${_label}`;
+      await beginPublishEffect(coordinator, run, effectKey);
+      const before = await readRun(connection.db, run.id);
+      const publicationFacts = {
+        ...validPublicationFacts(),
+        branch,
+      } as unknown as PublicationFactsPatch;
+
+      await expect(
+        coordinator.settleExecution({
+          runId: run.id,
+          expectedRevision: run.revision,
+          effectKey,
+          outcome: "confirmed",
+          trigger: "pr_observed",
+          evidence: "Invalid publication branch.",
+          at,
+          publicationFacts,
+          step: publicationStep(run),
+        }),
+      ).rejects.toThrow(/branch|Git ref/i);
+
+      expect(await readRun(connection.db, run.id)).toEqual(before);
+      expect(
+        connection.native
+          .prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?")
+          .get(run.id),
+      ).toEqual({ count: 0 });
+      expect(
+        connection.native
+          .prepare("SELECT status FROM side_effects WHERE key = ?")
+          .get(effectKey),
+      ).toEqual({ status: "in_flight" });
+      await coordinator.close();
+    },
+  );
 
   test("rejects a stale publish callback without writing its receipt", async () => {
     const connection = await createDatabase();
@@ -322,6 +388,7 @@ describe("atomic publication facts settlement", () => {
           pullRequestUrl: "https://github.com/owner/repository/pull/123",
           baseSha,
           headSha,
+          branch: "wheelsparrow/42-publication",
         },
       }),
     ).rejects.toThrow(/publish|publication/i);

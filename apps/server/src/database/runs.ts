@@ -24,6 +24,7 @@ const maximumEvidenceBytes = 4 * 1024;
 const maximumJsonBytes = 1024 * 1024;
 const maximumPullRequestTitleBytes = 2 * 1024;
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+const gitRefComponentPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const runStates = new Set<string>(RUN_STATES);
 const repairableTriggers = new Set<WorkflowTrigger>([
   "verification_failed_repairable",
@@ -172,8 +173,8 @@ export interface PublicationFactsPatch {
   pullRequestUrl: string;
   baseSha: string;
   headSha: string;
-  /** Preserve the already validated execution branch when a receipt includes it. */
-  branch?: string;
+  /** The exact branch assigned to this run before publication. */
+  branch: string;
 }
 
 export interface PublicationFactsUpdateRequest {
@@ -390,6 +391,23 @@ function sha(value: unknown, label: string): string {
   if (typeof value !== "string" || !shaPattern.test(value))
     throw new TypeError(`${label} must be a lowercase Git SHA.`);
   return value;
+}
+
+function gitRef(value: unknown, label: string): string {
+  const branch = boundedText(value, label, maximumIdentifierBytes);
+  const components = branch.split("/");
+  if (
+    components.some(
+      (component) =>
+        !gitRefComponentPattern.test(component) ||
+        component.endsWith(".") ||
+        component.endsWith(".lock"),
+    ) ||
+    branch.includes("..") ||
+    branch.includes("@{")
+  )
+    throw new TypeError(`${label} must be a safe Git ref.`);
+  return branch;
 }
 
 function validatePullRequestUrl(
@@ -1059,6 +1077,11 @@ export function createRunMutationRepository(
         "Pull request title",
         maximumPullRequestTitleBytes,
       );
+      const branch = gitRef(facts.branch, "Publication branch");
+      if (current.branch === null || branch !== current.branch)
+        throw new TypeError(
+          "Publication branch does not match the run's assigned branch.",
+        );
       const pullRequestUrl = validatePullRequestUrl(
         facts.pullRequestUrl,
         current.repository,
@@ -1066,10 +1089,6 @@ export function createRunMutationRepository(
       );
       const baseSha = sha(facts.baseSha, "Base SHA");
       const headSha = sha(facts.headSha, "Head SHA");
-      const branch =
-        facts.branch === undefined
-          ? current.branch
-          : identifier(facts.branch, "Branch");
 
       const updated = await tx
         .updateTable("runs")
