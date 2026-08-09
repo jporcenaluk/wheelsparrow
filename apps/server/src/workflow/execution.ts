@@ -168,7 +168,11 @@ export interface VerificationReceipt {
 export interface ExecutionCoordinator
   extends Pick<
     WorkflowCoordinator,
-    "createEffectIntent" | "beginEffect" | "settleExecution" | "transition"
+    | "createEffectIntent"
+    | "beginEffect"
+    | "settleExecution"
+    | "transition"
+    | "quarantineEffect"
   > {}
 
 interface ExecuteClaimedRunInputBase {

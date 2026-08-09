@@ -138,18 +138,6 @@ export type ReviewStageOutcome =
 
 type AdapterResult = Record<string, unknown>;
 
-type ReviewQuarantineCoordinator = ExecutionCoordinator & {
-  readonly quarantineEffect?: (command: {
-    readonly runId: string;
-    readonly expectedRevision: number;
-    readonly effectKey: string;
-    readonly outcome: "ambiguous";
-    readonly trigger: null;
-    readonly evidence: string;
-    readonly at?: string;
-  }) => Promise<EffectRecord>;
-};
-
 function isRecord(value: unknown): value is AdapterResult {
   return (
     typeof value === "object" &&
@@ -214,13 +202,11 @@ async function quarantineEffectAndHandoff(
   reason: string,
   now: () => string,
 ): Promise<DurableHandoffOutcome> {
-  const coordinator = input.coordinator as ReviewQuarantineCoordinator;
-  if (coordinator.quarantineEffect === undefined) return { kind: "stale", run };
   const evidence = bounded(
     `Review effect ${effect.key} was quarantined after settlement failed: ${reason}`,
   );
   try {
-    const quarantined = await coordinator.quarantineEffect({
+    const quarantined = await input.coordinator.quarantineEffect({
       runId: run.id,
       expectedRevision: run.revision,
       effectKey: effect.key,
