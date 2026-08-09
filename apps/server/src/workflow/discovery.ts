@@ -230,11 +230,15 @@ function evaluateCandidate(
 ): CandidateEvaluation {
   if (snapshotExclusionReason !== undefined)
     return excluded(item, snapshotExclusionReason);
-  if (!isValidItemIdentity(item))
-    return excluded(item, "invalid_item_identity");
-  if (duplicateProjectItemIds.has(item.projectItemId)) {
+  const projectItemId = isRecord(item) ? item.projectItemId : undefined;
+  if (
+    isNonEmptyText(projectItemId) &&
+    duplicateProjectItemIds.has(projectItemId)
+  ) {
     return excluded(item, "duplicate_project_item_id");
   }
+  if (!isValidItemIdentity(item))
+    return excluded(item, "invalid_item_identity");
   if (
     item.projectId !== input.projectId ||
     item.projectNumber !== input.projectNumber
@@ -327,8 +331,10 @@ function duplicateProjectItemIds(
   const duplicates = new Set<string>();
   for (let index = 0; index < items.length; index += 1) {
     if (!Object.hasOwn(items, index)) continue;
-    const candidate = items[index] as ProjectItem;
-    if (!isValidItemIdentity(candidate)) continue;
+    const candidate = items[index];
+    if (!isRecord(candidate) || !isNonEmptyText(candidate.projectItemId)) {
+      continue;
+    }
     const count = (counts.get(candidate.projectItemId) ?? 0) + 1;
     counts.set(candidate.projectItemId, count);
     if (count > 1) duplicates.add(candidate.projectItemId);

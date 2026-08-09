@@ -19,7 +19,7 @@
 - Test: `apps/server/src/github/project.test.ts`
 - Test: `tests/fakes/github.test.ts`
 
-- [ ] **Step 1: Write failing boundary tests for snapshot identity and conditional status moves**
+- [x] **Step 1: Write failing boundary tests for snapshot identity and conditional status moves**
 
 ```ts
 expect(await fake.readProject(snapshotRequest)).toEqual(expectedSnapshot);
@@ -27,13 +27,13 @@ await expect(fake.moveProjectItem({ itemId: "PVTI_1", expectedRevision: "1", fro
 await expect(fake.moveProjectItem({ itemId: "PVTI_1", expectedRevision: "1", fromStatus: "Ready", toStatus: "Todo" })).resolves.toMatchObject({ outcome: "already_applied" });
 ```
 
-- [ ] **Step 2: Run the focused tests and observe missing-module failures**
+- [x] **Step 2: Run the focused tests and observe missing-module failures**
 
 Run: `mise exec node@24.18.0 -- corepack pnpm vitest run apps/server/src/github/project.test.ts tests/fakes/github.test.ts`
 
 Expected: failure because the boundary and fake modules do not exist.
 
-- [ ] **Step 3: Define the narrow seam and minimal stateful fake**
+- [x] **Step 3: Define the narrow seam and minimal stateful fake**
 
 ```ts
 export interface GitHubProjectGateway {
@@ -49,7 +49,7 @@ export type ProjectStatusMoveResult =
 
 Make every item carry a project ID, repository, issue node ID/number, status, revision, labels, creation timestamp, optional priority rank, and either known dependency states or `unavailable`. Reject a wrong project, item revision, source status, or changed issue mapping. Keep an immutable mutation log and expose it to tests. Do not add an HTTP client, GraphQL strings, `gh`, a provider abstraction, or production imports of the fake.
 
-- [ ] **Step 4: Run focused tests and type checking**
+- [x] **Step 4: Run focused tests and type checking**
 
 Run: `mise exec node@24.18.0 -- corepack pnpm vitest run apps/server/src/github/project.test.ts tests/fakes/github.test.ts && mise exec node@24.18.0 -- corepack pnpm typecheck`
 
@@ -64,7 +64,7 @@ Expected: all focused tests and type checks pass.
 - Modify: `apps/server/src/database/runs.ts`
 - Test: `apps/server/src/workflow/discovery.test.ts`
 
-- [ ] **Step 1: Write failing discovery tests for every eligibility rule and ordering tie-breaker**
+- [x] **Step 1: Write failing discovery tests for every eligibility rule and ordering tie-breaker**
 
 ```ts
 const result = selectProjectCandidate(snapshot, {
@@ -77,13 +77,13 @@ expect(result.excluded).toContainEqual(expect.objectContaining({ issueNumber: 8,
 
 Cover wrong project/repository, closed issue, non-Ready status, missing any required label, open dependency, unavailable dependency, durable ownership, explicit-versus-missing priority, creation-time ordering, and number ordering. Add a real-SQLite test for a read-only `listOwnedProjectItemIds` query that returns only active ownership records.
 
-- [ ] **Step 2: Run the focused discovery test and observe its failure**
+- [x] **Step 2: Run the focused discovery test and observe its failure**
 
 Run: `mise exec node@24.18.0 -- corepack pnpm vitest run apps/server/src/workflow/discovery.test.ts`
 
 Expected: failure because `selectProjectCandidate` and owned-project lookup do not exist.
 
-- [ ] **Step 3: Implement side-effect-free selection and the narrow durable read**
+- [x] **Step 3: Implement side-effect-free selection and the narrow durable read**
 
 ```ts
 export function selectProjectCandidate(snapshot: ProjectSnapshot, input: DiscoveryInput): DiscoveryResult {
@@ -95,7 +95,7 @@ export function selectProjectCandidate(snapshot: ProjectSnapshot, input: Discove
 
 Treat dependency `unavailable` as blocked; label matching is a conjunction; missing priority sorts after an integer rank; timestamps compare lexicographically only after validating canonical ISO values. Query active ownership from `runs` by non-null `owner_token` and null `ownership_released_at`. Do not mutate SQLite or GitHub in this task.
 
-- [ ] **Step 4: Run focused tests and the server type check**
+- [x] **Step 4: Run focused tests and the server type check**
 
 Run: `mise exec node@24.18.0 -- corepack pnpm vitest run apps/server/src/workflow/discovery.test.ts && mise exec node@24.18.0 -- corepack pnpm --filter @wheelsparrow/server typecheck`
 
@@ -109,7 +109,7 @@ Expected: all focused tests and server type check pass.
 - Test: `apps/server/src/workflow/claim.test.ts`
 - Modify: `apps/server/src/workflow/coordinator.ts` only if a typed dispatcher bridge cannot be expressed as a consumer-local adapter
 
-- [ ] **Step 1: Write failing integration tests against real SQLite migrations and the stateful fake**
+- [x] **Step 1: Write failing integration tests against real SQLite migrations and the stateful fake**
 
 ```ts
 const outcome = await claimNextEligible({ coordinator, gateway: fake, configuration, now, runId: () => "run-1" });
@@ -120,13 +120,13 @@ await expect(claimNextEligible(/* same durable candidate */)).resolves.toMatchOb
 
 Also prove: durable intent is visible before the fake mutation; an exact expected revision is sent; revision drift produces a `claim_failed` run and no builder result; the coordinator's confirmed-effect replay does not duplicate a mutation; an occupied coding slot leaves the candidate unclaimed; and a false/changed mutation receipt cannot transition to `preparing`.
 
-- [ ] **Step 2: Run the claim test and observe a missing-module failure**
+- [x] **Step 2: Run the claim test and observe a missing-module failure**
 
 Run: `mise exec node@24.18.0 -- corepack pnpm vitest run apps/server/src/workflow/claim.test.ts`
 
 Expected: failure because `claimNextEligible` does not exist.
 
-- [ ] **Step 3: Implement the consumer-local claim service**
+- [x] **Step 3: Implement the consumer-local claim service**
 
 ```ts
 export async function claimNextEligible(input: ClaimNextEligibleInput): Promise<ClaimOutcome> {
@@ -139,7 +139,7 @@ export async function claimNextEligible(input: ClaimNextEligibleInput): Promise<
 
 Use `WorkflowCoordinator.createClaim` with a stable `project_todo` key and the item's expected revision in the effect intent. The dispatcher must parse that bounded intent, call `moveProjectItem`, and return `confirmed/todo_observed` only for a matching item, issue, status, and revision receipt. Return a typed rejection for stale status/revision/mapping and never invoke agent, worktree, PR, or UI behavior.
 
-- [ ] **Step 4: Run focused integration tests, full verification, and build**
+- [x] **Step 4: Run focused integration tests, full verification, and build**
 
 Run: `mise exec node@24.18.0 -- corepack pnpm vitest run apps/server/src/github/project.test.ts tests/fakes/github.test.ts apps/server/src/workflow/discovery.test.ts apps/server/src/workflow/claim.test.ts && mise exec node@24.18.0 -- make verify-agent && mise exec node@24.18.0 -- make build`
 

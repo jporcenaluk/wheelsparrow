@@ -336,6 +336,28 @@ describe("selectProjectCandidate", () => {
       ]),
     );
   });
+
+  test("excludes a valid item when a malformed duplicate shares its ID", () => {
+    const result = selectProjectCandidate(
+      snapshot([
+        item({ projectItemId: "PVTI_duplicate", issueNumber: 1 }),
+        item({
+          projectItemId: "PVTI_duplicate",
+          issueNodeId: "",
+          issueNumber: 0,
+        }),
+      ]),
+      { ...configuration, ownedProjectItemIds: new Set() },
+    );
+
+    expect(result.selected).toBeUndefined();
+    expect(result.eligible).toEqual([]);
+    expect(result.excluded).toHaveLength(2);
+    expect(result.excluded.map(({ reason }) => reason)).toEqual([
+      "duplicate_project_item_id",
+      "duplicate_project_item_id",
+    ]);
+  });
 });
 
 describe("listActiveProjectItemIds", () => {
