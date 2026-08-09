@@ -64,6 +64,8 @@ function graphqlCandidate() {
           headRefName: "ticket/42",
           headRefOid: headSha,
           mergeable: "MERGEABLE",
+          merged: false,
+          mergeCommit: { oid: mergeSha },
           closingIssuesReferences: {
             nodes: [{ number: 42 }],
           },
@@ -241,8 +243,10 @@ describe("GitHubDeliveryClient", () => {
       const body = graphqlCandidate();
       body.data.repository.pullRequest.merged = true;
       body.data.repository.pullRequest.mergeCommit = { oid: mergeSha };
-      body.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[0].conclusion =
-        "FAILURE";
+      const commit = body.data.repository.pullRequest.commits.nodes[0];
+      const check = commit?.commit.statusCheckRollup.contexts.nodes[0];
+      if (check === undefined) throw new Error("candidate check is absent");
+      check.conclusion = "FAILURE";
       return response(body);
     });
     await expect(
