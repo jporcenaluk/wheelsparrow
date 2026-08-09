@@ -569,6 +569,12 @@ export class FakeGitHubPublicationGateway implements GitHubPublicationGateway {
         );
       }
       const existing = this.#pullRequests.get(previousMutation.number);
+      if (existing?.isDraft === true) {
+        publicationFailure(
+          "pull_request_is_draft",
+          "Publication replay requires a non-draft pull request",
+        );
+      }
       if (existing === undefined || !sameRequestTarget(request, existing)) {
         publicationFailure(
           "head_drift",
@@ -707,10 +713,10 @@ export class FakeGitHubPublicationGateway implements GitHubPublicationGateway {
     const requiredChecks = this.#requiredCheckNames.map((name) => ({
       name,
       state: headDrifted
-        ? ("missing" as const)
+        ? ("pending" as const)
         : checkState.headSha === pullRequest.headSha
-          ? (checkState.states.get(name) ?? "missing")
-          : "missing",
+          ? (checkState.states.get(name) ?? "pending")
+          : "pending",
     }));
     const aggregate: RequiredChecksReceipt["aggregate"] = headDrifted
       ? "head_drift"
@@ -725,27 +731,38 @@ export class FakeGitHubPublicationGateway implements GitHubPublicationGateway {
       nodeId: pullRequest.nodeId,
       headSha: pullRequest.headSha,
       requiredChecks,
+      headDrift: headDrifted,
       aggregate,
     };
     return assertRequiredChecksReceipt(receipt);
   }
 
-  setRequiredCheck(name: string, state: RequiredCheckState): void {
+  setRequiredCheck(
+    number: number,
+    headSha: string,
+    name: string,
+    state: RequiredCheckState,
+  ): void {
     const checkName = assertCheckName(name);
     const checkState = assertRequiredCheckState(state);
     if (!this.#requiredCheckNames.includes(checkName)) {
       throw new Error(`Unknown required check: ${checkName}`);
     }
-    if (this.#pullRequests.size === 0) {
-      throw new Error("Cannot set a check before creating a pull request");
-    }
-    const latest = Math.max(...this.#pullRequests.keys());
-    const states = this.#checkStates.get(latest);
-    const pullRequest = this.#pullRequests.get(latest);
+    if (!Number.isSafeInteger(number) || number <= 0)
+      throw new Error("Pull request number must be a positive integer");
+    if (!/^[0-9a-f]{40}$/u.test(headSha))
+      throw new Error("Required check head must be a SHA-1");
+    const states = this.#checkStates.get(number);
+    const pullRequest = this.#pullRequests.get(number);
     if (states === undefined || pullRequest === undefined)
       throw new Error("Required check state is missing");
-    if (states.headSha !== pullRequest.headSha) {
-      states.headSha = pullRequest.headSha;
+    if (pullRequest.headSha !== headSha)
+      publicationFailure(
+        "head_drift",
+        "Required check mutation targets a stale PR head",
+      );
+    if (states.headSha !== headSha) {
+      states.headSha = headSha;
       states.states = new Map();
     }
     states.states.set(checkName, checkState);

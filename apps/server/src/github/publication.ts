@@ -16,7 +16,7 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/u;
 const REPOSITORY_PATTERN = /^[^/\s]+\/[^/\s]+$/u;
 const BRANCH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u;
 const NODE_ID_PATTERN = /^[A-Za-z0-9_:-]+$/u;
-const CHECK_STATES = ["missing", "pending", "success", "failure"] as const;
+const CHECK_STATES = ["pending", "success", "failure"] as const;
 
 export type RequiredCheckState = (typeof CHECK_STATES)[number];
 
@@ -105,6 +105,8 @@ export interface RequiredChecksReceipt {
   /** The head SHA actually observed on the PR, never the requested SHA. */
   readonly headSha: string;
   readonly requiredChecks: readonly RequiredCheckReceipt[];
+  /** True when the observed PR identity differs from the expected request. */
+  readonly headDrift: boolean;
   readonly aggregate: RequiredChecksAggregate;
 }
 
@@ -179,13 +181,44 @@ function repository(value: unknown): value is string {
 }
 
 function branch(value: unknown): value is string {
-  return text(value, "branch", MAX_BRANCH_BYTES) && BRANCH_PATTERN.test(value);
+  if (!text(value, "branch", MAX_BRANCH_BYTES) || !BRANCH_PATTERN.test(value))
+    return false;
+  return (
+    !value.includes("..") &&
+    !value.includes("//") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.endsWith(".lock") &&
+    !value.includes("@{") &&
+    value.split("/").every((component) => !component.startsWith("."))
+  );
 }
 
 function nodeId(value: unknown): value is string {
   return (
     text(value, "node ID", MAX_NODE_ID_BYTES) && NODE_ID_PATTERN.test(value)
   );
+}
+
+function canonicalPullRequestUrl(
+  value: unknown,
+  repositoryName: string,
+  number: number,
+): value is string {
+  return (
+    text(value, "pull request URL", MAX_URL_BYTES) &&
+    value === `https://github.com/${repositoryName}/pull/${number}`
+  );
+}
+
+function derivedChecksAggregate(
+  checks: readonly RequiredCheckReceipt[],
+  headDrift: boolean,
+): RequiredChecksAggregate {
+  if (headDrift) return "head_drift";
+  if (checks.some((check) => check.state === "failure")) return "failed";
+  if (checks.every((check) => check.state === "success")) return "green";
+  return "pending";
 }
 
 function failure(kind: GitHubPublicationFailureKind, message: string): never {
@@ -355,10 +388,10 @@ export function assertPullRequestReceipt(value: unknown): PullRequestReceipt {
     !repository(receipt.repository) ||
     !positiveInteger(receipt.number) ||
     !nodeId(receipt.nodeId) ||
-    !text(receipt.url, "pull request URL", MAX_URL_BYTES) ||
+    !canonicalPullRequestUrl(receipt.url, receipt.repository, receipt.number) ||
     !text(receipt.title, "pull request title", MAX_TITLE_BYTES) ||
     !positiveInteger(receipt.issueNumber) ||
-    typeof receipt.isDraft !== "boolean" ||
+    receipt.isDraft !== false ||
     !branch(receipt.baseBranch) ||
     !sha(receipt.baseSha) ||
     !branch(receipt.headBranch) ||
@@ -392,13 +425,16 @@ export function assertRequiredChecksReceipt(
       "nodeId",
       "headSha",
       "requiredChecks",
+      "headDrift",
       "aggregate",
     ]) ||
     !repository(receipt.repository) ||
     !positiveInteger(receipt.number) ||
     !nodeId(receipt.nodeId) ||
     !sha(receipt.headSha) ||
+    typeof receipt.headDrift !== "boolean" ||
     !isDenseArray(receipt.requiredChecks) ||
+    receipt.requiredChecks.length === 0 ||
     receipt.requiredChecks.length > 128 ||
     receipt.requiredChecks.some((check) => {
       if (!isPlainRecord(check)) return true;
@@ -415,7 +451,11 @@ export function assertRequiredChecksReceipt(
     ).size !== receipt.requiredChecks.length ||
     !["pending", "green", "failed", "head_drift"].includes(
       receipt.aggregate as string,
-    )
+    ) ||
+    derivedChecksAggregate(
+      receipt.requiredChecks as RequiredCheckReceipt[],
+      receipt.headDrift,
+    ) !== receipt.aggregate
   ) {
     invalid("Required checks receipt is malformed or exceeds its bounds");
   }
@@ -428,6 +468,7 @@ export function assertRequiredChecksReceipt(
       name: (check as Record<string, unknown>).name as string,
       state: (check as Record<string, unknown>).state as RequiredCheckState,
     })),
+    headDrift: receipt.headDrift,
     aggregate: receipt.aggregate as RequiredChecksAggregate,
   };
 }

@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import { FakeGitHubPublicationGateway } from "../../../../tests/fakes/github.js";
 import {
+  assertPullRequestReceipt,
+  assertRequiredChecksReceipt,
   GitHubPublicationBoundaryError,
   type GitHubPublicationGateway,
   type PublishPullRequestRequest,
@@ -99,6 +101,18 @@ describe("GitHub publication gateway seam", () => {
     expect(fake.publicationMutations()).toHaveLength(1);
   });
 
+  test("rejects an effect-key replay after the provider makes the PR a draft", async () => {
+    const fake = gateway();
+    const request = publishRequest();
+    const first = await fake.createPullRequest(request);
+    fake.setPullRequestDraft(first.number, true);
+
+    await expect(fake.createPullRequest(request)).rejects.toMatchObject({
+      kind: "pull_request_is_draft",
+    });
+    expect(fake.publicationMutations()).toHaveLength(1);
+  });
+
   test("rejects an effect key reused for a different publication request", async () => {
     const fake = gateway();
     await fake.createPullRequest(publishRequest());
@@ -120,8 +134,8 @@ describe("GitHub publication gateway seam", () => {
     async (_label, statuses, aggregate) => {
       const fake = gateway();
       const pr = await fake.createPullRequest(publishRequest());
-      fake.setRequiredCheck("test", statuses.test);
-      fake.setRequiredCheck("lint", statuses.lint);
+      fake.setRequiredCheck(pr.number, pr.headSha, "test", statuses.test);
+      fake.setRequiredCheck(pr.number, pr.headSha, "lint", statuses.lint);
 
       const observed = await fake.observeRequiredChecks({
         repository,
@@ -143,7 +157,7 @@ describe("GitHub publication gateway seam", () => {
   test("keeps a missing required check pending instead of treating partial evidence as green", async () => {
     const fake = gateway();
     const pr = await fake.createPullRequest(publishRequest());
-    fake.setRequiredCheck("test", "success");
+    fake.setRequiredCheck(pr.number, pr.headSha, "test", "success");
 
     const observed = await fake.observeRequiredChecks({
       repository,
@@ -157,7 +171,7 @@ describe("GitHub publication gateway seam", () => {
     expect(observed).toMatchObject({ aggregate: "pending" });
     expect(observed.requiredChecks).toEqual([
       { name: "test", state: "success" },
-      { name: "lint", state: "missing" },
+      { name: "lint", state: "pending" },
     ]);
   });
 
@@ -165,8 +179,8 @@ describe("GitHub publication gateway seam", () => {
     const fake = gateway();
     const pr = await fake.createPullRequest(publishRequest());
     fake.setPullRequestHead(pr.number, "c".repeat(40));
-    fake.setRequiredCheck("test", "success");
-    fake.setRequiredCheck("lint", "success");
+    fake.setRequiredCheck(pr.number, "c".repeat(40), "test", "success");
+    fake.setRequiredCheck(pr.number, "c".repeat(40), "lint", "success");
 
     const observed = await fake.observeRequiredChecks({
       repository,
@@ -182,15 +196,15 @@ describe("GitHub publication gateway seam", () => {
       headSha: "c".repeat(40),
     });
     expect(observed.requiredChecks).toEqual([
-      { name: "test", state: "missing" },
-      { name: "lint", state: "missing" },
+      { name: "test", state: "pending" },
+      { name: "lint", state: "pending" },
     ]);
   });
 
   test("reports base drift as non-green check evidence", async () => {
     const fake = gateway(["test"]);
     const pr = await fake.createPullRequest(publishRequest());
-    fake.setRequiredCheck("test", "success");
+    fake.setRequiredCheck(pr.number, pr.headSha, "test", "success");
     fake.setPullRequestBase(pr.number, "c".repeat(40));
 
     const observed = await fake.observeRequiredChecks({
@@ -204,7 +218,7 @@ describe("GitHub publication gateway seam", () => {
 
     expect(observed.aggregate).toBe("head_drift");
     expect(observed.requiredChecks).toEqual([
-      { name: "test", state: "missing" },
+      { name: "test", state: "pending" },
     ]);
   });
 
@@ -240,7 +254,7 @@ describe("GitHub publication gateway seam", () => {
   test("returns a defensive plain check receipt", async () => {
     const fake = gateway(["test"]);
     const pr = await fake.createPullRequest(publishRequest());
-    fake.setRequiredCheck("test", "success");
+    fake.setRequiredCheck(pr.number, pr.headSha, "test", "success");
 
     const observed: RequiredChecksReceipt = await fake.observeRequiredChecks({
       repository,
@@ -254,5 +268,96 @@ describe("GitHub publication gateway seam", () => {
     expect(Object.getPrototypeOf(observed.requiredChecks[0])).toBe(
       Object.prototype,
     );
+  });
+
+  test("targets check progression to the explicit PR and head", async () => {
+    const fake = gateway(["test"]);
+    const first = await fake.createPullRequest(
+      publishRequest({ issueNumber: 42, headBranch: "ticket/42-first" }),
+    );
+    const second = await fake.createPullRequest(
+      publishRequest({
+        issueNumber: 43,
+        effectKey: "run:run-2:pr:create",
+        headBranch: "ticket/43-second",
+        headSha: "c".repeat(40),
+      }),
+    );
+    fake.setRequiredCheck(second.number, second.headSha, "test", "success");
+
+    const firstChecks = await fake.observeRequiredChecks({
+      repository,
+      number: first.number,
+      nodeId: first.nodeId,
+      expectedBaseBranch: first.baseBranch,
+      expectedBaseSha: first.baseSha,
+      expectedHeadSha: first.headSha,
+    });
+    const secondChecks = await fake.observeRequiredChecks({
+      repository,
+      number: second.number,
+      nodeId: second.nodeId,
+      expectedBaseBranch: second.baseBranch,
+      expectedBaseSha: second.baseSha,
+      expectedHeadSha: second.headSha,
+    });
+
+    expect(firstChecks.aggregate).toBe("pending");
+    expect(secondChecks.aggregate).toBe("green");
+  });
+
+  test.each([
+    ["draft", { isDraft: true }],
+    ["non-canonical URL", { url: "https://example.test/octo/widget/pull/1" }],
+    ["double-slash branch", { headBranch: "ticket//publish" }],
+    ["dot-dot branch", { headBranch: "ticket/../publish" }],
+    ["trailing-slash branch", { headBranch: "ticket/publish/" }],
+    ["trailing-space branch", { headBranch: "ticket/publish " }],
+  ] as const)("rejects %s pull request receipts", (_label, change) => {
+    const valid = {
+      repository,
+      number: 1,
+      nodeId: "PR_node_1",
+      url: "https://github.com/octo/widget/pull/1",
+      title: "feat: publish the ticket",
+      issueNumber,
+      isDraft: false,
+      baseBranch: "main",
+      baseSha: "a".repeat(40),
+      headBranch: "ticket/42-publish",
+      headSha: "b".repeat(40),
+    };
+    expect(() => assertPullRequestReceipt({ ...valid, ...change })).toThrow(
+      /receipt|draft|url|branch/i,
+    );
+  });
+
+  test("derives and enforces the required-check aggregate", () => {
+    const valid = {
+      repository,
+      number: 1,
+      nodeId: "PR_node_1",
+      headSha: "b".repeat(40),
+      requiredChecks: [{ name: "test", state: "success" as const }],
+      headDrift: false,
+      aggregate: "green" as const,
+    };
+    expect(assertRequiredChecksReceipt(valid).aggregate).toBe("green");
+    expect(() =>
+      assertRequiredChecksReceipt({ ...valid, aggregate: "pending" }),
+    ).toThrow(/aggregate|check/i);
+    expect(() =>
+      assertRequiredChecksReceipt({ ...valid, requiredChecks: [] }),
+    ).toThrow(/check/i);
+    expect(() =>
+      assertRequiredChecksReceipt({ ...valid, headDrift: true }),
+    ).toThrow(/aggregate|check/i);
+    expect(
+      assertRequiredChecksReceipt({
+        ...valid,
+        headDrift: true,
+        aggregate: "head_drift",
+      }).aggregate,
+    ).toBe("head_drift");
   });
 });
