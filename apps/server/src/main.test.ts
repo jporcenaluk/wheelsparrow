@@ -15,6 +15,7 @@ import { GitHubCredentialsUnavailableError } from "./github/project-client.js";
 import {
   createProductionCoordinator,
   createProductionReadyDiscovery,
+  createProductionSmokeEnvironment,
   parsePort,
   type RunningService,
   resolveMigrationsDirectory,
@@ -380,6 +381,21 @@ function lifecycleFakes({
 }
 
 describe("start", () => {
+  test("projects PATH but no credentials into the production smoke environment", () => {
+    const environment = createProductionSmokeEnvironment({
+      PATH: "/safe/bin",
+      HOME: "/home/operator",
+      GITHUB_TOKEN: "ghp_secret",
+      GH_TOKEN: "gho_secret",
+      NODE_OPTIONS: "--require=secret-module",
+    });
+
+    expect(environment).toEqual({ PATH: "/safe/bin" });
+    expect(environment).not.toHaveProperty("GITHUB_TOKEN");
+    expect(environment).not.toHaveProperty("GH_TOKEN");
+    expect(environment).not.toHaveProperty("NODE_OPTIONS");
+  });
+
   test("composes production delivery adapters that dispatch an approved merge to the gateway", async () => {
     const connection = await createMainCompositionDatabase();
     const gateway = new FakeGitHubDeliveryGateway({

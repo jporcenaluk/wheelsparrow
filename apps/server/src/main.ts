@@ -129,6 +129,27 @@ export interface ProductionCoordinatorOptions {
   readonly restEndpoint?: string;
 }
 
+/**
+ * Return only executable lookup variables for smoke processes. Credentials,
+ * configuration overrides, and runtime flags must never cross this boundary.
+ */
+export function createProductionSmokeEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): Readonly<Record<string, string>> {
+  const projected: Record<string, string> = {};
+  const pathValue = environment.PATH ?? environment.Path;
+  if (typeof pathValue === "string" && pathValue.trim().length > 0)
+    projected.PATH = pathValue;
+  if (process.platform === "win32") {
+    for (const key of ["PATHEXT", "SystemRoot", "SYSTEMROOT"] as const) {
+      const value = environment[key];
+      if (typeof value === "string" && value.trim().length > 0)
+        projected[key] = value;
+    }
+  }
+  return projected;
+}
+
 function requireConfiguration(value: unknown): Configuration {
   if (!Value.Check(ConfigurationSchema, value)) {
     throw new Error("Validated runtime configuration is unavailable.");
@@ -229,8 +250,7 @@ export function createProductionCoordinator(
     options.smokeRunner ??
     createSafeSmokeRunner({
       cwd: options.repositoryRoot ?? process.cwd(),
-      // Smoke commands never inherit credentials or other ambient variables.
-      env: {},
+      env: createProductionSmokeEnvironment(),
     });
   const capability = createDeliveryCapability(
     deliveryGateway,
