@@ -16,6 +16,7 @@ import {
   type ExecutionFactsPatch,
   type NewFindingRecord,
   type NewStepRecord,
+  type PublicationFactsPatch,
   type RunRecord,
   readRun,
   type SchedulerControl,
@@ -114,6 +115,8 @@ export interface ExecutionSettlementCommand {
   evidence: string;
   at?: string;
   facts?: ExecutionFactsPatch;
+  /** PR receipt facts may settle only the coordinator-owned publish effect. */
+  publicationFacts?: PublicationFactsPatch;
   step?: NewStepRecord;
   /** Findings belong to the review step and are appended in this transaction. */
   findings?: readonly NewFindingRecord[];
@@ -605,6 +608,31 @@ export class WorkflowCoordinator {
             command.effectKey,
             command.expectedRevision,
           );
+        const hasPublicationFacts = command.publicationFacts !== undefined;
+        if (hasPublicationFacts && currentEffect.kind !== "publish")
+          throw new TypeError(
+            "Publication facts may settle only a publish effect.",
+          );
+        if (currentEffect.kind === "publish" && command.facts !== undefined)
+          throw new TypeError(
+            "Publish settlements require the narrow publication facts patch.",
+          );
+        if (
+          currentEffect.kind === "publish" &&
+          command.outcome === "confirmed" &&
+          !hasPublicationFacts
+        )
+          throw new TypeError(
+            "A confirmed publish settlement requires publication facts.",
+          );
+        if (
+          currentEffect.kind === "publish" &&
+          command.outcome !== "confirmed" &&
+          hasPublicationFacts
+        )
+          throw new TypeError(
+            "Publication facts require a confirmed publish settlement.",
+          );
         const repository = createRunMutationRepository(tx);
         if (command.step !== undefined) {
           if (
@@ -669,7 +697,14 @@ export class WorkflowCoordinator {
           throw new TypeError(
             "review_needs_repair requires a nonempty findings array.",
           );
-        if (command.facts !== undefined)
+        if (command.publicationFacts !== undefined)
+          await repository.updatePublicationFacts({
+            runId: command.runId,
+            expectedRevision: command.expectedRevision,
+            facts: command.publicationFacts,
+            at,
+          });
+        else if (command.facts !== undefined)
           await repository.updateExecutionFacts({
             runId: command.runId,
             expectedRevision: command.expectedRevision,
