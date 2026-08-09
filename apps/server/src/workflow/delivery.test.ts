@@ -201,6 +201,10 @@ function deliveryConfiguration() {
   } as const;
 }
 
+function nonMergeResolver(): never {
+  throw new Error("The merge resolver is not expected for this effect.");
+}
+
 function stagingRun(sha: string): StagingWorkflowRunReceipt {
   return {
     id: "workflow-run-1",
@@ -612,23 +616,6 @@ describe("coordinator-owned delivery stages", () => {
       dispatch: false,
       at,
     });
-    const effect = await coordinator.createEffectIntent({
-      runId: approval.run.id,
-      expectedRevision: approval.run.revision,
-      key: `run:${approval.run.id}:startup-merge`,
-      kind: "merge",
-      intent: {
-        repository: approval.run.repository,
-        pullRequestNumber: approval.run.pullRequestNumber,
-        pullRequestNodeId: approval.run.pullRequestNodeId,
-        pullRequestUrl: approval.run.pullRequestUrl,
-        branch: approval.run.branch,
-        baseSha,
-        headSha,
-      },
-      dispatch: false,
-      at,
-    });
     const capability = createDeliveryCapability(
       gateway,
       deliveryConfiguration(),
@@ -641,13 +628,30 @@ describe("coordinator-owned delivery stages", () => {
       },
       { resolveRun: () => approval.run },
     );
-    const dispatched = await dispatchCapability(capability, effect.effect);
-    expect(dispatched).toMatchObject({
-      outcome: "confirmed",
-      trigger: "merge_observed",
+    await coordinator.close();
+    const restarted = new WorkflowCoordinator({
+      connection,
+      dispatcher: capability.dispatcher,
+    });
+    const settlement = restarted.waitForEffectSettlement(
+      approval.effect.key,
+      1_000,
+    );
+    await restarted.beginEffect({
+      effectKey: approval.effect.key,
+      expectedRevision: approval.run.revision,
+      at,
+    });
+    const dispatched = await settlement;
+    expect(dispatched.status).toBe("confirmed");
+    expect(JSON.parse(dispatched.receipt ?? "null")).toMatchObject({
+      issueNumber: 42,
+    });
+    expect(await readRun(connection.db, approval.run.id)).toMatchObject({
+      state: "waiting_for_staging",
     });
     expect(gateway.mergeMutations()).toHaveLength(1);
-    await coordinator.close();
+    await restarted.close();
   });
 
   test("requires a durable run resolver for restart delivery capabilities", () => {
@@ -725,6 +729,7 @@ describe("coordinator-owned delivery stages", () => {
           durationMs: 1,
         }),
       },
+      { resolveRun: nonMergeResolver },
     );
     const dispatched = await dispatchCapability(capability, effect.effect);
     expect(dispatched).toMatchObject({
@@ -803,6 +808,7 @@ describe("coordinator-owned delivery stages", () => {
       }),
       deliveryConfiguration(),
       runner,
+      { resolveRun: nonMergeResolver },
     );
     const dispatched = await dispatchCapability(capability, effect);
     expect(dispatched).toMatchObject({
@@ -827,6 +833,7 @@ describe("coordinator-owned delivery stages", () => {
             exitCode: number;
           },
       },
+      { resolveRun: nonMergeResolver },
     );
     await expect(dispatchCapability(malformed, effect)).resolves.toMatchObject({
       outcome: "ambiguous",

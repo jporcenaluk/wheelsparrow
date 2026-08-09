@@ -171,9 +171,7 @@ export interface DeliveryCapability {
 
 export interface DeliveryCapabilityOptions {
   /** Resolve the durable run for an effect; this is the only safe source for issue/title facts omitted by older intents. */
-  readonly resolveRun?: (
-    effect: EffectRecord,
-  ) => RunRecord | Promise<RunRecord>;
+  readonly resolveRun: (effect: EffectRecord) => RunRecord | Promise<RunRecord>;
 }
 
 interface ScheduledEffect {
@@ -950,12 +948,38 @@ export async function executeStagingStage(
     });
   } catch (error) {
     if (isStale(error)) return { kind: "stale", run: input.run };
-    return handoff(
-      input.coordinator,
-      input.run,
-      `Staging settlement failed closed: ${redacted(errorMessage(error))}`,
-      now,
-    );
+    const reason = `Staging settlement failed closed: ${redacted(errorMessage(error))}`;
+    if (input.coordinator.quarantineEffect === undefined)
+      return handoff(input.coordinator, input.run, reason, now);
+    try {
+      await input.coordinator.quarantineEffect({
+        runId: input.run.id,
+        expectedRevision: input.run.revision,
+        effectKey: key,
+        outcome: "ambiguous",
+        evidence: bounded(
+          `${reason} Effect ${key} was quarantined for reconciliation before Review handoff.`,
+        ),
+        at: now(),
+      });
+      const reviewed = await input.coordinator.transition({
+        runId: input.run.id,
+        expectedRevision: input.run.revision + 1,
+        trigger: "delivery_failed",
+        summary: { text: bounded(reason) },
+        requiredAction: bounded(reason),
+        at: now(),
+      });
+      return { kind: "human", run: reviewed, reason: bounded(reason) };
+    } catch (quarantineError) {
+      if (isStale(quarantineError)) return { kind: "stale", run: input.run };
+      return handoff(
+        input.coordinator,
+        input.run,
+        `${reason} Effect quarantine failed closed: ${redacted(errorMessage(quarantineError))}`,
+        now,
+      );
+    }
   }
   const smokeKey = effectKey(settled.run, "smoke");
   try {
@@ -1397,19 +1421,17 @@ async function dispatchEffect(
   gateway: GitHubDeliveryGateway,
   configuration: DeliveryConfiguration,
   smokeRunner: SmokeRunner,
-  resolveRun?: DeliveryCapabilityOptions["resolveRun"],
+  resolveRun: DeliveryCapabilityOptions["resolveRun"],
 ): Promise<unknown> {
   if (effect.kind === "merge") {
-    let run: RunRecord | undefined;
-    if (resolveRun !== undefined) {
-      try {
-        run = await resolveRun(effect);
-      } catch {
-        return {
-          outcome: "failed",
-          evidence: `Durable run facts were unavailable for merge ${effect.key}.`,
-        };
-      }
+    let run: RunRecord;
+    try {
+      run = await resolveRun(effect);
+    } catch {
+      return {
+        outcome: "failed",
+        evidence: `Durable run facts were unavailable for merge ${effect.key}.`,
+      };
     }
     const request = mergeIntentRequest(effect, run);
     if (request === undefined)
@@ -1750,8 +1772,12 @@ export function createDeliveryCapability(
   gateway: GitHubDeliveryGateway,
   configuration: DeliveryConfiguration,
   smokeRunner: SmokeRunner,
-  options: DeliveryCapabilityOptions = {},
+  options?: DeliveryCapabilityOptions,
 ): DeliveryCapability {
+  if (typeof options?.resolveRun !== "function")
+    throw new TypeError(
+      "Delivery capability requires a durable run resolver for restart-safe merge dispatch.",
+    );
   return {
     dispatcher: async (effect) =>
       dispatchEffect(
