@@ -162,16 +162,15 @@ export function projectQueue(input: QueueProjectionInput): QueueResponse {
     schema_version: 1,
     scheduler: schedulerProjection(input.scheduler),
     active_todo: active === undefined ? null : queueProjection(active),
+    // Durable rows have no native discovery priority, so sort that subset
+    // deterministically. The injected GitHub discovery list is already
+    // canonically ordered by priority/creation/dependencies; preserve it.
     ready: [
       ...[...(input.ready ?? [])]
         .sort(byIssueNumber)
         .map((run) => queueProjection(run)),
       ...(input.discoveredReady ?? []),
-    ].toSorted(
-      (left, right) =>
-        left.issue_number - right.issue_number ||
-        left.run_id.localeCompare(right.run_id),
-    ),
+    ],
     review: reviews.map((run) => queueProjection(run, attentionReason(run))),
     review_count: reviews.length,
   };

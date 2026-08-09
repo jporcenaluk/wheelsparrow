@@ -80,8 +80,8 @@ async function createApp() {
         origin: "http://localhost:4321",
         discoverReady: async () => [
           {
-            run_id: "ready-2",
-            issue_number: 2,
+            run_id: "priority-1-issue-99",
+            issue_number: 99,
             repository: "owner/repository",
             state: "claiming",
             revision: 0,
@@ -96,7 +96,7 @@ async function createApp() {
             updated_at: "2026-08-09T10:00:00.000Z",
           } satisfies OperatorQueueRun,
           {
-            run_id: "ready-1",
+            run_id: "priority-2-issue-1",
             issue_number: 1,
             repository: "owner/repository",
             state: "claiming",
@@ -194,8 +194,8 @@ describe("operator routes", () => {
     expect(queue.body).not.toContain("project-run-1");
     expect(
       queue.json().ready.map((item: OperatorQueueRun) => item.issue_number),
-    ).toEqual([1, 2]);
-    expect(queue.json().ready[0].blocked_reason).toBe(
+    ).toEqual([99, 1]);
+    expect(queue.json().ready[1].blocked_reason).toBe(
       "blocked_dependency_open",
     );
   });

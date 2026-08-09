@@ -65,6 +65,57 @@ describe("operator read projections", () => {
     expect(JSON.stringify(projection)).not.toContain("PVTI_secretish");
   });
 
+  test("keeps durable-only ready merging deterministic while preserving discovery order", () => {
+    const first = { ...run, id: "durable-2", issueNumber: 20 };
+    const second = { ...run, id: "durable-1", issueNumber: 10 };
+    const projection = projectQueue({
+      scheduler,
+      runs: [],
+      ready: [first, second],
+      discoveredReady: [
+        {
+          run_id: "priority-1-issue-99",
+          issue_number: 99,
+          repository: "owner/repo",
+          state: "claiming",
+          revision: 0,
+          rework_epoch: 0,
+          repair_round: 0,
+          branch: null,
+          pull_request_number: null,
+          pull_request_title: null,
+          pull_request_url: null,
+          required_action: null,
+          blocked_reason: null,
+          updated_at: run.updatedAt,
+        },
+        {
+          run_id: "priority-2-issue-1",
+          issue_number: 1,
+          repository: "owner/repo",
+          state: "claiming",
+          revision: 0,
+          rework_epoch: 0,
+          repair_round: 0,
+          branch: null,
+          pull_request_number: null,
+          pull_request_title: null,
+          pull_request_url: null,
+          required_action: null,
+          blocked_reason: null,
+          updated_at: run.updatedAt,
+        },
+      ],
+    });
+
+    expect(projection.ready.map((item) => item.run_id)).toEqual([
+      "durable-1",
+      "durable-2",
+      "priority-1-issue-99",
+      "priority-2-issue-1",
+    ]);
+  });
+
   test("projects run detail without raw intake, effects, ownership, or logs", () => {
     const projection = projectRunDetail(run, {
       events: [
