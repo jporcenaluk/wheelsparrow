@@ -156,6 +156,27 @@ function insertReviewRun(connection: DatabaseConnection, id = "run-1") {
     );
 }
 
+function insertMergeReadyReviewRun(
+  connection: DatabaseConnection,
+  id = "run-merge",
+) {
+  insertReviewRun(connection, id);
+  connection.native
+    .prepare(
+      `UPDATE runs
+       SET pull_request_number = ?, pull_request_node_id = ?,
+           pull_request_title = ?, pull_request_url = ?
+       WHERE id = ?`,
+    )
+    .run(
+      7,
+      `PR_${id}`,
+      "Safe change",
+      `https://github.com/owner/repository/pull/7`,
+      id,
+    );
+}
+
 afterEach(async () => {
   await Promise.all(apps.splice(0).map((app) => app.close()));
   for (const connection of connections.splice(0)) await connection.close();
@@ -365,6 +386,165 @@ describe("operator routes", () => {
       error: { code: "not_found" },
     });
     expect(merge.statusCode).toBe(404);
+  });
+
+  test("accepts exact-SHA approval through the coordinator and returns a safe merge summary", async () => {
+    const { app, routes, connection } = await createApp();
+    insertMergeReadyReviewRun(connection, "run-merge");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/runs/run-merge/approve",
+      headers: {
+        origin: "http://localhost:4321",
+        "x-csrf-token": routes.csrfToken,
+      },
+      payload: {
+        schema_version: 1,
+        expected_run_revision: 3,
+        approved_head_sha: "b".repeat(40),
+        approved_base_sha: "a".repeat(40),
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      schema_version: 1,
+      run: { run_id: "run-merge", state: "merging", revision: 4 },
+      approval: {
+        approved_head_sha: "b".repeat(40),
+        observed_base_sha: "a".repeat(40),
+        decision: "approved",
+      },
+      effect: { kind: "merge", status: "in_flight", target_revision: 4 },
+      merge_intent: {
+        repository: "owner/repository",
+        pull_request_number: 7,
+        branch: "codex/run-merge",
+        base_sha: "a".repeat(40),
+        head_sha: "b".repeat(40),
+      },
+    });
+    expect(response.body).not.toContain("owner-secret");
+    expect(response.body).not.toContain("intent_json");
+    expect(response.body).not.toContain("fingerprint");
+    expect(response.body).not.toContain("executor_owner_token");
+  });
+
+  test("rejects stale exact-SHA approval revisions", async () => {
+    const { app, routes, connection } = await createApp();
+    insertMergeReadyReviewRun(connection, "run-stale");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/runs/run-stale/approve",
+      headers: {
+        origin: "http://localhost:4321",
+        "x-csrf-token": routes.csrfToken,
+      },
+      payload: {
+        schema_version: 1,
+        expected_run_revision: 99,
+        approved_head_sha: "b".repeat(40),
+        approved_base_sha: "a".repeat(40),
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      schema_version: 1,
+      error: { code: "revision_conflict" },
+    });
+  });
+
+  test("rejects invalid exact-SHA approval input", async () => {
+    const { app, routes, connection } = await createApp();
+    insertMergeReadyReviewRun(connection, "run-invalid");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/runs/run-invalid/approve",
+      headers: {
+        origin: "http://localhost:4321",
+        "x-csrf-token": routes.csrfToken,
+      },
+      payload: {
+        schema_version: 1,
+        expected_run_revision: 3,
+        approved_head_sha: "not-a-sha",
+        approved_base_sha: "a".repeat(40),
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      schema_version: 1,
+      error: { code: "invalid_request" },
+    });
+  });
+
+  test("requires same-origin and CSRF for exact-SHA approval", async () => {
+    const { app, routes, connection } = await createApp();
+    insertMergeReadyReviewRun(connection, "run-unauthorized");
+    const body = {
+      schema_version: 1,
+      expected_run_revision: 3,
+      approved_head_sha: "b".repeat(40),
+      approved_base_sha: "a".repeat(40),
+    };
+
+    const missingToken = await app.inject({
+      method: "POST",
+      url: "/api/runs/run-unauthorized/approve",
+      headers: { origin: "http://localhost:4321" },
+      payload: body,
+    });
+    const wrongOrigin = await app.inject({
+      method: "POST",
+      url: "/api/runs/run-unauthorized/approve",
+      headers: {
+        origin: "https://evil.example",
+        "x-csrf-token": routes.csrfToken,
+      },
+      payload: body,
+    });
+
+    expect(missingToken.statusCode).toBe(403);
+    expect(wrongOrigin.statusCode).toBe(403);
+    expect(missingToken.json()).toMatchObject({
+      schema_version: 1,
+      error: { code: "csrf_forbidden" },
+    });
+  });
+
+  test("reports staging retry as unavailable without creating an effect or remerging", async () => {
+    const { app, routes, connection } = await createApp();
+    insertMergeReadyReviewRun(connection, "run-retry");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/runs/run-retry/retry-staging",
+      headers: {
+        origin: "http://localhost:4321",
+        "x-csrf-token": routes.csrfToken,
+      },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      schema_version: 1,
+      error: { code: "capability_unavailable" },
+    });
+    expect(
+      connection.native
+        .prepare("SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ?")
+        .get("run-retry").count,
+    ).toBe(0);
+    expect(
+      connection.native
+        .prepare("SELECT state FROM runs WHERE id = ?")
+        .get("run-retry").state,
+    ).toBe("review");
   });
 
   test("requires CSRF and same-origin for SSE connections", async () => {

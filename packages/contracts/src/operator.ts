@@ -350,6 +350,70 @@ export type ReturnToTodoRequest = Static<typeof ReturnToTodoRequestSchema>;
 export const ReturnToTodoResponseSchema = OperatorRunDetailSchema;
 export type ReturnToTodoResponse = Static<typeof ReturnToTodoResponseSchema>;
 
+/** Exact candidate facts supplied by an operator before authorizing a merge. */
+export const ApproveMergeRequestSchema = Type.Object(
+  {
+    schema_version: SchemaVersion,
+    expected_run_revision: NonNegativeInteger,
+    approved_head_sha: Type.String({
+      pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+    }),
+    approved_base_sha: Type.String({
+      pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+    }),
+  },
+  { additionalProperties: false },
+);
+export type ApproveMergeRequest = Static<typeof ApproveMergeRequestSchema>;
+
+/** Safe, non-secret merge intent facts shown to an operator after approval. */
+export const OperatorMergeIntentSchema = Type.Object(
+  {
+    repository: Identifier,
+    pull_request_number: Type.Integer({ minimum: 1 }),
+    pull_request_url: Text,
+    branch: Text,
+    base_sha: Type.String({
+      pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+    }),
+    head_sha: Type.String({
+      pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+    }),
+  },
+  { additionalProperties: false },
+);
+export type OperatorMergeIntent = Static<typeof OperatorMergeIntentSchema>;
+
+export const OperatorMergeEffectSchema = Type.Object(
+  {
+    key: Identifier,
+    kind: Type.Literal("merge"),
+    target_revision: NonNegativeInteger,
+    status: Type.Union([
+      Type.Literal("pending"),
+      Type.Literal("in_flight"),
+      Type.Literal("ambiguous"),
+      Type.Literal("confirmed"),
+      Type.Literal("failed"),
+      Type.Literal("cancelled"),
+    ]),
+  },
+  { additionalProperties: false },
+);
+export type OperatorMergeEffect = Static<typeof OperatorMergeEffectSchema>;
+
+export const ApproveMergeResponseSchema = Type.Object(
+  {
+    schema_version: SchemaVersion,
+    run: OperatorRunSchema,
+    approval: OperatorApprovalSchema,
+    effect: OperatorMergeEffectSchema,
+    merge_intent: OperatorMergeIntentSchema,
+  },
+  { additionalProperties: false },
+);
+export type ApproveMergeResponse = Static<typeof ApproveMergeResponseSchema>;
+
 export const OperatorSessionResponseSchema = Type.Object(
   { schema_version: SchemaVersion, csrf_token: Text },
   { additionalProperties: false },
