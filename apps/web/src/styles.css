@@ -579,6 +579,59 @@ td {
   color: var(--ink-faint);
   font-size: 0.66rem;
 }
+.review-card__receipt {
+  border-bottom: 1px solid var(--line);
+}
+.delivery-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.delivery-heading .muted-line {
+  margin-top: 0.45rem;
+}
+.delivery-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.65rem 1rem;
+  margin: 0.2rem 0 0;
+}
+.delivery-facts dd {
+  min-height: 2.15rem;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.delivery-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--line);
+}
+.delivery-controls--retry {
+  align-items: end;
+}
+.delivery-controls .muted-line {
+  margin: 0;
+  max-width: 64ch;
+}
+.confirmation-control {
+  display: flex;
+  align-items: start;
+  gap: 0.6rem;
+  color: var(--ink-dim);
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+.confirmation-control input {
+  width: 1rem;
+  height: 1rem;
+  flex-shrink: 0;
+  margin: 0.12rem 0 0;
+  accent-color: var(--accent);
+}
 .footer-note {
   color: var(--ink-faint);
   font-size: 0.65rem;
@@ -657,6 +710,13 @@ td {
   .detail-grid {
     grid-template-columns: 1fr;
   }
+  .delivery-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .delivery-controls {
+    align-items: start;
+    flex-direction: column;
+  }
 }
 
 @media (max-width: 480px) {
@@ -667,6 +727,9 @@ td {
     white-space: nowrap;
   }
   .facts-grid {
+    grid-template-columns: 1fr;
+  }
+  .delivery-facts {
     grid-template-columns: 1fr;
   }
 }

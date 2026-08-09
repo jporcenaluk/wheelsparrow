@@ -3,7 +3,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  approveRun,
   fetchQueue,
+  retryStaging,
   safeGithubPullRequestUrl,
   subscribeToSnapshots,
 } from "./api.js";
@@ -25,6 +27,130 @@ const queue = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("operator API client", () => {
+  it("posts the exact-SHA approval with the durable revision and CSRF token", async () => {
+    document.head.innerHTML = '<meta name="csrf-token" content="csrf-test">';
+    const headSha = "b".repeat(40);
+    const baseSha = "a".repeat(40);
+    const fetch = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toBe("/api/runs/run-merge/approve");
+        expect(init?.method).toBe("POST");
+        expect(new Headers(init?.headers).get("x-csrf-token")).toBe(
+          "csrf-test",
+        );
+        expect(JSON.parse(String(init?.body))).toEqual({
+          schema_version: 1,
+          expected_run_revision: 3,
+          approved_head_sha: headSha,
+          approved_base_sha: baseSha,
+        });
+        return new Response(
+          JSON.stringify({
+            schema_version: 1,
+            run: {
+              run_id: "run-merge",
+              issue_number: 7,
+              repository: "owner/repository",
+              state: "merging",
+              revision: 4,
+              rework_epoch: 0,
+              repair_round: 0,
+              branch: "codex/run-merge",
+              pull_request_number: 7,
+              pull_request_title: "Merge",
+              pull_request_url: "https://github.com/owner/repository/pull/7",
+              required_action: null,
+              blocked_reason: null,
+              updated_at: "2026-08-09T11:00:00.000Z",
+              base_branch: "main",
+              base_sha: baseSha,
+              head_sha: headSha,
+              observed_base_sha: baseSha,
+              merge_sha: null,
+              worktree_path: null,
+              stop_requested_at: null,
+              started_at: null,
+              handed_off_at: null,
+              terminal_at: null,
+            },
+            approval: {
+              id: "approval-1",
+              operator: "local-operator",
+              approved_head_sha: headSha,
+              observed_base_sha: baseSha,
+              decision: "approved",
+              invalidation_reason: null,
+              created_at: "2026-08-09T11:00:00.000Z",
+            },
+            effect: {
+              key: "run:run-merge:merge",
+              kind: "merge",
+              target_revision: 4,
+              status: "in_flight",
+            },
+            merge_intent: {
+              repository: "owner/repository",
+              pull_request_number: 7,
+              pull_request_url: "https://github.com/owner/repository/pull/7",
+              branch: "codex/run-merge",
+              base_sha: baseSha,
+              head_sha: headSha,
+            },
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    const response = await approveRun("run-merge", {
+      schema_version: 1,
+      expected_run_revision: 3,
+      approved_head_sha: headSha,
+      approved_base_sha: baseSha,
+    });
+
+    expect(response.effect.status).toBe("in_flight");
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces the structured capability-unavailable result for staging retry", async () => {
+    document.head.innerHTML = '<meta name="csrf-token" content="csrf-test">';
+    const fetch = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toBe("/api/runs/run-retry/retry-staging");
+        expect(init?.method).toBe("POST");
+        expect(new Headers(init?.headers).get("x-csrf-token")).toBe(
+          "csrf-test",
+        );
+        return new Response(
+          JSON.stringify({
+            schema_version: 1,
+            error: {
+              code: "capability_unavailable",
+              message: "The staging delivery retry capability is unavailable.",
+            },
+          }),
+          {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(retryStaging("run-retry")).rejects.toMatchObject({
+      name: "OperatorApiError",
+      status: 503,
+      code: "capability_unavailable",
+      message: "The staging delivery retry capability is unavailable.",
+    });
+  });
+
   it("rejects a schema-valid payload served with an HTML media type", async () => {
     vi.stubGlobal(
       "fetch",

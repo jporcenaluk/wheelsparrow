@@ -1,8 +1,13 @@
 import {
+  type ApproveMergeRequest,
+  type ApproveMergeResponse,
+  ApproveMergeResponseSchema,
   type ConfigurationResponse,
   ConfigurationResponseSchema,
   type HealthResponse,
   HealthResponseSchema,
+  type OperatorErrorResponse,
+  OperatorErrorResponseSchema,
   type OperatorRunDetail,
   OperatorRunDetailSchema,
   type QueueResponse,
@@ -19,6 +24,7 @@ import { Value } from "typebox/value";
 
 const JSON_MEDIA_TYPE = /^application\/(?:json|[a-z0-9!#$&^_.+-]+\+json)$/u;
 const OPERATOR_ROOT = "/api/operator";
+const DELIVERY_ROOT = "/api/runs";
 const GITHUB_PATH_SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u;
 const GITHUB_PULL_REQUEST_PATH =
   /^\/([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\/([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\/pull\/([1-9][0-9]*)$/u;
@@ -60,11 +66,13 @@ export function safeGithubPullRequestUrl(value: string | null): string | null {
 
 export class OperatorApiError extends Error {
   readonly status: number;
+  readonly code: string | null;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code: string | null = null) {
     super(message);
     this.name = "OperatorApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -134,6 +142,21 @@ async function requestJson<T>(
   });
   rememberCsrf(response);
   if (!response.ok) {
+    if (isJsonResponse(response)) {
+      try {
+        const payload: unknown = await response.json();
+        if (Value.Check(OperatorErrorResponseSchema, payload)) {
+          const error = (payload as OperatorErrorResponse).error;
+          throw new OperatorApiError(
+            error.message,
+            response.status,
+            error.code,
+          );
+        }
+      } catch (error) {
+        if (error instanceof OperatorApiError) throw error;
+      }
+    }
     throw new OperatorApiError(
       `Operator request failed with HTTP ${response.status}`,
       response.status,
@@ -202,6 +225,25 @@ export function fetchReview(): Promise<ReviewResponse> {
   return requestJson<ReviewResponse>(
     `${OPERATOR_ROOT}/review`,
     ReviewResponseSchema,
+  );
+}
+
+export function approveRun(
+  runId: string,
+  request: ApproveMergeRequest,
+): Promise<ApproveMergeResponse> {
+  return requestJson<ApproveMergeResponse>(
+    `${DELIVERY_ROOT}/${encodeURIComponent(runId)}/approve`,
+    ApproveMergeResponseSchema,
+    { method: "POST", body: JSON.stringify(request) },
+  );
+}
+
+export function retryStaging(runId: string): Promise<OperatorErrorResponse> {
+  return requestJson<OperatorErrorResponse>(
+    `${DELIVERY_ROOT}/${encodeURIComponent(runId)}/retry-staging`,
+    OperatorErrorResponseSchema,
+    { method: "POST" },
   );
 }
 
