@@ -40,6 +40,7 @@ export interface RunsTable {
   base_branch: string;
   branch: string | null;
   pull_request_number: number | null;
+  pull_request_node_id: string | null;
   pull_request_title: string | null;
   pull_request_url: string | null;
   required_action: string | null;

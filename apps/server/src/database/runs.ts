@@ -22,7 +22,12 @@ import type {
 const maximumIdentifierBytes = 512;
 const maximumEvidenceBytes = 4 * 1024;
 const maximumJsonBytes = 1024 * 1024;
+const maximumPullRequestTitleBytes = 2 * 1024;
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+const gitRefComponentPattern = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+const githubPathSegmentPattern =
+  /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u;
+const githubNodeIdPattern = /^[A-Za-z0-9_:-]+$/u;
 const runStates = new Set<string>(RUN_STATES);
 const repairableTriggers = new Set<WorkflowTrigger>([
   "verification_failed_repairable",
@@ -88,6 +93,7 @@ export interface RunRecord {
   baseBranch: string;
   branch: string | null;
   pullRequestNumber: number | null;
+  pullRequestNodeId: string | null;
   pullRequestTitle: string | null;
   pullRequestUrl: string | null;
   requiredAction: string | null;
@@ -161,6 +167,25 @@ export interface ExecutionFactsUpdateRequest {
   runId: string;
   expectedRevision: number;
   facts: ExecutionFactsPatch;
+  at: string;
+}
+
+/** The only run facts a coordinator may persist from a publish receipt. */
+export interface PublicationFactsPatch {
+  pullRequestNumber: number;
+  pullRequestNodeId: string;
+  pullRequestTitle: string;
+  pullRequestUrl: string;
+  baseSha: string;
+  headSha: string;
+  /** The exact branch assigned to this run before publication. */
+  branch: string;
+}
+
+export interface PublicationFactsUpdateRequest {
+  runId: string;
+  expectedRevision: number;
+  facts: PublicationFactsPatch;
   at: string;
 }
 
@@ -373,6 +398,45 @@ function sha(value: unknown, label: string): string {
   return value;
 }
 
+function gitRef(value: unknown, label: string): string {
+  const branch = boundedText(value, label, maximumIdentifierBytes);
+  const components = branch.split("/");
+  if (
+    components.some(
+      (component) =>
+        !gitRefComponentPattern.test(component) ||
+        component.endsWith(".") ||
+        component.endsWith(".lock"),
+    ) ||
+    branch.includes("..") ||
+    branch.includes("@{")
+  )
+    throw new TypeError(`${label} must be a safe Git ref.`);
+  return branch;
+}
+
+function validatePullRequestUrl(
+  value: unknown,
+  repository: string,
+  pullRequestNumber: number,
+): string {
+  const text = boundedText(value, "Pull request URL", maximumIdentifierBytes);
+  const repositoryParts = repository.split("/");
+  if (
+    repositoryParts.length !== 2 ||
+    repositoryParts.some((part) => !githubPathSegmentPattern.test(part))
+  )
+    throw new TypeError(
+      "Run repository must contain safe GitHub owner and repository names.",
+    );
+  const expected = `https://github.com/${repository}/pull/${pullRequestNumber}`;
+  if (text !== expected)
+    throw new TypeError(
+      "Pull request URL must be the raw canonical HTTPS GitHub URL.",
+    );
+  return text;
+}
+
 function isIntakeJsonValue(value: unknown, seen = new Set<object>()): boolean {
   if (value === null || typeof value === "string" || typeof value === "boolean")
     return true;
@@ -432,6 +496,7 @@ function mapRun(row: RunsTable): RunRecord {
     baseBranch: row.base_branch,
     branch: row.branch,
     pullRequestNumber: row.pull_request_number,
+    pullRequestNodeId: row.pull_request_node_id,
     pullRequestTitle: row.pull_request_title,
     pullRequestUrl: row.pull_request_url,
     requiredAction: row.required_action,
@@ -741,6 +806,9 @@ export interface RunMutationRepository {
   updateExecutionFacts(
     request: ExecutionFactsUpdateRequest,
   ): Promise<RunRecord>;
+  updatePublicationFacts(
+    request: PublicationFactsUpdateRequest,
+  ): Promise<RunRecord>;
   appendStep(input: NewStepRecord): Promise<StepRecord>;
   appendFinding(input: NewFindingRecord): Promise<FindingRecord>;
   appendApproval(input: NewApprovalRecord): Promise<ApprovalRecord>;
@@ -797,6 +865,7 @@ export function createRunMutationRepository(
             base_branch: "main",
             branch: null,
             pull_request_number: null,
+            pull_request_node_id: null,
             pull_request_title: null,
             pull_request_url: null,
             required_action: null,
@@ -963,6 +1032,86 @@ export function createRunMutationRepository(
       const updated = await tx
         .updateTable("runs")
         .set(updates)
+        .where("id", "=", runId)
+        .where("revision", "=", current.revision)
+        .executeTakeFirst();
+      if (Number(updated.numUpdatedRows) !== 1)
+        throw new StaleRevisionError(request.expectedRevision);
+      return mapRun(await readRunRow(tx, runId));
+    },
+
+    async updatePublicationFacts(request): Promise<RunRecord> {
+      const runId = identifier(request.runId, "Run ID");
+      const at = identifier(request.at, "Timestamp");
+      const current = await assertRunRevision(
+        tx,
+        runId,
+        request.expectedRevision,
+      );
+      const facts = request.facts;
+      if (
+        facts === null ||
+        typeof facts !== "object" ||
+        Array.isArray(facts) ||
+        (Object.getPrototypeOf(facts) !== Object.prototype &&
+          Object.getPrototypeOf(facts) !== null)
+      )
+        throw new TypeError("Publication facts patch must be a plain object.");
+      const allowed = new Set([
+        "pullRequestNumber",
+        "pullRequestNodeId",
+        "pullRequestTitle",
+        "pullRequestUrl",
+        "baseSha",
+        "headSha",
+        "branch",
+      ]);
+      if (Object.keys(facts).some((key) => !allowed.has(key)))
+        throw new TypeError(
+          "Publication facts patch contains an unsupported field.",
+        );
+
+      const pullRequestNumber = positiveInteger(
+        facts.pullRequestNumber,
+        "Pull request number",
+      );
+      const pullRequestNodeId = boundedText(
+        facts.pullRequestNodeId,
+        "Pull request node ID",
+        maximumIdentifierBytes,
+      );
+      if (!githubNodeIdPattern.test(pullRequestNodeId))
+        throw new TypeError("Pull request node ID is malformed.");
+      const pullRequestTitle = boundedText(
+        facts.pullRequestTitle,
+        "Pull request title",
+        maximumPullRequestTitleBytes,
+      );
+      const branch = gitRef(facts.branch, "Publication branch");
+      if (current.branch === null || branch !== current.branch)
+        throw new TypeError(
+          "Publication branch does not match the run's assigned branch.",
+        );
+      const pullRequestUrl = validatePullRequestUrl(
+        facts.pullRequestUrl,
+        current.repository,
+        pullRequestNumber,
+      );
+      const baseSha = sha(facts.baseSha, "Base SHA");
+      const headSha = sha(facts.headSha, "Head SHA");
+
+      const updated = await tx
+        .updateTable("runs")
+        .set({
+          pull_request_number: pullRequestNumber,
+          pull_request_node_id: pullRequestNodeId,
+          pull_request_title: pullRequestTitle,
+          pull_request_url: pullRequestUrl,
+          base_sha: baseSha,
+          head_sha: headSha,
+          branch,
+          updated_at: at,
+        })
         .where("id", "=", runId)
         .where("revision", "=", current.revision)
         .executeTakeFirst();

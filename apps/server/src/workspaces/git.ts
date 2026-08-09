@@ -1,4 +1,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import {
+  closeSync,
+  constants as fsConstants,
+  openSync,
+  realpathSync,
+} from "node:fs";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -50,6 +56,15 @@ export interface ReadRunWorktreeDiffInput extends InspectRunWorktreeInput {
   readonly maxBytes?: number;
 }
 
+export interface CommitAndPushRunWorktreeInput
+  extends InspectRunWorktreeInput {}
+
+export interface CommittedRunWorktreeReceipt {
+  readonly branch: string;
+  readonly baseSha: string;
+  readonly headSha: string;
+}
+
 export interface RunWorktreeInspection extends RunWorktreeReceipt {
   readonly baseBranch: "main";
   /** Paths changed from the assigned worktree's base, relative to that worktree. */
@@ -79,6 +94,38 @@ function terminateGitProcessTree(child: ChildProcess): void {
   }
 }
 
+function safeGitEnvironment(): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  for (const key of Object.keys(environment)) {
+    if (
+      key.startsWith("GIT_CONFIG_") ||
+      [
+        "BASH_ENV",
+        "CDPATH",
+        "ENV",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_EXEC_PATH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_WORK_TREE",
+        "SSH_ASKPASS",
+      ].includes(key)
+    ) {
+      delete environment[key];
+    }
+  }
+  environment.GIT_CONFIG_NOSYSTEM = "1";
+  environment.GIT_CONFIG_GLOBAL = "/dev/null";
+  environment.GIT_TERMINAL_PROMPT = "0";
+  return environment;
+}
+
 function runGitProcess(
   cwd: string,
   args: readonly string[],
@@ -87,19 +134,67 @@ function runGitProcess(
   maxOutputBytes = MAX_OUTPUT_BYTES,
 ): Promise<string> {
   return new Promise((resolveGit, rejectGit) => {
-    const child = spawn("git", [...args], {
-      cwd,
-      detached: process.platform !== "win32",
-      env: process.env,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
+    let cwdFd: number | undefined;
+    let spawnCwd = cwd;
+    if (process.platform === "linux") {
+      try {
+        cwdFd = openSync(
+          cwd,
+          fsConstants.O_RDONLY |
+            fsConstants.O_DIRECTORY |
+            fsConstants.O_NOFOLLOW,
+        );
+        const openedPath = realpathSync(`/proc/self/fd/${cwdFd}`);
+        if (openedPath !== realpathSync(cwd)) {
+          throw new WorktreeBoundaryError(
+            "Git working directory changed while it was opened",
+          );
+        }
+        // The child resolves this fd-backed cwd before exec, so replacing the
+        // textual worktree path cannot redirect the Git process elsewhere.
+        spawnCwd = `/proc/self/fd/${cwdFd}`;
+      } catch (cause) {
+        if (cwdFd !== undefined) closeSync(cwdFd);
+        rejectGit(
+          cause instanceof WorktreeBoundaryError
+            ? cause
+            : new WorktreeBoundaryError("Git working directory is not safe"),
+        );
+        return;
+      }
+    }
+
+    // Git can interpret inherited variables such as GIT_DIR, GIT_WORK_TREE,
+    // GIT_INDEX_FILE, GIT_SSH_COMMAND, and GIT_CONFIG_* before it reaches the
+    // commit/push boundary. Keep the same constrained environment for every
+    // child, including read and staging commands.
+    const env = safeGitEnvironment();
+    let child: ChildProcess;
+    try {
+      child = spawn("git", [...args], {
+        cwd: spawnCwd,
+        detached: process.platform !== "win32",
+        env,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch {
+      if (cwdFd !== undefined) closeSync(cwdFd);
+      rejectGit(new WorktreeBoundaryError("Git process could not be started"));
+      return;
+    }
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
     let timedOut = false;
     let outputExceeded = false;
     let settled = false;
+
+    const closeCwd = (): void => {
+      if (cwdFd === undefined) return;
+      closeSync(cwdFd);
+      cwdFd = undefined;
+    };
 
     const capture = (target: "stdout" | "stderr", chunk: Buffer): void => {
       const current = target === "stdout" ? stdout : stderr;
@@ -144,6 +239,7 @@ function runGitProcess(
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      closeCwd();
       // Git can include remotes, credentials, or arbitrary hook output in an
       // exception. Keep the boundary diagnostic deliberately non-sensitive.
       rejectGit(
@@ -169,6 +265,7 @@ function runGitProcess(
       }
       settled = true;
       clearTimeout(timeout);
+      closeCwd();
       resolveGit(stdout.toString("utf8"));
     });
   });
@@ -519,6 +616,17 @@ async function inspectChangedFiles(
   return [...new Set(paths)].toSorted();
 }
 
+function parseChangedPathOutput(
+  worktreePath: string,
+  output: string,
+): readonly string[] {
+  return output
+    .split("\0")
+    .filter((path) => path.length > 0)
+    .map((path) => assertChangedPathContained(worktreePath, path))
+    .toSorted();
+}
+
 async function inspectUntrackedFiles(
   git: GitRunner,
   worktreePath: string,
@@ -551,6 +659,61 @@ interface UntrackedFileIdentity {
   readonly size: number;
   readonly mtimeMs: number;
   readonly ctimeMs: number;
+}
+
+interface DirectoryIdentity {
+  readonly requestedPath: string;
+  readonly canonicalPath: string;
+  readonly dev: number;
+  readonly ino: number;
+  readonly mode: number;
+  readonly ctimeMs: number;
+}
+
+async function inspectDirectoryIdentity(
+  path: string,
+  label: string,
+): Promise<DirectoryIdentity> {
+  const requestedPath = resolve(path);
+  let metadata: Awaited<ReturnType<typeof lstat>>;
+  let canonicalPath: string;
+  try {
+    metadata = await lstat(requestedPath);
+    if (metadata.isSymbolicLink())
+      throw new WorktreeBoundaryError(`${label} must not be a symbolic link`);
+    if (!metadata.isDirectory())
+      throw new WorktreeBoundaryError(`${label} must be a directory`);
+    canonicalPath = await realpath(requestedPath);
+    if (canonicalPath !== requestedPath)
+      throw new WorktreeBoundaryError(
+        `${label} must resolve to its canonical path`,
+      );
+  } catch (cause) {
+    if (cause instanceof WorktreeBoundaryError) throw cause;
+    throw new WorktreeBoundaryError(`${label} is not a stable directory`);
+  }
+  return {
+    requestedPath,
+    canonicalPath,
+    dev: metadata.dev,
+    ino: metadata.ino,
+    mode: metadata.mode,
+    ctimeMs: metadata.ctimeMs,
+  };
+}
+
+function sameDirectoryIdentity(
+  before: DirectoryIdentity,
+  after: DirectoryIdentity,
+): boolean {
+  return (
+    before.requestedPath === after.requestedPath &&
+    before.canonicalPath === after.canonicalPath &&
+    before.dev === after.dev &&
+    before.ino === after.ino &&
+    before.mode === after.mode &&
+    before.ctimeMs === after.ctimeMs
+  );
 }
 
 async function inspectReadableUntrackedFile(
@@ -888,4 +1051,263 @@ export async function readRunWorktreeDiff(
     }
   }
   return rawDiff;
+}
+
+/**
+ * Commit and publish only the assigned run worktree after revalidating every
+ * persisted identity. The operation never force-pushes and returns only the
+ * exact branch/base/head facts needed by the publication boundary.
+ */
+export async function commitAndPushRunWorktree(
+  input: CommitAndPushRunWorktreeInput,
+): Promise<CommittedRunWorktreeReceipt> {
+  const git = input.git ?? realGit;
+  const inspected = await inspectRunWorktree({ ...input, git });
+  if (inspected.changedFiles.length === 0) {
+    throw new WorktreeBoundaryError(
+      "cannot publish a worktree with no intentional changes",
+    );
+  }
+
+  const beforeStage = await inspectRunWorktree({ ...input, git });
+  if (
+    beforeStage.path !== inspected.path ||
+    beforeStage.branch !== inspected.branch ||
+    beforeStage.baseSha !== inspected.baseSha ||
+    beforeStage.headSha !== inspected.headSha ||
+    beforeStage.changedFiles.length !== inspected.changedFiles.length ||
+    beforeStage.changedFiles.some(
+      (path, index) => path !== inspected.changedFiles[index],
+    )
+  ) {
+    throw new WorktreeBoundaryError(
+      "assigned worktree identity or changes changed before staging",
+    );
+  }
+
+  const worktreeBeforeStage = await inspectDirectoryIdentity(
+    beforeStage.path,
+    "worktree path",
+  );
+  const untrackedPaths = await inspectUntrackedFiles(git, beforeStage.path);
+  const untrackedBeforeStage = await Promise.all(
+    untrackedPaths.map((path) =>
+      inspectReadableUntrackedFile(beforeStage.path, path),
+    ),
+  );
+  if (
+    untrackedPaths.some((path) => !beforeStage.changedFiles.includes(path)) ||
+    untrackedPaths.length !==
+      beforeStage.changedFiles.filter((path) => untrackedPaths.includes(path))
+        .length
+  ) {
+    throw new WorktreeBoundaryError("untracked changes changed before staging");
+  }
+
+  await runGit(
+    git,
+    beforeStage.path,
+    ["add", "--", ...beforeStage.changedFiles],
+    "stage worktree changes",
+  );
+
+  const worktreeAfterStage = await inspectDirectoryIdentity(
+    beforeStage.path,
+    "worktree path",
+  );
+  if (!sameDirectoryIdentity(worktreeBeforeStage, worktreeAfterStage)) {
+    throw new WorktreeBoundaryError(
+      "worktree path changed while staging changes",
+    );
+  }
+  for (const before of untrackedBeforeStage) {
+    const after = await inspectReadableUntrackedFile(
+      beforeStage.path,
+      before.path,
+    );
+    if (!sameUntrackedIdentity(before, after)) {
+      throw new WorktreeBoundaryError(
+        "untracked path changed while staging changes",
+      );
+    }
+  }
+
+  const stagedFiles = parseChangedPathOutput(
+    beforeStage.path,
+    await runGit(
+      git,
+      beforeStage.path,
+      ["diff", "--cached", "--name-only", "-z", "--"],
+      "inspect staged changes",
+    ),
+  );
+  if (
+    stagedFiles.length !== beforeStage.changedFiles.length ||
+    stagedFiles.some((path, index) => path !== beforeStage.changedFiles[index])
+  ) {
+    throw new WorktreeBoundaryError(
+      "staged changes do not match the assigned worktree changes",
+    );
+  }
+
+  const stagedInspection = await inspectRunWorktree({
+    ...input,
+    git,
+  });
+  if (
+    stagedInspection.path !== beforeStage.path ||
+    stagedInspection.branch !== beforeStage.branch ||
+    stagedInspection.baseSha !== beforeStage.baseSha ||
+    stagedInspection.headSha !== beforeStage.headSha ||
+    stagedInspection.changedFiles.length !== beforeStage.changedFiles.length ||
+    stagedInspection.changedFiles.some(
+      (path, index) => path !== beforeStage.changedFiles[index],
+    )
+  ) {
+    throw new WorktreeBoundaryError(
+      "assigned worktree identity or changes changed while staging",
+    );
+  }
+
+  const worktreeBeforeCommit = await inspectDirectoryIdentity(
+    stagedInspection.path,
+    "worktree path",
+  );
+  for (const before of untrackedBeforeStage) {
+    const after = await inspectReadableUntrackedFile(
+      stagedInspection.path,
+      before.path,
+    );
+    if (!sameUntrackedIdentity(before, after)) {
+      throw new WorktreeBoundaryError(
+        "untracked path changed before creating the publication commit",
+      );
+    }
+  }
+
+  await runGit(
+    git,
+    stagedInspection.path,
+    [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "commit",
+      "--no-verify",
+      "-m",
+      `feat: publish issue #${input.issueNumber} run ${input.runId}`,
+    ],
+    "commit worktree changes",
+  );
+
+  const committedHeadSha = await inspectGit(
+    git,
+    stagedInspection.path,
+    ["rev-parse", "HEAD"],
+    "committed worktree HEAD",
+  );
+  assertReceiptSha(committedHeadSha, "committed worktree HEAD");
+  if (committedHeadSha === stagedInspection.headSha) {
+    throw new WorktreeBoundaryError("Git commit did not advance worktree HEAD");
+  }
+  const worktreeAfterCommit = await inspectDirectoryIdentity(
+    stagedInspection.path,
+    "worktree path",
+  );
+  if (!sameDirectoryIdentity(worktreeBeforeCommit, worktreeAfterCommit)) {
+    throw new WorktreeBoundaryError(
+      "worktree path changed while creating the publication commit",
+    );
+  }
+
+  const committedExpected = {
+    path: stagedInspection.path,
+    branch: stagedInspection.branch,
+    baseSha: stagedInspection.baseSha,
+    headSha: committedHeadSha,
+  };
+  const committedInspection = await inspectRunWorktree({
+    ...input,
+    expected: committedExpected,
+    git,
+  });
+  if (committedInspection.changedFiles.length !== 0) {
+    throw new WorktreeBoundaryError(
+      "worktree changed while creating its publication commit",
+    );
+  }
+
+  const worktreeBeforePush = await inspectDirectoryIdentity(
+    committedInspection.path,
+    "worktree path",
+  );
+  await runGit(
+    git,
+    committedInspection.path,
+    [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "push",
+      "--no-verify",
+      "origin",
+      committedInspection.branch,
+    ],
+    "push ticket branch",
+  );
+  const worktreeAfterPush = await inspectDirectoryIdentity(
+    committedInspection.path,
+    "worktree path",
+  );
+  if (!sameDirectoryIdentity(worktreeBeforePush, worktreeAfterPush)) {
+    throw new WorktreeBoundaryError(
+      "worktree path changed while pushing the ticket branch",
+    );
+  }
+
+  const remoteOutput = await runGit(
+    git,
+    committedInspection.path,
+    ["ls-remote", "--heads", "origin", committedInspection.branch],
+    "verify pushed ticket branch",
+  );
+  const remoteLines = remoteOutput
+    .trim()
+    .split(/\r?\n/u)
+    .filter((line) => line.length > 0);
+  if (remoteLines.length !== 1) {
+    throw new WorktreeBoundaryError(
+      "Git returned an invalid pushed ticket branch",
+    );
+  }
+  const remoteParts = remoteLines[0]?.split(/\s+/u);
+  if (
+    remoteParts === undefined ||
+    remoteParts.length !== 2 ||
+    remoteParts[1] !== `refs/heads/${committedInspection.branch}`
+  ) {
+    throw new WorktreeBoundaryError(
+      "Git returned an invalid pushed ticket branch",
+    );
+  }
+  assertReceiptSha(remoteParts[0], "pushed ticket branch SHA");
+  if (remoteParts[0] !== committedHeadSha) {
+    throw new WorktreeBoundaryError(
+      "pushed ticket branch HEAD does not match the committed HEAD",
+    );
+  }
+
+  const finalInspection = await inspectRunWorktree({
+    ...input,
+    expected: committedExpected,
+    git,
+  });
+  if (finalInspection.changedFiles.length !== 0) {
+    throw new WorktreeBoundaryError(
+      "assigned worktree changed while publishing its ticket branch",
+    );
+  }
+  return {
+    branch: finalInspection.branch,
+    baseSha: finalInspection.baseSha,
+    headSha: finalInspection.headSha,
+  };
 }

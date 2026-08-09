@@ -9,6 +9,23 @@ import type {
   ProjectStatusMoveResult,
   ProjectStatusMutation,
 } from "../../apps/server/src/github/project.js";
+import {
+  assertCheckName,
+  assertObserveRequiredChecksRequest,
+  assertPublishPullRequestRequest,
+  assertReadPullRequestRequest,
+  assertReconcilePullRequestRequest,
+  assertRequiredCheckState,
+  assertRequiredChecksReceipt,
+  GitHubPublicationBoundaryError,
+  type GitHubPublicationGateway,
+  type ObserveRequiredChecksRequest,
+  type PublishPullRequestRequest,
+  type PullRequestReceipt,
+  type ReconcilePullRequestRequest,
+  type RequiredCheckState,
+  type RequiredChecksReceipt,
+} from "../../apps/server/src/github/publication.js";
 
 type MutableProjectItem = {
   projectItemId: string;
@@ -415,5 +432,430 @@ export class FakeGitHubProjectGateway implements GitHubProjectGateway {
       actualIssueNodeId: item.issueNodeId,
       actualIssueNumber: item.issueNumber,
     };
+  }
+}
+
+type MutablePullRequest = {
+  -readonly [Key in keyof PullRequestReceipt]: PullRequestReceipt[Key];
+} & { body: string };
+
+export interface FakeGitHubPublicationConfiguration {
+  readonly repository: string;
+  readonly requiredChecks: readonly string[];
+}
+
+export interface PublicationMutation {
+  readonly effectKey: string;
+  readonly repository: string;
+  readonly issueNumber: number;
+  readonly number: number;
+  readonly nodeId: string;
+  readonly baseSha: string;
+  readonly headSha: string;
+  readonly request: PublishPullRequestRequest;
+}
+
+function clonePullRequest(request: MutablePullRequest): PullRequestReceipt {
+  return {
+    repository: request.repository,
+    number: request.number,
+    nodeId: request.nodeId,
+    url: request.url,
+    title: request.title,
+    issueNumber: request.issueNumber,
+    isDraft: request.isDraft,
+    baseBranch: request.baseBranch,
+    baseSha: request.baseSha,
+    headBranch: request.headBranch,
+    headSha: request.headSha,
+  };
+}
+
+function clonePublishRequest(
+  request: PublishPullRequestRequest,
+): PublishPullRequestRequest {
+  return { ...request };
+}
+
+function samePublishRequest(
+  left: PublishPullRequestRequest,
+  right: PublishPullRequestRequest,
+): boolean {
+  return (
+    left.repository === right.repository &&
+    left.issueNumber === right.issueNumber &&
+    left.effectKey === right.effectKey &&
+    left.title === right.title &&
+    left.body === right.body &&
+    left.baseBranch === right.baseBranch &&
+    left.baseSha === right.baseSha &&
+    left.headBranch === right.headBranch &&
+    left.headSha === right.headSha
+  );
+}
+
+function sameRequestTarget(
+  request: PublishPullRequestRequest,
+  pullRequest: MutablePullRequest,
+): boolean {
+  return (
+    request.repository === pullRequest.repository &&
+    request.issueNumber === pullRequest.issueNumber &&
+    request.title === pullRequest.title &&
+    request.baseBranch === pullRequest.baseBranch &&
+    request.baseSha === pullRequest.baseSha &&
+    request.headBranch === pullRequest.headBranch &&
+    request.headSha === pullRequest.headSha
+  );
+}
+
+function publicationFailure(
+  kind: ConstructorParameters<typeof GitHubPublicationBoundaryError>[0],
+  message: string,
+): never {
+  throw new GitHubPublicationBoundaryError(kind, message);
+}
+
+/**
+ * Stateful, network-free GitHub publication fake. It deliberately stores PR
+ * and check state separately so tests can model a provider-side head change
+ * or partial check suite without mutating the caller's receipts.
+ */
+export class FakeGitHubPublicationGateway implements GitHubPublicationGateway {
+  readonly #repository: string;
+  readonly #requiredCheckNames: readonly string[];
+  readonly #pullRequests = new Map<number, MutablePullRequest>();
+  readonly #checkStates = new Map<
+    number,
+    { headSha: string; states: Map<string, RequiredCheckState> }
+  >();
+  readonly #mutations: PublicationMutation[] = [];
+  readonly #mutationsByEffectKey = new Map<string, PublicationMutation>();
+  #nextNumber = 1;
+
+  constructor(configuration: FakeGitHubPublicationConfiguration) {
+    if (
+      typeof configuration.repository !== "string" ||
+      configuration.repository.trim().length === 0
+    ) {
+      throw new Error("Publication repository must not be blank");
+    }
+    if (
+      !Array.isArray(configuration.requiredChecks) ||
+      configuration.requiredChecks.length === 0
+    ) {
+      throw new Error("At least one required check is needed");
+    }
+    const names = configuration.requiredChecks.map((name) =>
+      assertCheckName(name),
+    );
+    if (new Set(names).size !== names.length) {
+      throw new Error("Required check names must be unique");
+    }
+    this.#repository = configuration.repository;
+    this.#requiredCheckNames = Object.freeze([...names]);
+  }
+
+  async createPullRequest(
+    value: PublishPullRequestRequest,
+  ): Promise<PullRequestReceipt> {
+    const request = assertPublishPullRequestRequest(value);
+    this.#assertRepository(request.repository);
+
+    const previousMutation = this.#mutationsByEffectKey.get(request.effectKey);
+    if (previousMutation !== undefined) {
+      if (!samePublishRequest(previousMutation.request, request)) {
+        publicationFailure(
+          "effect_key_conflict",
+          "Publication effect key was reused with different request facts",
+        );
+      }
+      const existing = this.#pullRequests.get(previousMutation.number);
+      if (existing?.isDraft === true) {
+        publicationFailure(
+          "pull_request_is_draft",
+          "Publication replay requires a non-draft pull request",
+        );
+      }
+      if (existing === undefined || !sameRequestTarget(request, existing)) {
+        publicationFailure(
+          "head_drift",
+          "The replayed publication no longer matches the recorded PR",
+        );
+      }
+      return clonePullRequest(existing);
+    }
+
+    const existing = [...this.#pullRequests.values()].find(
+      (pullRequest) =>
+        pullRequest.repository === request.repository &&
+        pullRequest.issueNumber === request.issueNumber &&
+        pullRequest.headBranch === request.headBranch,
+    );
+    if (existing !== undefined) {
+      if (!sameRequestTarget(request, existing) || existing.isDraft) {
+        publicationFailure(
+          "pull_request_mismatch",
+          "An existing linked PR does not match the requested publication",
+        );
+      }
+      return clonePullRequest(existing);
+    }
+
+    const number = this.#nextNumber;
+    this.#nextNumber += 1;
+    const created: MutablePullRequest = {
+      repository: request.repository,
+      number,
+      nodeId: `PR_node_${number}`,
+      url: `https://github.com/${request.repository}/pull/${number}`,
+      title: request.title,
+      issueNumber: request.issueNumber,
+      isDraft: false,
+      baseBranch: request.baseBranch,
+      baseSha: request.baseSha,
+      headBranch: request.headBranch,
+      headSha: request.headSha,
+      body: request.body,
+    };
+    this.#pullRequests.set(number, created);
+    this.#checkStates.set(number, {
+      headSha: created.headSha,
+      states: new Map(),
+    });
+    const mutation: PublicationMutation = {
+      effectKey: request.effectKey,
+      repository: request.repository,
+      issueNumber: request.issueNumber,
+      number,
+      nodeId: created.nodeId,
+      baseSha: created.baseSha,
+      headSha: created.headSha,
+      request: clonePublishRequest(request),
+    };
+    this.#mutations.push(mutation);
+    this.#mutationsByEffectKey.set(request.effectKey, mutation);
+    return clonePullRequest(created);
+  }
+
+  async reconcilePullRequest(
+    value: ReconcilePullRequestRequest,
+  ): Promise<PullRequestReceipt> {
+    const request = assertReconcilePullRequestRequest(value);
+    this.#assertRepository(request.repository);
+    const pullRequest = this.#pullRequests.get(request.expectedNumber);
+    if (pullRequest === undefined) {
+      publicationFailure(
+        "pull_request_not_found",
+        "The recorded pull request was not found for reconciliation",
+      );
+    }
+    if (
+      pullRequest.nodeId !== request.expectedNodeId ||
+      pullRequest.repository !== request.repository ||
+      pullRequest.issueNumber !== request.issueNumber ||
+      pullRequest.title !== request.title ||
+      pullRequest.baseBranch !== request.baseBranch ||
+      pullRequest.baseSha !== request.baseSha ||
+      pullRequest.headBranch !== request.headBranch ||
+      pullRequest.headSha !== request.headSha ||
+      pullRequest.isDraft
+    ) {
+      publicationFailure(
+        "pull_request_mismatch",
+        "The recorded pull request does not match the repaired publication",
+      );
+    }
+    return clonePullRequest(pullRequest);
+  }
+
+  async readPullRequest(value: unknown): Promise<PullRequestReceipt> {
+    const request = assertReadPullRequestRequest(value);
+    this.#assertRepository(request.repository);
+    const pullRequest = this.#pullRequests.get(request.number);
+    if (pullRequest === undefined) {
+      publicationFailure(
+        "pull_request_not_found",
+        "The requested pull request was not found",
+      );
+    }
+    if (pullRequest.isDraft) {
+      publicationFailure(
+        "pull_request_is_draft",
+        "Publication requires a non-draft pull request",
+      );
+    }
+    if (
+      pullRequest.repository !== request.repository ||
+      pullRequest.issueNumber !== request.issueNumber ||
+      pullRequest.nodeId !== request.expectedNodeId ||
+      pullRequest.title !== request.expectedTitle ||
+      pullRequest.baseBranch !== request.expectedBaseBranch ||
+      pullRequest.baseSha !== request.expectedBaseSha ||
+      pullRequest.headBranch !== request.expectedHeadBranch
+    ) {
+      publicationFailure(
+        "pull_request_mismatch",
+        "The pull request identity or base does not match the expected receipt",
+      );
+    }
+    if (pullRequest.headSha !== request.expectedHeadSha) {
+      publicationFailure(
+        "head_drift",
+        "The pull request head changed after publication",
+      );
+    }
+    return clonePullRequest(pullRequest);
+  }
+
+  async observeRequiredChecks(
+    value: ObserveRequiredChecksRequest,
+  ): Promise<RequiredChecksReceipt> {
+    const request = assertObserveRequiredChecksRequest(value);
+    this.#assertRepository(request.repository);
+    const pullRequest = this.#pullRequests.get(request.number);
+    if (pullRequest === undefined) {
+      publicationFailure(
+        "pull_request_not_found",
+        "The requested pull request was not found",
+      );
+    }
+    if (pullRequest.nodeId !== request.nodeId) {
+      publicationFailure(
+        "pull_request_mismatch",
+        "The observed pull request node does not match the expected PR",
+      );
+    }
+    if (pullRequest.isDraft) {
+      publicationFailure(
+        "pull_request_is_draft",
+        "Publication checks require a non-draft pull request",
+      );
+    }
+    const checkState = this.#checkStates.get(request.number);
+    if (checkState === undefined) {
+      publicationFailure(
+        "required_checks_mismatch",
+        "Required check state is unavailable for the pull request",
+      );
+    }
+    const headDrifted =
+      pullRequest.headSha !== request.expectedHeadSha ||
+      pullRequest.baseBranch !== request.expectedBaseBranch ||
+      pullRequest.baseSha !== request.expectedBaseSha;
+    const requiredChecks = this.#requiredCheckNames.map((name) => ({
+      name,
+      state: headDrifted
+        ? ("pending" as const)
+        : checkState.headSha === pullRequest.headSha
+          ? (checkState.states.get(name) ?? "pending")
+          : "pending",
+    }));
+    const aggregate: RequiredChecksReceipt["aggregate"] = headDrifted
+      ? "head_drift"
+      : requiredChecks.some((check) => check.state === "failure")
+        ? "failed"
+        : requiredChecks.every((check) => check.state === "success")
+          ? "green"
+          : "pending";
+    const receipt: RequiredChecksReceipt = {
+      repository: pullRequest.repository,
+      number: pullRequest.number,
+      nodeId: pullRequest.nodeId,
+      headSha: pullRequest.headSha,
+      requiredCheckNames: [...this.#requiredCheckNames],
+      requiredChecks,
+      headDrift: headDrifted,
+      aggregate,
+    };
+    return assertRequiredChecksReceipt(receipt);
+  }
+
+  setRequiredCheck(
+    number: number,
+    headSha: string,
+    name: string,
+    state: RequiredCheckState,
+  ): void {
+    const checkName = assertCheckName(name);
+    const checkState = assertRequiredCheckState(state);
+    if (!this.#requiredCheckNames.includes(checkName)) {
+      throw new Error(`Unknown required check: ${checkName}`);
+    }
+    if (!Number.isSafeInteger(number) || number <= 0)
+      throw new Error("Pull request number must be a positive integer");
+    if (!/^[0-9a-f]{40}$/u.test(headSha))
+      throw new Error("Required check head must be a SHA-1");
+    const states = this.#checkStates.get(number);
+    const pullRequest = this.#pullRequests.get(number);
+    if (states === undefined || pullRequest === undefined)
+      throw new Error("Required check state is missing");
+    if (pullRequest.headSha !== headSha)
+      publicationFailure(
+        "head_drift",
+        "Required check mutation targets a stale PR head",
+      );
+    if (states.headSha !== headSha) {
+      states.headSha = headSha;
+      states.states = new Map();
+    }
+    states.states.set(checkName, checkState);
+  }
+
+  setPullRequestHead(number: number, headSha: string): void {
+    if (!Number.isSafeInteger(number) || number <= 0) {
+      throw new Error("Pull request number must be a positive integer");
+    }
+    if (!/^[0-9a-f]{40}$/u.test(headSha)) {
+      throw new Error("Pull request head must be a SHA-1");
+    }
+    const pullRequest = this.#pullRequests.get(number);
+    if (pullRequest === undefined) throw new Error("Unknown pull request");
+    pullRequest.headSha = headSha;
+    const checkState = this.#checkStates.get(number);
+    if (checkState !== undefined) {
+      checkState.headSha = headSha;
+      checkState.states = new Map();
+    }
+  }
+
+  /** Advance the linked PR head between bounded repair rounds. */
+  advancePullRequestHead(number: number, headSha: string): void {
+    this.setPullRequestHead(number, headSha);
+  }
+
+  setPullRequestBase(number: number, baseSha: string): void {
+    if (!/^[0-9a-f]{40}$/u.test(baseSha)) {
+      throw new Error("Pull request base must be a SHA-1");
+    }
+    const pullRequest = this.#pullRequests.get(number);
+    if (pullRequest === undefined) throw new Error("Unknown pull request");
+    pullRequest.baseSha = baseSha;
+  }
+
+  setPullRequestDraft(number: number, isDraft: boolean): void {
+    const pullRequest = this.#pullRequests.get(number);
+    if (pullRequest === undefined) throw new Error("Unknown pull request");
+    pullRequest.isDraft = isDraft;
+  }
+
+  publicationMutations(): readonly PublicationMutation[] {
+    return Object.freeze(
+      this.#mutations.map((mutation) =>
+        Object.freeze({
+          ...mutation,
+          request: clonePublishRequest(mutation.request),
+        }),
+      ),
+    );
+  }
+
+  #assertRepository(repository: string): void {
+    if (repository !== this.#repository) {
+      publicationFailure(
+        "repository_mismatch",
+        "The publication request targets a different repository",
+      );
+    }
   }
 }
