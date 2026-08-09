@@ -1,3 +1,26 @@
+import {
+  assertConditionalProjectDoneMoveRequest,
+  assertMergeCandidateReceipt,
+  assertMergeCandidateRequest,
+  assertMergeReceipt,
+  assertMergeRequest,
+  assertObserveStagingRequest,
+  assertStagingObservation,
+  type ConditionalProjectDoneMoveRequest,
+  GitHubDeliveryBoundaryError,
+  type GitHubDeliveryGateway,
+  type MergeCandidateReceipt,
+  type MergeCandidateRequest,
+  type MergeMethod,
+  type MergeReceipt,
+  type MergeRequest,
+  type MergeThreadReceipt,
+  type ObserveStagingRequest,
+  type ProjectDoneMoveResult,
+  type StagingDeploymentReceipt,
+  type StagingObservation,
+  type StagingWorkflowRunReceipt,
+} from "../../apps/server/src/github/delivery.js";
 import type {
   ConditionalProjectStatusMove,
   GitHubProjectGateway,
@@ -857,5 +880,731 @@ export class FakeGitHubPublicationGateway implements GitHubPublicationGateway {
         "The publication request targets a different repository",
       );
     }
+  }
+}
+
+type MutableDeliveryPullRequest = {
+  repository: string;
+  number: number;
+  issueNumber: number;
+  nodeId: string;
+  isDraft: boolean;
+  title: string;
+  baseBranch: string;
+  baseSha: string;
+  headBranch: string;
+  headSha: string;
+};
+
+type DeliveryMutation = {
+  effectKey: string;
+  request: MergeRequest;
+  receipt: MergeReceipt;
+};
+
+type DoneMutation = {
+  effectKey: string;
+  request: ConditionalProjectDoneMoveRequest;
+  item: ProjectItem;
+};
+
+type FakeGitHubDeliveryConfiguration = {
+  readonly repository: string;
+  readonly requiredChecks: readonly string[];
+  readonly staging: {
+    readonly workflow: string;
+    readonly environment: string;
+  };
+};
+
+function cloneDeliveryRequest(request: MergeRequest): MergeRequest {
+  return { ...request };
+}
+
+function sameDeliveryRequest(left: MergeRequest, right: MergeRequest): boolean {
+  return (
+    left.repository === right.repository &&
+    left.number === right.number &&
+    left.issueNumber === right.issueNumber &&
+    left.nodeId === right.nodeId &&
+    left.expectedTitle === right.expectedTitle &&
+    left.expectedBaseBranch === right.expectedBaseBranch &&
+    left.expectedBaseSha === right.expectedBaseSha &&
+    left.expectedHeadBranch === right.expectedHeadBranch &&
+    left.expectedHeadSha === right.expectedHeadSha &&
+    left.effectKey === right.effectKey &&
+    left.method === right.method
+  );
+}
+
+function deliveryFailure(
+  kind: ConstructorParameters<typeof GitHubDeliveryBoundaryError>[0],
+  message: string,
+): never {
+  throw new GitHubDeliveryBoundaryError(kind, message);
+}
+
+function cloneDeliveryReceipt(receipt: MergeReceipt): MergeReceipt {
+  return { ...receipt };
+}
+
+function cloneThreads(
+  threads: readonly MergeThreadReceipt[],
+): readonly MergeThreadReceipt[] {
+  return Object.freeze(threads.map((thread) => Object.freeze({ ...thread })));
+}
+
+/**
+ * Stateful, network-free fake for the Block 7 delivery boundary.  PR facts,
+ * provider-side drift, merge effects, deployments, and conditional project
+ * moves are independent mutable state so tests can exercise reconciliation.
+ */
+export class FakeGitHubDeliveryGateway implements GitHubDeliveryGateway {
+  readonly #repository: string;
+  readonly #requiredCheckNames: readonly string[];
+  readonly #stagingWorkflow: string;
+  readonly #stagingEnvironment: string;
+  readonly #pullRequests = new Map<number, MutableDeliveryPullRequest>();
+  readonly #checkStates = new Map<
+    number,
+    { headSha: string; states: Map<string, RequiredCheckState> }
+  >();
+  readonly #threads = new Map<number, MergeThreadReceipt[]>();
+  readonly #mergeability = new Map<
+    number,
+    MergeCandidateReceipt["mergeability"]
+  >();
+  readonly #permittedMethods = new Map<number, MergeMethod[]>();
+  readonly #mergeMutations: DeliveryMutation[] = [];
+  readonly #mergeMutationsByEffectKey = new Map<string, DeliveryMutation>();
+  readonly #mergedReceipts = new Map<number, MergeReceipt>();
+  readonly #workflowRuns = new Map<string, StagingWorkflowRunReceipt>();
+  readonly #deployment: { current: StagingDeploymentReceipt | undefined } = {
+    current: undefined,
+  };
+  readonly #projectItems = new Map<string, MutableProjectItem>();
+  readonly #doneMutations: DoneMutation[] = [];
+  readonly #doneMutationsByEffectKey = new Map<string, DoneMutation>();
+  readonly #revisionCounters = new Map<string, number>();
+  #nextMergeSha = "c".repeat(40);
+  #mergeFailure: "merge_prevented" | "merge_ambiguous" | undefined;
+
+  constructor(configuration: FakeGitHubDeliveryConfiguration) {
+    if (
+      typeof configuration.repository !== "string" ||
+      configuration.repository.trim().length === 0
+    ) {
+      throw new Error("Delivery repository must not be blank");
+    }
+    if (
+      !Array.isArray(configuration.requiredChecks) ||
+      configuration.requiredChecks.length === 0
+    ) {
+      throw new Error("At least one required check is needed");
+    }
+    const names = configuration.requiredChecks.map((name) =>
+      assertCheckName(name),
+    );
+    if (new Set(names).size !== names.length) {
+      throw new Error("Required check names must be unique");
+    }
+    if (
+      typeof configuration.staging?.workflow !== "string" ||
+      configuration.staging.workflow.trim().length === 0 ||
+      typeof configuration.staging?.environment !== "string" ||
+      configuration.staging.environment.trim().length === 0
+    ) {
+      throw new Error("Staging workflow and environment are required");
+    }
+    this.#repository = configuration.repository;
+    this.#requiredCheckNames = Object.freeze([...names]);
+    this.#stagingWorkflow = configuration.staging.workflow;
+    this.#stagingEnvironment = configuration.staging.environment;
+  }
+
+  seedPullRequest(value: MergeCandidateReceipt): void {
+    const candidate = assertMergeCandidateReceipt(value);
+    this.#assertRepository(candidate.repository);
+    if (
+      candidate.requiredChecks.requiredCheckNames.join("\u0000") !==
+      this.#requiredCheckNames.join("\u0000")
+    ) {
+      throw new Error("Seeded checks do not match configured required checks");
+    }
+    this.#pullRequests.set(candidate.number, {
+      repository: candidate.repository,
+      number: candidate.number,
+      issueNumber: candidate.issueNumber,
+      nodeId: candidate.nodeId,
+      isDraft: candidate.isDraft,
+      title: candidate.title,
+      baseBranch: candidate.baseBranch,
+      baseSha: candidate.baseSha,
+      headBranch: candidate.headBranch,
+      headSha: candidate.headSha,
+    });
+    this.#checkStates.set(candidate.number, {
+      headSha: candidate.headSha,
+      states: new Map(
+        candidate.requiredChecks.requiredChecks.map((check) => [
+          check.name,
+          check.state,
+        ]),
+      ),
+    });
+    this.#threads.set(
+      candidate.number,
+      candidate.threads.map((thread) => ({ ...thread })),
+    );
+    this.#mergeability.set(candidate.number, candidate.mergeability);
+    this.#permittedMethods.set(candidate.number, [
+      ...candidate.permittedMergeMethods,
+    ]);
+  }
+
+  async readMergeCandidate(
+    value: MergeCandidateRequest,
+  ): Promise<MergeCandidateReceipt> {
+    const request = assertMergeCandidateRequest(value);
+    this.#assertRepository(request.repository);
+    return this.#readCandidate(request);
+  }
+
+  async mergePullRequest(value: MergeRequest): Promise<MergeReceipt> {
+    const request = assertMergeRequest(value);
+    this.#assertRepository(request.repository);
+    const previous = this.#mergeMutationsByEffectKey.get(request.effectKey);
+    if (previous !== undefined) {
+      if (!sameDeliveryRequest(previous.request, request)) {
+        deliveryFailure(
+          "effect_key_conflict",
+          "Merge effect key was reused with different request facts",
+        );
+      }
+      return cloneDeliveryReceipt(previous.receipt);
+    }
+    const candidate = this.#readCandidate(request);
+    this.#assertMergeRequestMatchesCandidate(request, candidate);
+    if (candidate.requiredChecks.aggregate !== "green") {
+      deliveryFailure(
+        "required_checks_not_green",
+        "The merge candidate does not have green required checks",
+      );
+    }
+    if (candidate.threads.some((thread) => !thread.resolved)) {
+      deliveryFailure(
+        "unresolved_threads",
+        "The merge candidate has unresolved review threads",
+      );
+    }
+    if (candidate.mergeability === "conflicting") {
+      deliveryFailure("merge_conflict", "The merge candidate is not mergeable");
+    }
+    if (candidate.mergeability === "unknown") {
+      deliveryFailure(
+        "mergeability_unknown",
+        "The merge candidate mergeability is unknown",
+      );
+    }
+    if (!candidate.permittedMergeMethods.includes(request.method)) {
+      deliveryFailure(
+        "merge_method_not_permitted",
+        "The requested merge method is not permitted",
+      );
+    }
+    if (this.#mergeFailure !== undefined) {
+      deliveryFailure(
+        this.#mergeFailure,
+        this.#mergeFailure === "merge_prevented"
+          ? "The repository prevented the merge"
+          : "The merge result was ambiguous",
+      );
+    }
+    const receipt = assertMergeReceipt({
+      repository: candidate.repository,
+      number: candidate.number,
+      issueNumber: candidate.issueNumber,
+      nodeId: candidate.nodeId,
+      method: request.method,
+      baseBranch: candidate.baseBranch,
+      baseSha: candidate.baseSha,
+      headBranch: candidate.headBranch,
+      headSha: candidate.headSha,
+      mergeSha: this.#nextMergeSha,
+    });
+    this.#nextMergeSha = this.#nextSha(receipt.mergeSha);
+    const mutation: DeliveryMutation = {
+      effectKey: request.effectKey,
+      request: cloneDeliveryRequest(request),
+      receipt,
+    };
+    this.#mergeMutations.push(mutation);
+    this.#mergeMutationsByEffectKey.set(request.effectKey, mutation);
+    this.#mergedReceipts.set(receipt.number, receipt);
+    return cloneDeliveryReceipt(receipt);
+  }
+
+  async observeStaging(
+    value: ObserveStagingRequest,
+  ): Promise<StagingObservation> {
+    const request = assertObserveStagingRequest(value);
+    this.#assertRepository(request.repository);
+    if (
+      request.workflow !== this.#stagingWorkflow ||
+      request.environment !== this.#stagingEnvironment
+    ) {
+      deliveryFailure(
+        "staging_target_mismatch",
+        "The staging observation target does not match configuration",
+      );
+    }
+    const workflowRun = this.#workflowRuns.get(request.mergeSha);
+    const deployment = this.#deployment.current;
+    let outcome: StagingObservation["outcome"] = "pending";
+    if (
+      workflowRun?.status === "completed" &&
+      workflowRun.conclusion !== "success"
+    ) {
+      outcome = "failed";
+    } else if (
+      workflowRun?.status === "completed" &&
+      workflowRun.conclusion === "success" &&
+      deployment?.state === "failure"
+    ) {
+      outcome = "failed";
+    } else if (
+      workflowRun?.status === "completed" &&
+      workflowRun.conclusion === "success" &&
+      deployment !== undefined &&
+      deployment.state === "success" &&
+      deployment.deployedSha !== request.mergeSha
+    ) {
+      outcome = "sha_mismatch";
+    } else if (
+      workflowRun?.status === "completed" &&
+      workflowRun.conclusion === "success" &&
+      deployment?.state === "success" &&
+      deployment.deployedSha === request.mergeSha
+    ) {
+      outcome = "deployed";
+    }
+    return assertStagingObservation({
+      repository: request.repository,
+      workflow: request.workflow,
+      environment: request.environment,
+      mergeSha: request.mergeSha,
+      workflowRun,
+      deployment,
+      outcome,
+    });
+  }
+
+  async moveProjectItemToDone(
+    value: ConditionalProjectDoneMoveRequest,
+  ): Promise<ProjectDoneMoveResult> {
+    const request = assertConditionalProjectDoneMoveRequest(value);
+    if (request.repository !== this.#repository) {
+      return { outcome: "rejected", reason: { kind: "repository_mismatch" } };
+    }
+    const previous = this.#doneMutationsByEffectKey.get(request.effectKey);
+    if (previous !== undefined) {
+      if (!this.#sameDoneRequest(previous.request, request)) {
+        return { outcome: "rejected", reason: { kind: "effect_key_conflict" } };
+      }
+      const current = this.#projectItems.get(request.itemId);
+      if (
+        current === undefined ||
+        current.status !== previous.item.status ||
+        current.revision !== previous.item.revision
+      ) {
+        return {
+          outcome: "rejected",
+          reason: {
+            kind: "project_revision_mismatch",
+            expectedRevision: previous.item.revision,
+            actualRevision: current?.revision ?? "missing",
+          },
+        };
+      }
+      return { outcome: "already_applied", item: cloneItem(current) };
+    }
+    const item = this.#projectItems.get(request.itemId);
+    if (item === undefined) {
+      return { outcome: "rejected", reason: { kind: "project_not_found" } };
+    }
+    if (
+      item.repository !== request.repository ||
+      item.projectId !== request.projectId ||
+      item.projectNumber !== request.projectNumber ||
+      item.issueNodeId !== request.issueNodeId ||
+      item.issueNumber !== request.issueNumber
+    ) {
+      return {
+        outcome: "rejected",
+        reason: { kind: "project_mapping_mismatch" },
+      };
+    }
+    if (!this.#mergedReceiptsBySha(request.mergeSha)) {
+      return { outcome: "rejected", reason: { kind: "merge_not_observed" } };
+    }
+    if (item.revision !== request.expectedRevision) {
+      return {
+        outcome: "rejected",
+        reason: {
+          kind: "project_revision_mismatch",
+          expectedRevision: request.expectedRevision,
+          actualRevision: item.revision,
+        },
+      };
+    }
+    if (item.status !== request.fromStatus) {
+      return {
+        outcome: "rejected",
+        reason: {
+          kind: "project_status_mismatch",
+          expectedStatus: request.fromStatus,
+          actualStatus: item.status,
+        },
+      };
+    }
+    item.status = request.toStatus;
+    item.revision = this.#nextRevision(request.itemId, item.revision);
+    const observed = cloneItem(item);
+    const mutation: DoneMutation = {
+      effectKey: request.effectKey,
+      request: { ...request },
+      item: observed,
+    };
+    this.#doneMutations.push(mutation);
+    this.#doneMutationsByEffectKey.set(request.effectKey, mutation);
+    return { outcome: "moved", item: cloneItem(item) };
+  }
+
+  setRequiredCheck(
+    number: number,
+    headSha: string,
+    name: string,
+    state: RequiredCheckState,
+  ): void {
+    const checkName = assertCheckName(name);
+    const checkState = assertRequiredCheckState(state);
+    const pullRequest = this.#pullRequests.get(number);
+    const states = this.#checkStates.get(number);
+    if (pullRequest === undefined || states === undefined) {
+      throw new Error("Required check state is missing");
+    }
+    if (!this.#requiredCheckNames.includes(checkName)) {
+      throw new Error("Unknown required check");
+    }
+    if (pullRequest.headSha !== headSha) {
+      deliveryFailure(
+        "head_drift",
+        "Required check mutation targets a stale PR head",
+      );
+    }
+    states.headSha = headSha;
+    states.states.set(checkName, checkState);
+  }
+
+  setPullRequestHead(number: number, headSha: string): void {
+    if (!/^[0-9a-f]{40}$/u.test(headSha))
+      throw new Error("Pull request head must be a SHA-1");
+    const pullRequest = this.#pullRequests.get(number);
+    if (pullRequest === undefined) throw new Error("Unknown pull request");
+    pullRequest.headSha = headSha;
+    this.#checkStates.get(number)?.states.clear();
+    const states = this.#checkStates.get(number);
+    if (states !== undefined) states.headSha = headSha;
+  }
+
+  setThreads(number: number, threads: readonly MergeThreadReceipt[]): void {
+    if (threads.some((thread) => thread.id.trim().length === 0)) {
+      throw new Error("Thread IDs must not be blank");
+    }
+    this.#requirePullRequest(number);
+    this.#threads.set(
+      number,
+      threads.map((thread) => ({ ...thread })),
+    );
+  }
+
+  setPullRequestDraft(number: number, isDraft: boolean): void {
+    const pullRequest = this.#requirePullRequest(number);
+    pullRequest.isDraft = isDraft;
+  }
+
+  setMergeFailure(
+    failure: "merge_prevented" | "merge_ambiguous" | undefined,
+  ): void {
+    this.#mergeFailure = failure;
+  }
+
+  setMergeability(
+    number: number,
+    mergeability: MergeCandidateReceipt["mergeability"],
+  ): void {
+    this.#requirePullRequest(number);
+    this.#mergeability.set(number, mergeability);
+  }
+
+  setPermittedMergeMethods(
+    number: number,
+    methods: readonly MergeMethod[],
+  ): void {
+    this.#requirePullRequest(number);
+    this.#permittedMethods.set(number, [...methods]);
+  }
+
+  setWorkflowRun(run: StagingWorkflowRunReceipt): void {
+    if (run.workflow !== this.#stagingWorkflow)
+      throw new Error("Workflow is not configured");
+    this.#workflowRuns.set(run.headSha, { ...run });
+  }
+
+  setDeployment(deployment: StagingDeploymentReceipt): void {
+    this.#deployment.current = { ...deployment };
+  }
+
+  setMergedReceipt(receipt: MergeReceipt): void {
+    const validated = assertMergeReceipt(receipt);
+    this.#assertRepository(validated.repository);
+    this.#mergedReceipts.set(validated.number, validated);
+  }
+
+  seedProjectItem(item: ProjectItem): void {
+    if (item.repository !== this.#repository)
+      throw new Error("Project repository mismatch");
+    this.#projectItems.set(item.projectItemId, {
+      projectItemId: item.projectItemId,
+      projectId: item.projectId,
+      projectNumber: item.projectNumber,
+      repository: item.repository,
+      issueNodeId: item.issueNodeId,
+      issueNumber: item.issueNumber,
+      isOpen: item.isOpen,
+      status: item.status,
+      revision: item.revision,
+      labels: [...item.labels],
+      createdAt: item.createdAt,
+      ...(item.priorityRank === undefined
+        ? {}
+        : { priorityRank: item.priorityRank }),
+      dependencies: cloneDependencies(item.dependencies),
+    });
+    this.#revisionCounters.set(item.projectItemId, 1);
+  }
+
+  simulateProjectDrift(itemId: string): void {
+    const item = this.#projectItems.get(itemId);
+    if (item === undefined) throw new Error("Unknown project item");
+    item.revision = this.#nextRevision(itemId, item.revision);
+  }
+
+  mergeMutations(): readonly DeliveryMutation[] {
+    return Object.freeze(
+      this.#mergeMutations.map((mutation) =>
+        Object.freeze({
+          effectKey: mutation.effectKey,
+          request: cloneDeliveryRequest(mutation.request),
+          receipt: cloneDeliveryReceipt(mutation.receipt),
+        }),
+      ),
+    );
+  }
+
+  doneMutations(): readonly DoneMutation[] {
+    return Object.freeze(
+      this.#doneMutations.map((mutation) =>
+        Object.freeze({
+          effectKey: mutation.effectKey,
+          request: { ...mutation.request },
+          item: cloneItem(mutation.item),
+        }),
+      ),
+    );
+  }
+
+  #readCandidate(request: MergeCandidateRequest): MergeCandidateReceipt {
+    const pullRequest = this.#pullRequests.get(request.number);
+    if (pullRequest === undefined) {
+      deliveryFailure(
+        "pull_request_not_found",
+        "The requested pull request was not found",
+      );
+    }
+    if (pullRequest.repository !== request.repository) {
+      deliveryFailure(
+        "repository_mismatch",
+        "The pull request belongs to another repository",
+      );
+    }
+    if (pullRequest.isDraft) {
+      deliveryFailure(
+        "pull_request_is_draft",
+        "The pull request is still a draft",
+      );
+    }
+    if (
+      pullRequest.nodeId !== request.nodeId ||
+      pullRequest.issueNumber !== request.issueNumber ||
+      pullRequest.title !== request.expectedTitle ||
+      pullRequest.headBranch !== request.expectedHeadBranch
+    ) {
+      deliveryFailure(
+        "pull_request_mismatch",
+        "The merge candidate identity changed",
+      );
+    }
+    const checkState = this.#checkStates.get(request.number);
+    if (checkState === undefined) {
+      deliveryFailure(
+        "required_checks_not_green",
+        "Required check state is unavailable",
+      );
+    }
+    const headDrift =
+      pullRequest.headSha !== request.expectedHeadSha ||
+      pullRequest.baseSha !== request.expectedBaseSha ||
+      pullRequest.baseBranch !== request.expectedBaseBranch;
+    const requiredChecks = assertRequiredChecksReceipt({
+      repository: pullRequest.repository,
+      number: pullRequest.number,
+      nodeId: pullRequest.nodeId,
+      headSha: pullRequest.headSha,
+      requiredCheckNames: [...this.#requiredCheckNames],
+      requiredChecks: this.#requiredCheckNames.map((name) => ({
+        name,
+        state:
+          headDrift || checkState.headSha !== pullRequest.headSha
+            ? "pending"
+            : (checkState.states.get(name) ?? "pending"),
+      })),
+      headDrift,
+      aggregate: headDrift
+        ? "head_drift"
+        : this.#requiredCheckNames.every(
+              (name) => checkState.states.get(name) === "success",
+            )
+          ? "green"
+          : this.#requiredCheckNames.some(
+                (name) => checkState.states.get(name) === "failure",
+              )
+            ? "failed"
+            : "pending",
+    });
+    const candidate = assertMergeCandidateReceipt({
+      repository: pullRequest.repository,
+      number: pullRequest.number,
+      issueNumber: pullRequest.issueNumber,
+      nodeId: pullRequest.nodeId,
+      isDraft: false,
+      title: pullRequest.title,
+      baseBranch: pullRequest.baseBranch,
+      baseSha: pullRequest.baseSha,
+      headBranch: pullRequest.headBranch,
+      headSha: pullRequest.headSha,
+      requiredChecks,
+      threads: cloneThreads(this.#threads.get(request.number) ?? []),
+      mergeability: this.#mergeability.get(request.number) ?? "unknown",
+      permittedMergeMethods: [
+        ...(this.#permittedMethods.get(request.number) ?? []),
+      ],
+    });
+    return {
+      ...candidate,
+      threads: cloneThreads(candidate.threads),
+      permittedMergeMethods: Object.freeze([
+        ...candidate.permittedMergeMethods,
+      ]),
+    };
+  }
+
+  #assertMergeRequestMatchesCandidate(
+    request: MergeRequest,
+    candidate: MergeCandidateReceipt,
+  ): void {
+    if (candidate.headSha !== request.expectedHeadSha) {
+      deliveryFailure(
+        "head_drift",
+        "The pull request head changed after approval",
+      );
+    }
+    if (
+      candidate.baseSha !== request.expectedBaseSha ||
+      candidate.baseBranch !== request.expectedBaseBranch
+    ) {
+      deliveryFailure(
+        "base_drift",
+        "The pull request base changed after approval",
+      );
+    }
+    if (
+      candidate.repository !== request.repository ||
+      candidate.number !== request.number ||
+      candidate.issueNumber !== request.issueNumber ||
+      candidate.nodeId !== request.nodeId ||
+      candidate.title !== request.expectedTitle ||
+      candidate.headBranch !== request.expectedHeadBranch
+    ) {
+      deliveryFailure(
+        "pull_request_mismatch",
+        "The merge candidate identity changed",
+      );
+    }
+  }
+
+  #requirePullRequest(number: number): MutableDeliveryPullRequest {
+    const pullRequest = this.#pullRequests.get(number);
+    if (pullRequest === undefined) throw new Error("Unknown pull request");
+    return pullRequest;
+  }
+
+  #assertRepository(repository: string): void {
+    if (repository !== this.#repository) {
+      deliveryFailure(
+        "repository_mismatch",
+        "The delivery request targets another repository",
+      );
+    }
+  }
+
+  #mergedReceiptsBySha(mergeSha: string): MergeReceipt | undefined {
+    return [...this.#mergedReceipts.values()].find(
+      (receipt) => receipt.mergeSha === mergeSha,
+    );
+  }
+
+  #sameDoneRequest(
+    left: ConditionalProjectDoneMoveRequest,
+    right: ConditionalProjectDoneMoveRequest,
+  ): boolean {
+    return (
+      left.repository === right.repository &&
+      left.projectId === right.projectId &&
+      left.projectNumber === right.projectNumber &&
+      left.itemId === right.itemId &&
+      left.issueNodeId === right.issueNodeId &&
+      left.issueNumber === right.issueNumber &&
+      left.expectedRevision === right.expectedRevision &&
+      left.fromStatus === right.fromStatus &&
+      left.toStatus === right.toStatus &&
+      left.effectKey === right.effectKey &&
+      left.mergeSha === right.mergeSha
+    );
+  }
+
+  #nextRevision(itemId: string, currentRevision: string): string {
+    const next = (this.#revisionCounters.get(itemId) ?? 1) + 1;
+    this.#revisionCounters.set(itemId, next);
+    const result = String(next);
+    return result === currentRevision ? String(next + 1) : result;
+  }
+
+  #nextSha(previous: string): string {
+    const first = previous[0] ?? "c";
+    const next = String.fromCharCode(
+      Math.min("f".charCodeAt(0), first.charCodeAt(0) + 1),
+    );
+    return next.repeat(40);
   }
 }
