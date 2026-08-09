@@ -524,6 +524,56 @@ function toFindings(
   }));
 }
 
+async function settleReviewHandoff(
+  input: ReviewRepairInput,
+  run: RunRecord,
+  effect: EffectRecord,
+  prompt: ReviewerRenderReceipt,
+  startedAt: string,
+  receipt: unknown,
+  model: string,
+  reasoningEffort: string,
+  reason: string,
+  now: () => string,
+): Promise<ReviewStageOutcome> {
+  const completedAt = now();
+  const safeReason = bounded(reason);
+  try {
+    const settled = await input.coordinator.settleExecution({
+      runId: run.id,
+      expectedRevision: run.revision,
+      effectKey: effect.key,
+      outcome: "failed",
+      trigger: "handoff_required",
+      evidence: safeReason,
+      receipt,
+      step: reviewStep(
+        run,
+        run.repairRound + 1,
+        receipt,
+        prompt,
+        model,
+        reasoningEffort,
+        "failed",
+        startedAt,
+        completedAt,
+        safeReason,
+      ),
+      requiredAction: safeReason,
+      at: completedAt,
+    });
+    return { kind: "human", run: settled.run, reason: safeReason };
+  } catch (error) {
+    if (isStaleError(error)) return { kind: "stale", run };
+    return handoff(
+      input,
+      run,
+      `Independent review handoff settlement failed closed: ${errorMessage(error)}`,
+      now,
+    );
+  }
+}
+
 async function settleReview(
   input: ReviewRepairInput,
   run: RunRecord,
@@ -539,13 +589,24 @@ async function settleReview(
   const model = input.intake?.builder.model ?? run.repository;
   const reasoningEffort = input.intake?.builder.reasoningEffort ?? "bounded";
   const completedAt = now();
+  const reviewReceipt = {
+    ...outputReceipt(rawResult),
+    ...(terminal === undefined ? {} : { terminal }),
+    ...(reason === undefined ? {} : { reason }),
+  };
   let findings: readonly RepairFindingInput[];
   try {
     findings = terminal === undefined ? [] : findingsFromTerminal(terminal);
   } catch (error) {
-    return handoff(
+    return settleReviewHandoff(
       input,
       run,
+      effect,
+      prompt,
+      startedAt,
+      reviewReceipt,
+      model,
+      reasoningEffort,
       `Independent review findings are invalid: ${errorMessage(error)}`,
       now,
     );
@@ -560,11 +621,6 @@ async function settleReview(
         : terminal?.outcome === "blocked"
           ? `Independent review is blocked: ${terminal.requested_action}`
           : "Independent review could not produce a trustworthy result."));
-  const reviewReceipt = {
-    ...outputReceipt(rawResult),
-    ...(terminal === undefined ? {} : { terminal }),
-    ...(reason === undefined ? {} : { reason }),
-  };
   const shouldRepair = terminal?.outcome === "needs_repair" && !exhausted;
   const persistFindings =
     terminal?.outcome === "needs_repair" && findings.length > 0;
@@ -853,6 +909,60 @@ export async function executeReviewStage(
     undefined,
     now,
   );
+}
+
+async function settleRepairHandoff(
+  input: ReviewRepairInput,
+  run: RunRecord,
+  effect: EffectRecord,
+  prompt: RepairRenderReceipt,
+  attempt: number,
+  receipt: unknown,
+  model: string,
+  reasoningEffort: string,
+  startedAt: string,
+  reason: string,
+  now: () => string,
+): Promise<
+  | { kind: "human"; run: RunRecord; reason: string }
+  | { kind: "stale"; run: RunRecord }
+> {
+  const completedAt = now();
+  const safeReason = bounded(reason);
+  try {
+    const settled = await input.coordinator.settleExecution({
+      runId: run.id,
+      expectedRevision: run.revision,
+      effectKey: effect.key,
+      outcome: "failed",
+      trigger: "handoff_required",
+      evidence: safeReason,
+      receipt,
+      step: repairStep(
+        run,
+        attempt,
+        receipt,
+        prompt,
+        model,
+        reasoningEffort,
+        "failed",
+        startedAt,
+        completedAt,
+        safeReason,
+      ),
+      requiredAction: safeReason,
+      at: completedAt,
+    });
+    return { kind: "human", run: settled.run, reason: safeReason };
+  } catch (error) {
+    if (isStaleError(error)) return { kind: "stale", run };
+    return handoff(
+      input,
+      run,
+      `Repair handoff settlement failed closed: ${errorMessage(error)}`,
+      now,
+    );
+  }
 }
 
 async function executeRepairStage(
@@ -1163,30 +1273,19 @@ async function executeRepairStage(
   if (input.workspaceInspect === undefined) {
     const reasonText =
       "Repair completed but workspace inspection is unavailable.";
-    const settled = await input.coordinator.settleExecution({
-      runId: run.id,
-      expectedRevision: run.revision,
-      effectKey: effect.key,
-      outcome: "failed",
-      trigger: "handoff_required",
-      evidence: reasonText,
+    return settleRepairHandoff(
+      effectiveInput,
+      run,
+      effect,
+      rendered,
+      attempt,
       receipt,
-      step: repairStep(
-        run,
-        attempt,
-        receipt,
-        rendered,
-        model,
-        reasoningEffort,
-        "failed",
-        startedAt,
-        completedAt,
-        reasonText,
-      ),
-      requiredAction: reasonText,
-      at: completedAt,
-    });
-    return { kind: "human", run: settled.run, reason: reasonText };
+      model,
+      reasoningEffort,
+      startedAt,
+      reasonText,
+      now,
+    );
   }
   let inspected: WorkspacePreparationReceipt;
   try {
@@ -1209,30 +1308,19 @@ async function executeRepairStage(
       );
   } catch (error) {
     const handoffReason = `Repair workspace inspection failed: ${errorMessage(error)}`;
-    const settled = await input.coordinator.settleExecution({
-      runId: run.id,
-      expectedRevision: run.revision,
-      effectKey: effect.key,
-      outcome: "failed",
-      trigger: "handoff_required",
-      evidence: bounded(handoffReason),
+    return settleRepairHandoff(
+      effectiveInput,
+      run,
+      effect,
+      rendered,
+      attempt,
       receipt,
-      step: repairStep(
-        run,
-        attempt,
-        receipt,
-        rendered,
-        model,
-        reasoningEffort,
-        "failed",
-        startedAt,
-        completedAt,
-        handoffReason,
-      ),
-      requiredAction: bounded(handoffReason),
-      at: completedAt,
-    });
-    return { kind: "human", run: settled.run, reason: handoffReason };
+      model,
+      reasoningEffort,
+      startedAt,
+      handoffReason,
+      now,
+    );
   }
   try {
     const settled = await input.coordinator.settleExecution({

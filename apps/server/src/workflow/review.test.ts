@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { openDatabase } from "../database/connection.js";
 import { migrateDatabase } from "../database/migrate.js";
-import { readRun } from "../database/runs.js";
+import { readRun, StaleRevisionError } from "../database/runs.js";
 import { WorkflowCoordinator } from "./coordinator.js";
 import { executeReviewRepair, type ReviewRepairInput } from "./review.js";
 
@@ -98,6 +98,110 @@ afterEach(async () => {
       .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
+
+async function enterReviewing(
+  coordinator: WorkflowCoordinator,
+  connection: ReturnType<typeof openDatabase>,
+): Promise<Awaited<ReturnType<typeof readRun>>> {
+  await coordinator.createClaim(claimInput());
+  let run = await readRun(connection.db, claimInput().id);
+  for (const trigger of [
+    "todo_observed",
+    "workspace_prepared",
+    "intake_captured",
+    "builder_succeeded",
+    "verification_passed",
+  ] as const) {
+    run = await coordinator.transition({
+      runId: run.id,
+      expectedRevision: run.revision,
+      trigger,
+      at,
+      summary: { text: `${trigger}.` },
+    });
+  }
+  connection.native
+    .prepare(
+      "UPDATE runs SET base_sha = ?, head_sha = ?, worktree_path = ?, branch = ?, intake_json = ? WHERE id = ?",
+    )
+    .run(
+      baseSha,
+      firstHeadSha,
+      workspace(firstHeadSha).path,
+      workspace(firstHeadSha).branch,
+      JSON.stringify(intake()),
+      run.id,
+    );
+  return readRun(connection.db, run.id);
+}
+
+async function enterRepairing(
+  coordinator: WorkflowCoordinator,
+  connection: ReturnType<typeof openDatabase>,
+): Promise<Awaited<ReturnType<typeof readRun>>> {
+  const reviewing = await enterReviewing(coordinator, connection);
+  return coordinator.transition({
+    runId: reviewing.id,
+    expectedRevision: reviewing.revision,
+    trigger: "review_needs_repair",
+    at,
+    summary: { text: "Repair is required." },
+  });
+}
+
+function repairInput(
+  coordinator: WorkflowCoordinator,
+  run: Awaited<ReturnType<typeof readRun>>,
+  workspaceInspect: NonNullable<ReviewRepairInput["workspaceInspect"]>,
+): ReviewRepairInput {
+  return {
+    coordinator,
+    run,
+    verification: {
+      kind: "succeeded",
+      command: "pnpm test:unit",
+      cwd: workspace(firstHeadSha).path,
+      exitCode: 0,
+      signal: null,
+      stdout: "verified",
+      stderr: "",
+      headSha: firstHeadSha,
+      changedFiles: workspace(firstHeadSha).changedFiles,
+    },
+    readDiff: async () => "raw diff",
+    readFindings: async () => [
+      {
+        stable_key: "review.repair",
+        severity: "high" as const,
+        evidence: "Repair this finding.",
+      },
+    ],
+    reviewer: {
+      render: async () => ({ prompt: "unused", promptHash: hash("unused") }),
+      invoke: async () => ({
+        outcome: "approved" as const,
+        summary: "unused",
+        validation: [],
+      }),
+    },
+    repair: {
+      render: async () => ({ prompt: "repair", promptHash: hash("repair") }),
+      invoke: async () => ({
+        kind: "succeeded" as const,
+        terminal: {
+          outcome: "completed" as const,
+          summary: "Repaired the finding.",
+          validation: ["Checked."],
+          changed_files: workspace(firstHeadSha).changedFiles,
+        },
+        stdout: "repair",
+        stderr: "",
+      }),
+    },
+    workspaceInspect,
+    now: () => at,
+  };
+}
 
 describe("durable review and repair sequencing", () => {
   test("runs a fresh review, records findings, repairs in place, re-verifies, and reviews again", async () => {
@@ -433,6 +537,123 @@ describe("durable review and repair sequencing", () => {
         .prepare("SELECT COUNT(*) AS count FROM findings WHERE run_id = ?")
         .get(run.id),
     ).toEqual({ count: 1 });
+    await coordinator.close();
+  });
+
+  test("settles invalid findings before handing the review effect to Review", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterReviewing(coordinator, connection);
+    const result = await executeReviewRepair({
+      coordinator,
+      run,
+      verification: {
+        kind: "succeeded" as const,
+        command: "pnpm test:unit",
+        cwd: workspace(firstHeadSha).path,
+        exitCode: 0,
+        signal: null,
+        stdout: "verified",
+        stderr: "",
+        headSha: firstHeadSha,
+        changedFiles: workspace(firstHeadSha).changedFiles,
+      },
+      readDiff: async () => "raw diff",
+      reviewer: {
+        render: async () => ({ prompt: "review", promptHash: hash("review") }),
+        invoke: async () => ({
+          kind: "succeeded" as const,
+          terminal: {
+            outcome: "needs_repair" as const,
+            summary: "Malformed finding evidence.",
+            validation: [],
+            findings: [
+              {
+                stable_key: "review.invalid-evidence",
+                severity: "high" as const,
+                evidence: " ",
+              },
+            ],
+          },
+          stdout: "review output",
+          stderr: "",
+        }),
+      },
+      workspaceInspect: async (_run, expected) => ({
+        ...(expected as ReturnType<typeof workspace>),
+        changedFiles: workspace(firstHeadSha).changedFiles,
+      }),
+      now: () => at,
+    });
+    expect(result.kind).toBe("human");
+    expect(result.run.state).toBe("review");
+    expect(
+      connection.native
+        .prepare(
+          "SELECT status FROM side_effects WHERE run_id = ? AND kind = 'agent_review'",
+        )
+        .get(run.id),
+    ).toEqual({ status: "failed" });
+    expect(
+      connection.native
+        .prepare(
+          "SELECT COUNT(*) AS count FROM side_effects WHERE run_id = ? AND status = 'in_flight'",
+        )
+        .get(run.id),
+    ).toEqual({ count: 0 });
+    await coordinator.close();
+  });
+
+  test("returns stale when repair handoff settlement is stale", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterRepairing(coordinator, connection);
+    coordinator.settleExecution = async () => {
+      throw new StaleRevisionError(run.revision);
+    };
+    const result = await executeReviewRepair(
+      repairInput(coordinator, run, async (_run, expected) => ({
+        ...(expected as ReturnType<typeof workspace>),
+        changedFiles: workspace(firstHeadSha).changedFiles,
+      })),
+    );
+    expect(result.kind).toBe("stale");
+    expect(
+      connection.native
+        .prepare(
+          "SELECT status FROM side_effects WHERE run_id = ? AND kind = 'agent_repair'",
+        )
+        .get(run.id),
+    ).toEqual({ status: "in_flight" });
+    await coordinator.close();
+  });
+
+  test("hands off to Review when repair settlement fails non-stale", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    const run = await enterRepairing(coordinator, connection);
+    let inspectCalls = 0;
+    let settleCalls = 0;
+    coordinator.settleExecution = async () => {
+      settleCalls += 1;
+      throw new Error("coordinator acknowledgement failed");
+    };
+    const result = await executeReviewRepair(
+      repairInput(coordinator, run, async () => {
+        inspectCalls += 1;
+        return workspace(inspectCalls >= 4 ? repairedHeadSha : firstHeadSha);
+      }),
+    );
+    expect(result.kind).toBe("human");
+    expect(result.run.state).toBe("review");
+    expect(settleCalls).toBe(1);
+    expect(
+      connection.native
+        .prepare(
+          "SELECT status FROM side_effects WHERE run_id = ? AND kind = 'agent_repair'",
+        )
+        .get(run.id),
+    ).toEqual({ status: "in_flight" });
     await coordinator.close();
   });
 
