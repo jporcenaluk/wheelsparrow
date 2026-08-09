@@ -13,6 +13,8 @@ import {
 import {
   type CreateClaimInput,
   createRunMutationRepository,
+  type ExecutionFactsPatch,
+  type NewStepRecord,
   type RunRecord,
   readRun,
   type SchedulerControl,
@@ -94,6 +96,29 @@ export interface RejectClaimCommand {
 
 export interface ObserveEffectCommand extends EffectObservation {
   at?: string;
+}
+
+/**
+ * Settle one execution effect and persist the facts produced by that same
+ * edge. All optional writes happen before the existing effect observation
+ * transition, inside one coordinator-owned transaction.
+ */
+export interface ExecutionSettlementCommand {
+  runId: string;
+  expectedRevision: number;
+  effectKey: string;
+  outcome: EffectObservation["outcome"];
+  trigger?: WorkflowTrigger | null;
+  receipt?: unknown;
+  evidence: string;
+  at?: string;
+  facts?: ExecutionFactsPatch;
+  step?: NewStepRecord;
+}
+
+export interface ExecutionSettlement {
+  run: RunRecord;
+  effect: EffectRecord;
 }
 
 /** Quarantine an in-flight effect and advance its run revision atomically. */
@@ -543,6 +568,69 @@ export class WorkflowCoordinator {
       )
         await this.beginAndDispatch(result.effect.key, request.at);
       return result.run;
+    });
+  }
+
+  /**
+   * Atomically persist execution facts and an optional step with an effect
+   * observation. A stale callback rolls back every write in this transaction.
+   */
+  settleExecution(
+    command: ExecutionSettlementCommand,
+  ): Promise<ExecutionSettlement> {
+    return this.enqueue(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db.transaction().execute(async (tx) => {
+        const current = await readRun(tx, command.runId);
+        if (current.revision !== command.expectedRevision)
+          throw new StaleRevisionError(command.expectedRevision);
+        const currentEffect = await tx
+          .selectFrom("side_effects")
+          .select(["run_id", "rework_epoch", "target_revision"])
+          .where("key", "=", command.effectKey)
+          .executeTakeFirst();
+        if (
+          currentEffect === undefined ||
+          currentEffect.run_id !== current.id ||
+          currentEffect.rework_epoch !== current.reworkEpoch ||
+          currentEffect.target_revision !== command.expectedRevision
+        )
+          throw new StaleEffectError(
+            command.effectKey,
+            command.expectedRevision,
+          );
+        const repository = createRunMutationRepository(tx);
+        if (command.step !== undefined) {
+          if (
+            command.step.runId !== command.runId ||
+            command.step.expectedRevision !== command.expectedRevision
+          )
+            throw new StaleRevisionError(command.expectedRevision);
+          await repository.appendStep(command.step);
+        }
+        if (command.facts !== undefined)
+          await repository.updateExecutionFacts({
+            runId: command.runId,
+            expectedRevision: command.expectedRevision,
+            facts: command.facts,
+            at,
+          });
+        const observation: EffectObservation = {
+          runId: command.runId,
+          expectedRevision: command.expectedRevision,
+          effectKey: command.effectKey,
+          outcome: command.outcome,
+          evidence: command.evidence,
+        };
+        if (command.trigger !== undefined)
+          observation.trigger = command.trigger;
+        if (command.receipt !== undefined)
+          observation.receipt = command.receipt;
+        const effect = await createEffectMutationRepository(
+          tx,
+        ).recordEffectObservation(observation, at);
+        return { run: await readRun(tx, command.runId), effect };
+      });
     });
   }
 
@@ -1351,6 +1439,7 @@ export class WorkflowCoordinator {
 export type CoordinatorCommand =
   | ReturnType<WorkflowCoordinator["createClaim"]>
   | ReturnType<WorkflowCoordinator["transition"]>
+  | ReturnType<WorkflowCoordinator["settleExecution"]>
   | ReturnType<WorkflowCoordinator["createEffectIntent"]>
   | ReturnType<WorkflowCoordinator["beginEffect"]>
   | ReturnType<WorkflowCoordinator["observeEffect"]>

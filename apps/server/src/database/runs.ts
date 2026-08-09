@@ -139,6 +139,31 @@ export interface NewStepRecord {
   rawLogReference?: string | null;
 }
 
+/** JSON values accepted for the bounded intake snapshot. */
+export type IntakeJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | IntakeJsonValue[]
+  | { readonly [key: string]: IntakeJsonValue };
+
+/** The only run facts an execution receipt may update. */
+export interface ExecutionFactsPatch {
+  worktreePath?: string;
+  baseSha?: string;
+  branch?: string;
+  headSha?: string;
+  intakeJson?: string | IntakeJsonValue;
+}
+
+export interface ExecutionFactsUpdateRequest {
+  runId: string;
+  expectedRevision: number;
+  facts: ExecutionFactsPatch;
+  at: string;
+}
+
 export interface NewFindingRecord {
   id: string;
   runId: string;
@@ -346,6 +371,36 @@ function sha(value: unknown, label: string): string {
   if (typeof value !== "string" || !shaPattern.test(value))
     throw new TypeError(`${label} must be a lowercase Git SHA.`);
   return value;
+}
+
+function isIntakeJsonValue(value: unknown, seen = new Set<object>()): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean")
+    return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value))
+    return value.every((item) => isIntakeJsonValue(item, seen));
+  if (Object.getPrototypeOf(value) !== Object.prototype) return false;
+  return Object.values(value).every((item) => isIntakeJsonValue(item, seen));
+}
+
+function boundedIntakeJson(value: string | IntakeJsonValue): string {
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value) as unknown;
+    } catch {
+      throw new TypeError("Intake JSON must be valid JSON.");
+    }
+  }
+  if (!isIntakeJsonValue(parsed))
+    throw new TypeError("Intake JSON must contain JSON values.");
+  const serialized = typeof value === "string" ? value : JSON.stringify(value);
+  if (byteLength(serialized) > maximumJsonBytes)
+    throw new RangeError("Intake JSON exceeds its size limit.");
+  return serialized;
 }
 
 function parseRunState(value: string): RunState {
@@ -683,6 +738,9 @@ export async function readSchedulerControl(
 export interface RunMutationRepository {
   createClaim(input: CreateClaimInput): Promise<RunRecord>;
   transitionRun(request: TransitionRequest): Promise<RunRecord>;
+  updateExecutionFacts(
+    request: ExecutionFactsUpdateRequest,
+  ): Promise<RunRecord>;
   appendStep(input: NewStepRecord): Promise<StepRecord>;
   appendFinding(input: NewFindingRecord): Promise<FindingRecord>;
   appendApproval(input: NewApprovalRecord): Promise<ApprovalRecord>;
@@ -857,6 +915,60 @@ export function createRunMutationRepository(
           throw new StaleRevisionError(expectedRevision);
         translateWriteError(error);
       }
+    },
+
+    async updateExecutionFacts(request): Promise<RunRecord> {
+      const runId = identifier(request.runId, "Run ID");
+      const at = identifier(request.at, "Timestamp");
+      const current = await assertRunRevision(
+        tx,
+        runId,
+        request.expectedRevision,
+      );
+      const facts = request.facts;
+      if (
+        facts === null ||
+        typeof facts !== "object" ||
+        Object.keys(facts).length === 0
+      )
+        throw new TypeError("Execution facts patch must be non-empty.");
+      const allowed = new Set([
+        "worktreePath",
+        "baseSha",
+        "branch",
+        "headSha",
+        "intakeJson",
+      ]);
+      if (Object.keys(facts).some((key) => !allowed.has(key)))
+        throw new TypeError(
+          "Execution facts patch contains an unsupported field.",
+        );
+
+      const updates: Partial<RunsTable> = { updated_at: at };
+      if (facts.worktreePath !== undefined)
+        updates.worktree_path = identifier(facts.worktreePath, "Worktree path");
+      if (facts.baseSha !== undefined)
+        updates.base_sha = sha(facts.baseSha, "Base SHA");
+      if (facts.branch !== undefined)
+        updates.branch = identifier(facts.branch, "Branch");
+      if (facts.headSha !== undefined)
+        updates.head_sha = sha(facts.headSha, "Head SHA");
+      if (facts.intakeJson !== undefined)
+        updates.intake_json = boundedIntakeJson(facts.intakeJson);
+      if (Object.keys(updates).length === 1)
+        throw new TypeError(
+          "Execution facts patch must contain a supported value.",
+        );
+
+      const updated = await tx
+        .updateTable("runs")
+        .set(updates)
+        .where("id", "=", runId)
+        .where("revision", "=", current.revision)
+        .executeTakeFirst();
+      if (Number(updated.numUpdatedRows) !== 1)
+        throw new StaleRevisionError(request.expectedRevision);
+      return mapRun(await readRunRow(tx, runId));
     },
 
     async appendStep(input): Promise<StepRecord> {
