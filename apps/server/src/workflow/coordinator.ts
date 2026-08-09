@@ -20,6 +20,7 @@ import {
   StaleRevisionError,
   type TransitionRequest,
 } from "../database/runs.js";
+import type { SideEffectsTable } from "../database/schema.js";
 import {
   assertEffectObservationTrigger,
   type EffectKind,
@@ -83,9 +84,20 @@ export interface CancelEffectCommand {
   at?: string;
 }
 
+export interface RejectClaimCommand {
+  runId: string;
+  effectKey: string;
+  expectedRevision: number;
+  reason: string;
+  at?: string;
+}
+
 export interface ObserveEffectCommand extends EffectObservation {
   at?: string;
 }
+
+/** Quarantine an in-flight effect and advance its run revision atomically. */
+export interface QuarantineEffectCommand extends ObserveEffectCommand {}
 
 export interface ObserveAmbiguousEffectCommand {
   effectKey: string;
@@ -153,12 +165,42 @@ const FAILED_EFFECT_TRIGGERS = {
 const WORKFLOW_TRIGGER_SET = new Set<string>(WORKFLOW_TRIGGERS);
 const maximumEvidenceBytes = 4 * 1024;
 const maximumJsonBytes = 1024 * 1024;
+// A fixed event kind plus structured effect-key details is durable quarantine
+// state; adapter evidence remains free-form and is never used as a marker.
+const quarantinedEffectEventKind = "effect_quarantined";
 
 function boundedEvidence(value: string): string {
   let result = value;
   while (Buffer.byteLength(result, "utf8") > maximumEvidenceBytes)
     result = result.slice(0, -1);
   return result;
+}
+
+function mapSideEffect(row: SideEffectsTable): EffectRecord {
+  return {
+    key: row.key,
+    runId: row.run_id,
+    reworkEpoch: row.rework_epoch,
+    kind: row.kind as EffectKind,
+    targetRevision: row.target_revision,
+    fingerprint: row.fingerprint,
+    intent: row.intent_json,
+    status: row.status as EffectStatus,
+    executorAttempt: row.executor_attempt,
+    executorOwnerToken: row.executor_owner_token,
+    receipt: row.receipt_json,
+    processId: row.process_id,
+    requestId: row.request_id,
+    prNumber: row.pr_number,
+    prNodeId: row.pr_node_id,
+    workflowRunId: row.workflow_run_id,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    failure: row.failure,
+    reconciliationEvidence: row.reconciliation_evidence,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 function errorValue(value: unknown): Error {
@@ -357,8 +399,15 @@ export class WorkflowCoordinator {
     string,
     Set<(effect: EffectRecord) => void>
   >();
+  private readonly commandQueue: Array<{
+    command: () => Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
   private accepting = true;
-  private tail: Promise<void> = Promise.resolve();
+  private draining = false;
+  private idle: Promise<void> = Promise.resolve();
+  private resolveIdle: (() => void) | undefined;
   private closePromise: Promise<void> | undefined;
 
   constructor(options: WorkflowCoordinatorOptions) {
@@ -394,7 +443,7 @@ export class WorkflowCoordinator {
 
   /** Resolves after every command accepted so far has settled. */
   async waitForIdle(): Promise<void> {
-    await this.tail;
+    await this.idle;
   }
 
   /**
@@ -567,19 +616,9 @@ export class WorkflowCoordinator {
   }
 
   observeEffect(command: ObserveEffectCommand): Promise<EffectRecord> {
-    const result = this.enqueue(async () => {
-      const at = asTimestamp(this.now, command.at);
-      return this.connection.db
-        .transaction()
-        .execute((tx) =>
-          createEffectMutationRepository(tx).recordEffectObservation(
-            command,
-            at,
-          ),
-        );
-    });
-    return result.then((effect) => {
-      this.notifyEffectSettlement(effect);
+    return this.submitObservation(command, false).then((effect) => {
+      if (effect === undefined)
+        throw new Error("Effect observation was unexpectedly skipped.");
       return effect;
     });
   }
@@ -587,6 +626,98 @@ export class WorkflowCoordinator {
   /** Alias emphasizing that observations are commands, never direct writes. */
   recordEffect(command: ObserveEffectCommand): Promise<EffectRecord> {
     return this.observeEffect(command);
+  }
+
+  /** Mark an uncertain dispatch ambiguous and ignore any late adapter receipt. */
+  abandonEffect(command: ObserveEffectCommand): Promise<EffectRecord> {
+    const result = this.enqueuePriority(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db.transaction().execute(async (tx) => {
+        const effect = await createEffectMutationRepository(
+          tx,
+        ).recordEffectObservation(command, at);
+        const run = await readRun(tx, effect.runId);
+        const previous = await tx
+          .selectFrom("events")
+          .select("sequence")
+          .where("run_id", "=", effect.runId)
+          .orderBy("sequence", "desc")
+          .limit(1)
+          .executeTakeFirst();
+        await tx
+          .insertInto("events")
+          .values({
+            id: randomUUID(),
+            run_id: effect.runId,
+            sequence: (previous?.sequence ?? 0) + 1,
+            run_revision: run.revision,
+            kind: quarantinedEffectEventKind,
+            summary: command.evidence,
+            details_json: JSON.stringify({ effectKey: command.effectKey }),
+            log_reference: null,
+            created_at: at,
+          })
+          .execute();
+        return effect;
+      });
+    });
+    return result.then((effect) => {
+      this.notifyEffectSettlement(effect);
+      return effect;
+    });
+  }
+
+  /**
+   * Quarantine an in-flight effect through the coordinator when a caller
+   * cannot use the ordinary observation command. The run revision advance and
+   * quarantine marker are one durable transaction, so late callbacks are
+   * stale even if they were already queued by an adapter.
+   */
+  quarantineEffect(command: QuarantineEffectCommand): Promise<EffectRecord> {
+    const result = this.enqueuePriority(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db.transaction().execute(async (tx) => {
+        const effect = await createEffectMutationRepository(
+          tx,
+        ).recordEffectObservation(command, at);
+        const run = await readRun(tx, effect.runId);
+        const nextRevision = run.revision + 1;
+        const updated = await tx
+          .updateTable("runs")
+          .set({ revision: nextRevision, updated_at: at })
+          .where("id", "=", run.id)
+          .where("revision", "=", run.revision)
+          .executeTakeFirst();
+        if (Number(updated.numUpdatedRows) !== 1)
+          throw new StaleRevisionError(run.revision);
+        const previous = await tx
+          .selectFrom("events")
+          .select("sequence")
+          .where("run_id", "=", run.id)
+          .orderBy("sequence", "desc")
+          .limit(1)
+          .executeTakeFirst();
+        await tx
+          .insertInto("events")
+          .values({
+            id: randomUUID(),
+            run_id: run.id,
+            sequence: (previous?.sequence ?? 0) + 1,
+            run_revision: nextRevision,
+            kind: quarantinedEffectEventKind,
+            summary: command.evidence,
+            details_json: JSON.stringify({ effectKey: command.effectKey }),
+            log_reference: null,
+            created_at: at,
+          })
+          .execute();
+        return effect;
+      });
+    });
+    return result.then((effect) => {
+      this.notifyEffectSettlement(effect);
+      return effect;
+    });
   }
 
   cancelEffect(command: CancelEffectCommand): Promise<EffectRecord> {
@@ -613,6 +744,89 @@ export class WorkflowCoordinator {
     return result.then((effect) => {
       this.notifyEffectSettlement(effect);
       return effect;
+    });
+  }
+
+  /**
+   * Reject a just-created claim and its project mutation as one serialized
+   * transaction. A late adapter callback observes the advanced run revision
+   * and is therefore stale rather than reviving the terminal claim.
+   */
+  rejectClaim(command: RejectClaimCommand): Promise<RunRecord> {
+    const result = this.enqueuePriority(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db.transaction().execute(async (tx) => {
+        const run = await readRun(tx, command.runId);
+        if (run.revision !== command.expectedRevision)
+          throw new StaleRevisionError(command.expectedRevision);
+        if (run.state !== "claiming")
+          throw new StaleRevisionError(command.expectedRevision);
+
+        const row = await tx
+          .selectFrom("side_effects")
+          .selectAll()
+          .where("key", "=", command.effectKey)
+          .executeTakeFirst();
+        if (
+          row === undefined ||
+          row.run_id !== run.id ||
+          row.kind !== "project_todo" ||
+          row.target_revision !== run.revision ||
+          (row.status !== "pending" && row.status !== "in_flight")
+        )
+          throw new StaleEffectError(
+            command.effectKey,
+            command.expectedRevision,
+          );
+
+        let effect: EffectRecord;
+        if (row.status === "pending") {
+          effect = await createEffectMutationRepository(tx).cancelPendingEffect(
+            command.effectKey,
+            command.reason,
+            at,
+          );
+        } else {
+          const updated = await tx
+            .updateTable("side_effects")
+            .set({
+              status: "cancelled",
+              failure: command.reason,
+              completed_at: at,
+              updated_at: at,
+            })
+            .where("key", "=", command.effectKey)
+            .where("run_id", "=", run.id)
+            .where("target_revision", "=", run.revision)
+            .where("status", "=", "in_flight")
+            .executeTakeFirst();
+          if (Number(updated.numUpdatedRows) !== 1)
+            throw new StaleEffectError(
+              command.effectKey,
+              command.expectedRevision,
+            );
+          effect = mapSideEffect({
+            ...row,
+            status: "cancelled",
+            failure: command.reason,
+            completed_at: at,
+            updated_at: at,
+          });
+        }
+
+        const rejected = await createRunMutationRepository(tx).transitionRun({
+          runId: run.id,
+          expectedRevision: run.revision,
+          trigger: "claim_rejected",
+          at,
+          summary: { text: command.reason },
+        });
+        return { effect, run: rejected };
+      });
+    });
+    return result.then(({ effect, run }) => {
+      this.notifyEffectSettlement(effect);
+      return run;
     });
   }
 
@@ -672,7 +886,7 @@ export class WorkflowCoordinator {
   }
 
   private async drainAndMarkAmbiguous(): Promise<void> {
-    await this.tail;
+    await this.waitForIdle();
     await this.markOwnedEffectsAmbiguous(
       "Coordinator closed before an external effect receipt was observed.",
     );
@@ -744,8 +958,61 @@ export class WorkflowCoordinator {
       observation.trigger = normalized.trigger;
     if (normalized.receipt !== undefined)
       observation.receipt = normalized.receipt;
-    void this.observeEffect(observation).catch((error: unknown) => {
-      this.handleObservationFailure(effect, expectedRevision, source, error);
+    void this.submitObservation(observation, source === "observer").catch(
+      (error: unknown) => {
+        this.handleObservationFailure(effect, expectedRevision, source, error);
+      },
+    );
+  }
+
+  private submitObservation(
+    command: ObserveEffectCommand,
+    allowQuarantined = false,
+  ): Promise<EffectRecord | undefined> {
+    const result = this.enqueue(async () => {
+      const at = asTimestamp(this.now, command.at);
+      return this.connection.db.transaction().execute(async (tx) => {
+        const current = await tx
+          .selectFrom("side_effects")
+          .select(["run_id", "status"])
+          .where("key", "=", command.effectKey)
+          .executeTakeFirst();
+        if (current === undefined)
+          throw new StaleEffectError(
+            command.effectKey,
+            command.expectedRevision,
+          );
+        const run = await readRun(tx, current.run_id);
+        const effectIsSettled =
+          current.status !== "pending" && current.status !== "in_flight";
+        const quarantineMarker = JSON.stringify({
+          effectKey: command.effectKey,
+        });
+        const quarantine = await tx
+          .selectFrom("events")
+          .select("sequence")
+          .where("run_id", "=", current.run_id)
+          .where("kind", "=", quarantinedEffectEventKind)
+          .where("details_json", "=", quarantineMarker)
+          .executeTakeFirst();
+        if (
+          run.revision !== command.expectedRevision ||
+          (effectIsSettled && current.status !== "ambiguous") ||
+          (quarantine !== undefined && !allowQuarantined)
+        )
+          throw new StaleEffectError(
+            command.effectKey,
+            command.expectedRevision,
+          );
+        return createEffectMutationRepository(tx).recordEffectObservation(
+          command,
+          at,
+        );
+      });
+    });
+    return result.then((effect) => {
+      if (effect !== undefined) this.notifyEffectSettlement(effect);
+      return effect;
     });
   }
 
@@ -895,7 +1162,8 @@ export class WorkflowCoordinator {
   }
 
   private launchDispatch(effect: EffectRecord): void {
-    if (this.dispatcher === undefined) return;
+    const dispatcher = this.dispatcher;
+    if (dispatcher === undefined) return;
     let completed = false;
     const complete: EffectCompletion = (result) => {
       if (completed) return;
@@ -916,9 +1184,9 @@ export class WorkflowCoordinator {
     };
     try {
       const result =
-        typeof this.dispatcher === "function"
-          ? this.dispatcher(effect, complete)
-          : this.dispatcher.dispatch(effect, complete);
+        typeof dispatcher === "function"
+          ? dispatcher(effect, complete)
+          : dispatcher.dispatch(effect, complete);
       void Promise.resolve(result).then(
         (value) => {
           const normalized = safeNormalizeAdapterResult(
@@ -1015,12 +1283,68 @@ export class WorkflowCoordinator {
 
   private enqueue<T>(command: () => Promise<T>): Promise<T> {
     if (!this.accepting) return Promise.reject(new CoordinatorClosedError());
-    const result = this.tail.then(command, command);
-    this.tail = result.then(
-      () => undefined,
-      () => undefined,
-    );
+    return this.enqueueCommand(command, false);
+  }
+
+  /**
+   * Quarantine commands run before commands waiting in the FIFO, while still
+   * waiting for a command already in progress. This lets a durable ambiguity
+   * record invalidate callbacks that were queued earlier.
+   */
+  private enqueuePriority<T>(command: () => Promise<T>): Promise<T> {
+    if (!this.accepting) return Promise.reject(new CoordinatorClosedError());
+    return this.enqueueCommand(command, true);
+  }
+
+  private enqueueCommand<T>(
+    command: () => Promise<T>,
+    priority: boolean,
+  ): Promise<T> {
+    if (!this.draining && this.commandQueue.length === 0) {
+      this.idle = new Promise<void>((resolve) => {
+        this.resolveIdle = resolve;
+      });
+    }
+    const result = new Promise<T>((resolve, reject) => {
+      const entry = {
+        command: async (): Promise<unknown> => command(),
+        resolve: (value: unknown): void => resolve(value as T),
+        reject,
+      };
+      if (priority) this.commandQueue.unshift(entry);
+      else this.commandQueue.push(entry);
+    });
+    this.scheduleDrain();
     return result;
+  }
+
+  private scheduleDrain(): void {
+    if (this.draining) return;
+    this.draining = true;
+    queueMicrotask(() => {
+      void this.drainQueue();
+    });
+  }
+
+  private async drainQueue(): Promise<void> {
+    const entry = this.commandQueue.shift();
+    if (entry === undefined) {
+      this.draining = false;
+      const resolveIdle = this.resolveIdle;
+      this.resolveIdle = undefined;
+      resolveIdle?.();
+      return;
+    }
+    try {
+      entry.resolve(await entry.command());
+    } catch (error) {
+      entry.reject(error);
+    }
+    // Yield between commands so callers can enqueue a priority quarantine
+    // after a command resolves but before its already-queued callbacks run.
+    queueMicrotask(() => {
+      void this.drainQueue();
+    });
   }
 }
 
@@ -1031,6 +1355,8 @@ export type CoordinatorCommand =
   | ReturnType<WorkflowCoordinator["beginEffect"]>
   | ReturnType<WorkflowCoordinator["observeEffect"]>
   | ReturnType<WorkflowCoordinator["cancelEffect"]>
+  | ReturnType<WorkflowCoordinator["rejectClaim"]>
+  | ReturnType<WorkflowCoordinator["quarantineEffect"]>
   | ReturnType<WorkflowCoordinator["updateSchedulerControl"]>;
 
 export type CoordinatorEffectOutcome = EffectStatus;
