@@ -50,6 +50,15 @@ export interface ReadRunWorktreeDiffInput extends InspectRunWorktreeInput {
   readonly maxBytes?: number;
 }
 
+export interface CommitAndPushRunWorktreeInput
+  extends InspectRunWorktreeInput {}
+
+export interface CommittedRunWorktreeReceipt {
+  readonly branch: string;
+  readonly baseSha: string;
+  readonly headSha: string;
+}
+
 export interface RunWorktreeInspection extends RunWorktreeReceipt {
   readonly baseBranch: "main";
   /** Paths changed from the assigned worktree's base, relative to that worktree. */
@@ -519,6 +528,17 @@ async function inspectChangedFiles(
   return [...new Set(paths)].toSorted();
 }
 
+function parseChangedPathOutput(
+  worktreePath: string,
+  output: string,
+): readonly string[] {
+  return output
+    .split("\0")
+    .filter((path) => path.length > 0)
+    .map((path) => assertChangedPathContained(worktreePath, path))
+    .toSorted();
+}
+
 async function inspectUntrackedFiles(
   git: GitRunner,
   worktreePath: string,
@@ -888,4 +908,159 @@ export async function readRunWorktreeDiff(
     }
   }
   return rawDiff;
+}
+
+/**
+ * Commit and publish only the assigned run worktree after revalidating every
+ * persisted identity. The operation never force-pushes and returns only the
+ * exact branch/base/head facts needed by the publication boundary.
+ */
+export async function commitAndPushRunWorktree(
+  input: CommitAndPushRunWorktreeInput,
+): Promise<CommittedRunWorktreeReceipt> {
+  const git = input.git ?? realGit;
+  const inspected = await inspectRunWorktree({ ...input, git });
+  if (inspected.changedFiles.length === 0) {
+    throw new WorktreeBoundaryError(
+      "cannot publish a worktree with no intentional changes",
+    );
+  }
+
+  await runGit(
+    git,
+    inspected.path,
+    ["add", "--all", "--", ...inspected.changedFiles],
+    "stage worktree changes",
+  );
+
+  const stagedFiles = parseChangedPathOutput(
+    inspected.path,
+    await runGit(
+      git,
+      inspected.path,
+      ["diff", "--cached", "--name-only", "-z", "--"],
+      "inspect staged changes",
+    ),
+  );
+  if (
+    stagedFiles.length !== inspected.changedFiles.length ||
+    stagedFiles.some((path, index) => path !== inspected.changedFiles[index])
+  ) {
+    throw new WorktreeBoundaryError(
+      "staged changes do not match the assigned worktree changes",
+    );
+  }
+
+  const stagedInspection = await inspectRunWorktree({
+    ...input,
+    git,
+  });
+  if (
+    stagedInspection.path !== inspected.path ||
+    stagedInspection.branch !== inspected.branch ||
+    stagedInspection.baseSha !== inspected.baseSha ||
+    stagedInspection.headSha !== inspected.headSha ||
+    stagedInspection.changedFiles.some(
+      (path, index) => path !== inspected.changedFiles[index],
+    ) ||
+    stagedInspection.changedFiles.length !== inspected.changedFiles.length
+  ) {
+    throw new WorktreeBoundaryError(
+      "assigned worktree identity or changes changed while staging",
+    );
+  }
+
+  await runGit(
+    git,
+    inspected.path,
+    [
+      "commit",
+      "-m",
+      `feat: publish issue #${input.issueNumber} run ${input.runId}`,
+    ],
+    "commit worktree changes",
+  );
+
+  const committedHeadSha = await inspectGit(
+    git,
+    inspected.path,
+    ["rev-parse", "HEAD"],
+    "committed worktree HEAD",
+  );
+  assertReceiptSha(committedHeadSha, "committed worktree HEAD");
+  if (committedHeadSha === inspected.headSha) {
+    throw new WorktreeBoundaryError("Git commit did not advance worktree HEAD");
+  }
+
+  const committedExpected = {
+    path: inspected.path,
+    branch: inspected.branch,
+    baseSha: inspected.baseSha,
+    headSha: committedHeadSha,
+  };
+  const committedInspection = await inspectRunWorktree({
+    ...input,
+    expected: committedExpected,
+    git,
+  });
+  if (committedInspection.changedFiles.length !== 0) {
+    throw new WorktreeBoundaryError(
+      "worktree changed while creating its publication commit",
+    );
+  }
+
+  await runGit(
+    git,
+    committedInspection.path,
+    ["push", "origin", committedInspection.branch],
+    "push ticket branch",
+  );
+
+  const remoteOutput = await runGit(
+    git,
+    committedInspection.path,
+    ["ls-remote", "--heads", "origin", committedInspection.branch],
+    "verify pushed ticket branch",
+  );
+  const remoteLines = remoteOutput
+    .trim()
+    .split(/\r?\n/u)
+    .filter((line) => line.length > 0);
+  if (remoteLines.length !== 1) {
+    throw new WorktreeBoundaryError(
+      "Git returned an invalid pushed ticket branch",
+    );
+  }
+  const remoteParts = remoteLines[0]?.split(/\s+/u);
+  if (
+    remoteParts === undefined ||
+    remoteParts.length !== 2 ||
+    remoteParts[1] !== `refs/heads/${committedInspection.branch}`
+  ) {
+    throw new WorktreeBoundaryError(
+      "Git returned an invalid pushed ticket branch",
+    );
+  }
+  assertReceiptSha(remoteParts[0], "pushed ticket branch SHA");
+  if (remoteParts[0] !== committedHeadSha) {
+    throw new WorktreeBoundaryError(
+      "pushed ticket branch HEAD does not match the committed HEAD",
+    );
+  }
+
+  const finalInspection = await inspectRunWorktree({
+    ...input,
+    expected: committedExpected,
+    git,
+  });
+  if (finalInspection.changedFiles.length !== 0) {
+    throw new WorktreeBoundaryError(
+      "assigned worktree changed while publishing its ticket branch",
+    );
+  }
+  return {
+    branch: finalInspection.branch,
+    baseSha: finalInspection.baseSha,
+    headSha: finalInspection.headSha,
+  };
 }
