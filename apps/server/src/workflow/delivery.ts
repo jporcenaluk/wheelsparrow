@@ -665,7 +665,7 @@ export async function executeMergeStage(
       input.run,
       { key, runId: input.run.id } as EffectRecord,
       "delivery_failed",
-      errorMessage(error),
+      redacted(errorMessage(error)),
       { kind: "invalid_merge_facts" },
       now,
     );
@@ -693,7 +693,7 @@ export async function executeMergeStage(
     return handoff(
       input.coordinator,
       input.run,
-      `Merge scheduling failed closed: ${errorMessage(error)}`,
+      `Merge scheduling failed closed: ${redacted(errorMessage(error))}`,
       now,
     );
   }
@@ -741,7 +741,7 @@ export async function executeMergeStage(
       input.run,
       scheduled.effect,
       "delivery_failed",
-      `Merge failed closed: ${errorMessage(error)}`,
+      `Merge failed closed: ${redacted(errorMessage(error))}`,
       { kind: "merge_failed" },
       now,
     );
@@ -797,7 +797,7 @@ export async function executeMergeStage(
     return handoff(
       input.coordinator,
       settled.run,
-      `Staging observation could not be scheduled: ${errorMessage(error)}`,
+      `Staging observation could not be scheduled: ${redacted(errorMessage(error))}`,
       now,
     );
   }
@@ -839,7 +839,7 @@ export async function executeStagingStage(
     return handoff(
       input.coordinator,
       input.run,
-      `Staging configuration failed closed: ${errorMessage(error)}`,
+      `Staging configuration failed closed: ${redacted(errorMessage(error))}`,
       now,
     );
   }
@@ -859,7 +859,7 @@ export async function executeStagingStage(
     return handoff(
       input.coordinator,
       input.run,
-      `Staging scheduling failed closed: ${errorMessage(error)}`,
+      `Staging scheduling failed closed: ${redacted(errorMessage(error))}`,
       now,
     );
   }
@@ -895,7 +895,7 @@ export async function executeStagingStage(
       input.run,
       scheduled.effect,
       "delivery_failed",
-      `Staging observation failed closed: ${errorMessage(error)}`,
+      `Staging observation failed closed: ${redacted(errorMessage(error))}`,
       { kind: "staging_failed" },
       now,
     );
@@ -918,7 +918,7 @@ export async function executeStagingStage(
         input.run,
         scheduled.effect,
         "delivery_failed",
-        `Staging pending lease failed: ${errorMessage(error)}`,
+        `Staging pending lease failed: ${redacted(errorMessage(error))}`,
         { observed },
         now,
       );
@@ -953,7 +953,7 @@ export async function executeStagingStage(
     return handoff(
       input.coordinator,
       input.run,
-      `Staging settlement failed closed: ${errorMessage(error)}`,
+      `Staging settlement failed closed: ${redacted(errorMessage(error))}`,
       now,
     );
   }
@@ -979,7 +979,7 @@ export async function executeStagingStage(
     return handoff(
       input.coordinator,
       settled.run,
-      `Smoke could not be scheduled: ${errorMessage(error)}`,
+      `Smoke could not be scheduled: ${redacted(errorMessage(error))}`,
       now,
     );
   }
@@ -1058,7 +1058,7 @@ export async function executeSmokeStage(
     return handoff(
       input.coordinator,
       input.run,
-      `Smoke scheduling failed closed: ${errorMessage(scheduleError)}`,
+      `Smoke scheduling failed closed: ${redacted(errorMessage(scheduleError))}`,
       now,
     );
   }
@@ -1153,7 +1153,7 @@ export async function executeSmokeStage(
     return handoff(
       input.coordinator,
       settled.run,
-      `Done projection could not be scheduled: ${errorMessage(doneError)}`,
+      `Done projection could not be scheduled: ${redacted(errorMessage(doneError))}`,
       now,
     );
   }
@@ -1238,7 +1238,7 @@ export async function executeProjectDoneStage(
     return handoff(
       input.coordinator,
       input.run,
-      `Done projection configuration failed closed: ${errorMessage(error)}`,
+      `Done projection configuration failed closed: ${redacted(errorMessage(error))}`,
       now,
     );
   }
@@ -1258,7 +1258,7 @@ export async function executeProjectDoneStage(
     return handoff(
       input.coordinator,
       input.run,
-      `Done projection scheduling failed closed: ${errorMessage(error)}`,
+      `Done projection scheduling failed closed: ${redacted(errorMessage(error))}`,
       now,
     );
   }
@@ -1291,7 +1291,7 @@ export async function executeProjectDoneStage(
       input.run,
       scheduled.effect,
       "done_projection_failed",
-      `Done projection failed closed: ${errorMessage(error)}`,
+      `Done projection failed closed: ${redacted(errorMessage(error))}`,
       { kind: "done_projection_failed" },
       now,
     );

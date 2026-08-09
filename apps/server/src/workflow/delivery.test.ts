@@ -36,6 +36,16 @@ const baseSha = "a".repeat(40);
 const headSha = "b".repeat(40);
 const mergeSha = "c".repeat(40);
 
+async function dispatchCapability(
+  capability: ReturnType<typeof createDeliveryCapability>,
+  effect: EffectRecord,
+): Promise<unknown> {
+  const dispatcher = capability.dispatcher;
+  if (typeof dispatcher === "function")
+    return dispatcher(effect, () => undefined);
+  return dispatcher.dispatch(effect, () => undefined);
+}
+
 async function createDatabase(): Promise<ReturnType<typeof openDatabase>> {
   const directory = await mkdtemp(
     join(tmpdir(), "wheelsparrow-delivery-stage-"),
@@ -631,13 +641,29 @@ describe("coordinator-owned delivery stages", () => {
       },
       { resolveRun: () => approval.run },
     );
-    const dispatched = await capability.dispatcher(effect.effect);
+    const dispatched = await dispatchCapability(capability, effect.effect);
     expect(dispatched).toMatchObject({
       outcome: "confirmed",
       trigger: "merge_observed",
     });
     expect(gateway.mergeMutations()).toHaveLength(1);
     await coordinator.close();
+  });
+
+  test("requires a durable run resolver for restart delivery capabilities", () => {
+    const gateway = new FakeGitHubDeliveryGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+      staging: { workflow: "deploy-staging.yml", environment: "staging" },
+    });
+    expect(() =>
+      createDeliveryCapability(
+        gateway,
+        deliveryConfiguration(),
+        { run: async () => ({ outcome: "passed" as const }) },
+        undefined as never,
+      ),
+    ).toThrow(/durable run resolver/i);
   });
 
   test("staging startup dispatch uses durable intent despite configuration drift", async () => {
@@ -700,7 +726,7 @@ describe("coordinator-owned delivery stages", () => {
         }),
       },
     );
-    const dispatched = await capability.dispatcher(effect.effect);
+    const dispatched = await dispatchCapability(capability, effect.effect);
     expect(dispatched).toMatchObject({
       outcome: "confirmed",
       trigger: "staging_succeeded",
@@ -778,7 +804,7 @@ describe("coordinator-owned delivery stages", () => {
       deliveryConfiguration(),
       runner,
     );
-    const dispatched = await capability.dispatcher(effect);
+    const dispatched = await dispatchCapability(capability, effect);
     expect(dispatched).toMatchObject({
       outcome: "confirmed",
       receipt: { command: "make smoke-durable", mergeSha },
@@ -802,9 +828,61 @@ describe("coordinator-owned delivery stages", () => {
           },
       },
     );
-    await expect(malformed.dispatcher(effect)).resolves.toMatchObject({
+    await expect(dispatchCapability(malformed, effect)).resolves.toMatchObject({
       outcome: "ambiguous",
     });
+  });
+
+  test("quarantines staging when durable settlement fails before Review handoff", async () => {
+    const connection = await createDatabase();
+    const gateway = new FakeGitHubDeliveryGateway({
+      repository: "octo/widget",
+      requiredChecks: ["test"],
+      staging: { workflow: "deploy-staging.yml", environment: "staging" },
+    });
+    gateway.seedPullRequest(candidate());
+    const coordinator = new WorkflowCoordinator({ connection });
+    const review = await enterReview(connection, coordinator);
+    const approval = await coordinator.approveMerge({
+      runId: review.id,
+      expectedRevision: review.revision,
+      operator: "operator@example.test",
+      approvedHeadSha: headSha,
+      observedBaseSha: baseSha,
+      dispatch: false,
+      at,
+    });
+    const merged = await executeMergeStage({
+      coordinator,
+      gateway,
+      run: approval.run,
+      configuration: deliveryConfiguration(),
+      now: () => at,
+    });
+    if (merged.kind !== "merged") throw new Error("merge did not complete");
+    gateway.setWorkflowRun(stagingRun(merged.merge.mergeSha));
+    gateway.setDeployment(deployment(merged.merge.mergeSha));
+    vi.spyOn(coordinator, "settleExecution").mockRejectedValue(
+      new Error("durable settlement unavailable"),
+    );
+
+    const result = await executeStagingStage({
+      coordinator,
+      gateway,
+      run: merged.run,
+      configuration: deliveryConfiguration(),
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    const effect = await connection.db
+      .selectFrom("side_effects")
+      .select(["status", "reconciliation_evidence"])
+      .where("key", "=", merged.stagingEffectKey)
+      .executeTakeFirstOrThrow();
+    expect(effect.status).toBe("ambiguous");
+    expect(effect.reconciliation_evidence).toMatch(/quarantined/i);
+    await coordinator.close();
   });
 
   test("direct Done confirmation satisfies strict coordinator receipt binding", async () => {
@@ -848,6 +926,7 @@ describe("coordinator-owned delivery stages", () => {
           durationMs: 1,
         }),
       },
+      { resolveRun: () => fixture.smoked.run },
     );
     const restarted = new WorkflowCoordinator({
       connection: fixture.connection,
@@ -894,6 +973,7 @@ describe("coordinator-owned delivery stages", () => {
           durationMs: 1,
         }),
       },
+      { resolveRun: () => fixture.smoked.run },
     );
     const restarted = new WorkflowCoordinator({
       connection: fixture.connection,
@@ -934,6 +1014,34 @@ describe("coordinator-owned delivery stages", () => {
 
     expect(result.kind).toBe("human");
     expect(fixture.gateway.doneMutations()).toHaveLength(0);
+    await fixture.coordinator.close();
+  });
+
+  test("redacts token-shaped provider errors before persisting delivery evidence", async () => {
+    const fixture = await reachSmoked();
+    vi.spyOn(fixture.gateway, "moveProjectItemToDone").mockRejectedValue(
+      new Error("provider rejected request: Bearer ghp_deliverySecret123"),
+    );
+
+    const result = await executeProjectDoneStage({
+      coordinator: fixture.coordinator,
+      gateway: fixture.gateway,
+      run: fixture.smoked.run,
+      configuration: deliveryConfiguration(),
+      now: () => at,
+    });
+
+    expect(result).toMatchObject({ kind: "human", run: { state: "review" } });
+    const effect = await fixture.connection.db
+      .selectFrom("side_effects")
+      .select(["failure", "reconciliation_evidence"])
+      .where("key", "=", fixture.doneEffect.effect.key)
+      .executeTakeFirstOrThrow();
+    expect(effect.failure).not.toContain("ghp_deliverySecret123");
+    expect(effect.reconciliation_evidence).not.toContain(
+      "ghp_deliverySecret123",
+    );
+    expect(effect.failure).toContain("[REDACTED]");
     await fixture.coordinator.close();
   });
 });
