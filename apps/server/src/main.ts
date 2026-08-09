@@ -11,6 +11,7 @@ import type { DatabaseConnection } from "./database/connection.js";
 import { openDatabase } from "./database/connection.js";
 import { migrateDatabase } from "./database/migrate.js";
 import { acquireOwnership } from "./database/ownership.js";
+import { registerOperatorRoutes } from "./http/routes.js";
 import { createReadinessGate, type ReadinessGate } from "./readiness.js";
 import { registerWeb } from "./web.js";
 import { WorkflowCoordinator } from "./workflow/coordinator.js";
@@ -47,7 +48,7 @@ export interface RunningService {
 export interface StartDependencies {
   loadRuntimeConfiguration(
     repositoryRoot: string,
-  ): Promise<{ paths: LocalPaths }>;
+  ): Promise<{ paths: LocalPaths; configuration?: unknown }>;
   prepareLocalPaths(paths: LocalPaths): Promise<LocalPaths>;
   acquireOwnership(lockPath: string): Promise<Ownership>;
   openDatabase(databasePath: string): Database | Promise<Database>;
@@ -59,6 +60,7 @@ export interface StartDependencies {
     | undefined;
   buildApp(options: {
     readiness: ReadinessGate;
+    registerOperator?: (app: FastifyInstance) => Promise<void>;
     registerWeb?: (app: FastifyInstance) => Promise<void>;
   }): Promise<Application>;
   createReadinessGate(): ReadinessGate;
@@ -66,6 +68,16 @@ export interface StartDependencies {
   signalTarget: SignalTarget;
   registerWeb?:
     | ((app: FastifyInstance, directory: string) => Promise<void>)
+    | undefined;
+  registerOperator?:
+    | ((
+        app: FastifyInstance,
+        context: {
+          database: Database;
+          coordinator: Coordinator;
+          configuration: unknown;
+        },
+      ) => Promise<void>)
     | undefined;
 }
 
@@ -111,6 +123,7 @@ export async function startService(
   let sigintHandlerInstalled = false;
   let sigtermHandlerInstalled = false;
   let shutdownRequested = false;
+  let runtimeConfiguration: unknown;
   let closePromise: Promise<void> | undefined;
   let startupSettled = false;
   let resolveStartupSettled!: () => void;
@@ -181,8 +194,10 @@ export async function startService(
   let address: string | undefined;
   try {
     try {
-      const { paths } =
+      const runtime =
         await dependencies.loadRuntimeConfiguration(repositoryRoot);
+      const { paths } = runtime;
+      runtimeConfiguration = runtime.configuration;
       readiness = dependencies.createReadinessGate();
       dependencies.signalTarget.once("SIGINT", signalHandlers.SIGINT);
       sigintHandlerInstalled = true;
@@ -214,19 +229,35 @@ export async function startService(
         await reconcile(database, coordinator);
         stopIfRequested();
       }
-      app = await dependencies.buildApp(
-        process.env.NODE_ENV === "development"
-          ? { readiness }
-          : {
-              readiness,
-              registerWeb: async (server) => {
-                await dependencies.registerWeb?.(
-                  server,
-                  resolve(import.meta.dirname, "../../web/dist"),
-                );
-              },
-            },
-      );
+      const appOptions: {
+        readiness: ReadinessGate;
+        registerOperator?: (server: FastifyInstance) => Promise<void>;
+        registerWeb?: (server: FastifyInstance) => Promise<void>;
+      } = { readiness };
+      const activeDatabase = database;
+      const activeCoordinator = coordinator;
+      const registerOperator = dependencies.registerOperator;
+      if (
+        activeDatabase !== undefined &&
+        activeCoordinator !== undefined &&
+        registerOperator !== undefined
+      ) {
+        appOptions.registerOperator = (server) =>
+          registerOperator(server, {
+            database: activeDatabase,
+            coordinator: activeCoordinator,
+            configuration: runtimeConfiguration,
+          });
+      }
+      if (process.env.NODE_ENV !== "development") {
+        appOptions.registerWeb = async (server) => {
+          await dependencies.registerWeb?.(
+            server,
+            resolve(import.meta.dirname, "../../web/dist"),
+          );
+        };
+      }
+      app = await dependencies.buildApp(appOptions);
       stopIfRequested();
       address = await app.listen({
         host: "127.0.0.1",
@@ -308,6 +339,13 @@ const productionDependencies: StartDependencies = {
   },
   signalTarget: productionSignalTarget(),
   registerWeb,
+  async registerOperator(app, context) {
+    registerOperatorRoutes(app, {
+      connection: context.database as DatabaseConnection,
+      coordinator: context.coordinator as WorkflowCoordinator,
+      configuration: context.configuration,
+    });
+  },
 };
 
 export async function start(repositoryRoot = process.cwd()): Promise<void> {

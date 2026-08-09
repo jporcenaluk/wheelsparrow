@@ -9,11 +9,14 @@ import type { ReadinessGate } from "./readiness.js";
 
 export interface BuildAppOptions {
   readiness: ReadinessGate;
+  /** Register the guarded operator API once the durable coordinator is ready. */
+  registerOperator?: (app: FastifyInstance) => Promise<void>;
   registerWeb?: (app: FastifyInstance) => Promise<void>;
 }
 
 export async function buildApp({
   readiness,
+  registerOperator,
   registerWeb,
 }: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
@@ -56,6 +59,7 @@ export async function buildApp({
   );
 
   try {
+    await registerOperator?.(app);
     await registerWeb?.(app);
     return app;
   } catch (error) {
