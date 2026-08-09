@@ -7,10 +7,12 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { openDatabase } from "../database/connection.js";
+import type { EffectRecord } from "../database/effects.js";
 import { migrateDatabase } from "../database/migrate.js";
 import { type RunRecord, readRun } from "../database/runs.js";
 import { WorkflowCoordinator } from "./coordinator.js";
 import {
+  createExecutionCapability,
   executeClaimedRun,
   type IntakeCapture,
   type WorkspacePreparationReceipt,
@@ -114,6 +116,40 @@ afterEach(async () => {
       .splice(0)
       .map((directory) => rm(directory, { recursive: true, force: true })),
   );
+});
+
+test("execution capability fails closed for an unprovable restarted builder", async () => {
+  let builderCalls = 0;
+  const capability = createExecutionCapability({
+    readRun: async () => {
+      throw new Error("run is unavailable");
+    },
+    builder: {
+      render: async () => ({ prompt, promptHash }),
+      invoke: async () => {
+        builderCalls += 1;
+        throw new Error("must not run during observation");
+      },
+    },
+  });
+  const effect = {
+    key: "run:run-1:agent:builder:attempt:1",
+    runId: "run-1",
+    reworkEpoch: 0,
+    kind: "agent_build",
+    targetRevision: 4,
+    intent: JSON.stringify({}),
+    status: "ambiguous",
+  } as unknown as EffectRecord;
+
+  const observer = capability.observer as (
+    effect: EffectRecord,
+  ) => Promise<{ outcome: string; evidence?: string }>;
+  await expect(observer(effect)).resolves.toMatchObject({
+    outcome: "ambiguous",
+    evidence: expect.stringMatching(/cannot prove|unavailable/iu),
+  });
+  expect(builderCalls).toBe(0);
 });
 
 describe("executeClaimedRun", () => {

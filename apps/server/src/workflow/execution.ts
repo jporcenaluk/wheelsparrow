@@ -4,7 +4,10 @@ import type { BuilderTerminalResult } from "../agents/builder.js";
 import type { EffectRecord } from "../database/effects.js";
 import { type RunRecord, StaleRevisionError } from "../database/runs.js";
 import type {
+  EffectDispatcherLike,
   EffectIntentCommand,
+  EffectObserverLike,
+  EffectResult,
   WorkflowCoordinator,
 } from "./coordinator.js";
 
@@ -131,7 +134,7 @@ export interface BuilderReceipt {
   readonly terminal: BuilderTerminalResult;
   readonly stdout: string;
   readonly stderr: string;
-  readonly exitCode: number | null;
+  readonly exitCode: 0;
   readonly headSha: string;
   readonly changedFiles: readonly string[];
 }
@@ -180,6 +183,37 @@ export type ExecuteClaimedRunInput = ExecuteClaimedRunInputBase & {
   readonly intake?: IntakeCapture;
   readonly intakeCapture?: IntakeCapture;
 };
+
+/** Read-only run access used by the restart capability. */
+export type ExecutionRunReader = (
+  runId: string,
+) => RunRecord | PromiseLike<RunRecord>;
+
+/** A coordinator-facing edge executor for one already-begun effect. */
+export type ExecutionEffectExecutor = (
+  effect: EffectRecord,
+) => unknown | PromiseLike<unknown>;
+
+/**
+ * The Block 3 capability is deliberately narrower than the coordinator. It
+ * receives a durable effect, reads the current run through this seam, and
+ * returns a receipt; all durable settlement remains coordinator-owned.
+ */
+export interface ExecutionCapabilityInput {
+  /** Prefer this seam: the caller supplies the executeClaimedRun/coordinator
+   * adapter and retains all durable settlement behavior. */
+  readonly execute?: ExecutionEffectExecutor;
+  readonly readRun?: ExecutionRunReader;
+  readonly workspacePrepare?: WorkspacePreparation;
+  readonly workspaceInspect?: WorkspaceInspection;
+  readonly builder?: BuilderAdapter;
+  readonly verify?: VerificationAdapter;
+}
+
+export interface ExecutionCapability {
+  readonly dispatcher: EffectDispatcherLike;
+  readonly observer: EffectObserverLike;
+}
 
 export type ExecutionOutcome =
   | {
@@ -598,7 +632,7 @@ interface ValidatedBuilderSuccess {
   readonly terminal: BuilderTerminalResult;
   readonly stdout: string;
   readonly stderr: string;
-  readonly exitCode: number | null;
+  readonly exitCode: 0;
 }
 
 interface ValidatedBuilderFailure {
@@ -630,15 +664,16 @@ function validateBuilderResult(value: unknown): ValidatedBuilderResult {
     throw new BuilderReceiptError("Builder invocation result kind is invalid.");
   const stdout = boundedBuilderLog(value.stdout, "Builder stdout");
   const stderr = boundedBuilderLog(value.stderr, "Builder stderr");
-  const exitCode = value.exitCode === undefined ? null : value.exitCode;
-  if (
-    exitCode !== null &&
-    (typeof exitCode !== "number" ||
-      !Number.isSafeInteger(exitCode) ||
-      exitCode < 0)
-  )
-    throw new BuilderReceiptError("Builder exit code is invalid.");
+  const exitCode = value.exitCode;
   if (value.kind === "failed") {
+    const failedExitCode = exitCode === undefined ? null : exitCode;
+    if (
+      failedExitCode !== null &&
+      (typeof failedExitCode !== "number" ||
+        !Number.isSafeInteger(failedExitCode) ||
+        failedExitCode < 0)
+    )
+      throw new BuilderReceiptError("Builder exit code is invalid.");
     if (
       typeof value.reason !== "string" ||
       value.reason.trim().length === 0 ||
@@ -656,15 +691,17 @@ function validateBuilderResult(value: unknown): ValidatedBuilderResult {
       reason: value.reason,
       stdout,
       stderr,
-      exitCode,
+      exitCode: failedExitCode,
       signal: value.signal,
       ...(error === undefined ? {} : { error }),
     };
   }
   const terminal = validateBuilderTerminal(value.terminal);
-  if (exitCode !== null && exitCode !== 0)
-    throw new BuilderReceiptError("Builder success must have exit code zero.");
-  return { kind: "succeeded", terminal, stdout, stderr, exitCode };
+  if (exitCode !== 0)
+    throw new BuilderReceiptError(
+      "Builder success must have exit code exactly zero.",
+    );
+  return { kind: "succeeded", terminal, stdout, stderr, exitCode: 0 };
 }
 
 function persistedWorkspaceReceipt(
@@ -879,6 +916,697 @@ function verificationIntent(
     },
     dispatch: false,
   };
+}
+
+type ExecutionEffectKind = "workspace_prepare" | "agent_build" | "verify";
+
+interface CapabilityWorkspaceIntent {
+  readonly runId: string;
+  readonly issueNumber: number;
+  readonly baseBranch: "main";
+}
+
+interface CapabilityBuilderIntent {
+  readonly runId: string;
+  readonly issueNumber: number;
+  readonly worktreePath: string;
+  readonly branch: string;
+  readonly baseSha: string;
+  readonly changedFiles: readonly string[];
+  readonly prompt: string;
+  readonly promptHash: string;
+  readonly model: string;
+  readonly reasoningEffort: string;
+  readonly attempt: 1;
+}
+
+interface CapabilityVerificationIntent {
+  readonly runId: string;
+  readonly worktreePath: string;
+  readonly command: string;
+  readonly expectedHeadSha: string;
+  readonly changedFiles: readonly string[];
+  readonly attempt: 1;
+}
+
+function canonicalCapabilityJson(value: unknown): string {
+  if (Array.isArray(value)) return JSON.stringify(value.map(canonicalValue));
+  if (!isRecord(value)) {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined)
+      throw new BuilderReceiptError("Effect intent is not JSON data.");
+    return serialized;
+  }
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.keys(value)
+        .toSorted()
+        .map((key) => [key, canonicalValue(value[key])]),
+    ),
+  );
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (isRecord(value))
+    return Object.fromEntries(
+      Object.keys(value)
+        .toSorted()
+        .map((key) => [key, canonicalValue(value[key])]),
+    );
+  return value;
+}
+
+function capabilityKeys(
+  value: Record<string, unknown>,
+  keys: string[],
+): boolean {
+  return Object.keys(value).toSorted().join(",") === keys.toSorted().join(",");
+}
+
+function parseCapabilityIntent(
+  effect: EffectRecord,
+  kind: ExecutionEffectKind,
+  keys: string[],
+): Record<string, unknown> {
+  const expectedKey =
+    kind === "workspace_prepare"
+      ? workspaceEffectKey(effect.runId)
+      : kind === "agent_build"
+        ? builderEffectKey(effect.runId)
+        : verificationEffectKey(effect.runId);
+  if (effect.kind !== kind || effect.key !== expectedKey)
+    throw new BuilderReceiptError("Effect is not owned by Block 3.");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(effect.intent) as unknown;
+  } catch {
+    throw new BuilderReceiptError("Effect intent is not valid JSON.");
+  }
+  if (!isRecord(parsed) || !capabilityKeys(parsed, keys))
+    throw new BuilderReceiptError("Effect intent has an invalid shape.");
+  if (canonicalCapabilityJson(parsed) !== effect.intent)
+    throw new BuilderReceiptError("Effect intent is not canonical JSON.");
+  return parsed;
+}
+
+function capabilityFailureTrigger(
+  kind: ExecutionEffectKind,
+): Exclude<EffectResult["trigger"], undefined | null> {
+  if (kind === "workspace_prepare") return "startup_failed";
+  if (kind === "agent_build") return "builder_exhausted";
+  return "verification_failed_exhausted";
+}
+
+function capabilityFailure(
+  effect: EffectRecord,
+  kind: ExecutionEffectKind,
+  reason: string,
+  receipt?: unknown,
+): EffectResult {
+  return {
+    outcome: "failed",
+    trigger: capabilityFailureTrigger(kind),
+    ...(receipt === undefined ? {} : { receipt }),
+    evidence: boundedFailureReason(`${effect.key}: ${reason}`),
+  };
+}
+
+function capabilityAmbiguous(
+  effect: EffectRecord,
+  reason: string,
+): EffectResult {
+  return {
+    outcome: "ambiguous",
+    trigger: null,
+    evidence: boundedFailureReason(`${effect.key}: ${reason}`),
+  };
+}
+
+function capabilityWorkspace(
+  value: Record<string, unknown>,
+  run: RunRecord,
+  expectedHeadSha: string,
+): WorkspacePreparationReceipt {
+  if (
+    !isNonEmptyText(value.worktreePath) ||
+    !isNonEmptyText(value.branch) ||
+    typeof value.baseSha !== "string" ||
+    !shaPattern.test(value.baseSha) ||
+    !validChangedFiles(value.changedFiles)
+  )
+    throw new BuilderReceiptError("Effect workspace context is invalid.");
+  if (
+    run.worktreePath !== value.worktreePath ||
+    run.branch !== value.branch ||
+    run.baseSha !== value.baseSha
+  )
+    throw new BuilderReceiptError(
+      "Effect workspace context does not match persisted run facts.",
+    );
+  return {
+    path: value.worktreePath,
+    branch: value.branch,
+    baseBranch: "main",
+    baseSha: value.baseSha,
+    headSha: expectedHeadSha,
+    changedFiles: value.changedFiles,
+  };
+}
+
+function assertCapabilityWorkspaceStable(
+  expected: WorkspacePreparationReceipt,
+  observed: WorkspacePreparationReceipt,
+): void {
+  assertSameWorkspace(expected, observed);
+  if (
+    observed.headSha !== expected.headSha ||
+    observed.changedFiles.length !== expected.changedFiles.length ||
+    observed.changedFiles.some(
+      (path, index) => path !== expected.changedFiles[index],
+    )
+  )
+    throw new BuilderReceiptError(
+      "Observed workspace changed before a restart dispatch.",
+    );
+}
+
+function parseCapabilityIntake(run: RunRecord): IntakeCapture {
+  if (run.intakeJson === null)
+    throw new IntakeCaptureError("Effect run has no persisted intake.");
+  try {
+    return validateIntakeCapture(JSON.parse(run.intakeJson));
+  } catch (error) {
+    throw new IntakeCaptureError(
+      `Persisted effect intake is invalid: ${errorMessage(error)}`,
+    );
+  }
+}
+
+function ensureCapabilityRun(
+  effect: EffectRecord,
+  run: RunRecord,
+  kind: ExecutionEffectKind,
+  dispatch: boolean,
+): void {
+  if (run.id !== effect.runId)
+    throw new BuilderReceiptError("Effect run identity does not match.");
+  if (dispatch && run.revision !== effect.targetRevision)
+    throw new StaleRevisionError(effect.targetRevision);
+  const expectedState =
+    kind === "workspace_prepare"
+      ? "preparing"
+      : kind === "agent_build"
+        ? "building"
+        : "verifying";
+  if (run.state !== expectedState)
+    throw new BuilderReceiptError("Effect run state does not match its edge.");
+}
+
+async function inspectCapabilityWorkspace(
+  input: ExecutionCapabilityInput,
+  run: RunRecord,
+  expected: WorkspacePreparationReceipt,
+): Promise<WorkspacePreparationReceipt> {
+  if (input.workspaceInspect === undefined)
+    throw new BuilderReceiptError(
+      "Workspace inspection capability unavailable.",
+    );
+  const observed = validateWorkspaceReceipt(
+    await input.workspaceInspect(run, expected),
+  );
+  assertSameWorkspace(expected, observed);
+  return observed;
+}
+
+async function dispatchWorkspaceEffect(
+  input: ExecutionCapabilityInput,
+  effect: EffectRecord,
+  run: RunRecord,
+  intent: CapabilityWorkspaceIntent,
+): Promise<EffectResult> {
+  if (input.workspacePrepare === undefined)
+    return capabilityFailure(
+      effect,
+      "workspace_prepare",
+      "workspace preparation capability unavailable",
+    );
+  if (
+    intent.runId !== run.id ||
+    intent.issueNumber !== run.issueNumber ||
+    intent.baseBranch !== run.baseBranch
+  )
+    return capabilityFailure(effect, "workspace_prepare", "intent mismatch");
+  let rawReceipt: unknown;
+  try {
+    rawReceipt = await input.workspacePrepare(run);
+    const workspace = await inspectCapabilityWorkspace(
+      input,
+      run,
+      validateWorkspaceReceipt(rawReceipt),
+    );
+    return {
+      outcome: "confirmed",
+      trigger: "workspace_prepared",
+      receipt: workspace,
+      evidence: `Workspace prepared for ${run.id}.`,
+    };
+  } catch (error) {
+    return capabilityFailure(
+      effect,
+      "workspace_prepare",
+      `workspace edge failed: ${errorMessage(error)}`,
+    );
+  }
+}
+
+async function dispatchBuilderEffect(
+  input: ExecutionCapabilityInput,
+  effect: EffectRecord,
+  run: RunRecord,
+  intent: CapabilityBuilderIntent,
+): Promise<EffectResult> {
+  if (input.builder === undefined)
+    return capabilityFailure(
+      effect,
+      "agent_build",
+      "builder capability unavailable",
+    );
+  let intake: IntakeCapture;
+  let expected: WorkspacePreparationReceipt;
+  try {
+    intake = parseCapabilityIntake(run);
+    if (
+      intent.runId !== run.id ||
+      intent.issueNumber !== run.issueNumber ||
+      intent.model !== intake.builder.model ||
+      intent.reasoningEffort !== intake.builder.reasoningEffort
+    )
+      throw new BuilderReceiptError("Builder intent does not match intake.");
+    const promptReceipt = validatePromptReceipt({
+      prompt: intent.prompt,
+      promptHash: intent.promptHash,
+    });
+    expected = capabilityWorkspace(
+      intent as unknown as Record<string, unknown>,
+      run,
+      run.headSha ?? intent.baseSha,
+    );
+    const before = await inspectCapabilityWorkspace(input, run, expected);
+    assertCapabilityWorkspaceStable(expected, before);
+    let rawResult: unknown;
+    try {
+      rawResult = await input.builder.invoke({
+        issueNumber: run.issueNumber,
+        worktreePath: expected.path,
+        baseSha: expected.baseSha,
+        intake,
+        prompt: promptReceipt.prompt,
+        promptHash: promptReceipt.promptHash,
+        model: intake.builder.model,
+        reasoningEffort: intake.builder.reasoningEffort,
+      });
+    } catch (error) {
+      return capabilityFailure(
+        effect,
+        "agent_build",
+        `builder edge failed: ${errorMessage(error)}`,
+      );
+    }
+    if (!isRecord(rawResult))
+      throw new BuilderReceiptError("Builder receipt must be an object.");
+    if (
+      rawResult.promptHash !== undefined &&
+      rawResult.promptHash !== promptReceipt.promptHash
+    )
+      throw new BuilderReceiptError("Builder prompt hash does not match.");
+    if (
+      rawResult.model !== undefined &&
+      rawResult.model !== intake.builder.model
+    )
+      throw new BuilderReceiptError("Builder model does not match intake.");
+    if (
+      rawResult.reasoningEffort !== undefined &&
+      rawResult.reasoningEffort !== intake.builder.reasoningEffort
+    )
+      throw new BuilderReceiptError(
+        "Builder reasoning effort does not match intake.",
+      );
+    const result = validateBuilderResult(rawResult);
+    if (result.kind === "failed") {
+      return capabilityFailure(
+        effect,
+        "agent_build",
+        `Builder failed: ${result.reason}`,
+        {
+          kind: "failed",
+          promptHash: promptReceipt.promptHash,
+          model: intake.builder.model,
+          reasoningEffort: intake.builder.reasoningEffort,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          ...(result.error === undefined ? {} : { error: result.error }),
+        },
+      );
+    }
+    if (result.terminal.outcome === "blocked")
+      return capabilityFailure(
+        effect,
+        "agent_build",
+        "Builder returned a blocked terminal",
+        {
+          kind: "failed",
+          promptHash: promptReceipt.promptHash,
+          model: intake.builder.model,
+          reasoningEffort: intake.builder.reasoningEffort,
+          terminal: result.terminal,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          signal: null,
+        },
+      );
+    const after = await inspectCapabilityWorkspace(input, run, expected);
+    if (isRecord(rawResult) && rawResult.headSha !== undefined) {
+      if (rawResult.headSha !== after.headSha)
+        throw new BuilderReceiptError(
+          "Builder head SHA does not match workspace.",
+        );
+    }
+    const receipt: BuilderReceipt = {
+      kind: "succeeded",
+      promptHash: promptReceipt.promptHash,
+      model: intake.builder.model,
+      reasoningEffort: intake.builder.reasoningEffort,
+      terminal: result.terminal,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: 0,
+      headSha: after.headSha,
+      changedFiles: after.changedFiles,
+    };
+    return {
+      outcome: "confirmed",
+      trigger: "builder_succeeded",
+      receipt,
+      evidence: boundedFailureReason(result.terminal.summary),
+    };
+  } catch (error) {
+    return capabilityFailure(
+      effect,
+      "agent_build",
+      `Malformed builder effect context or receipt: ${errorMessage(error)}`,
+    );
+  }
+}
+
+async function dispatchVerificationEffect(
+  input: ExecutionCapabilityInput,
+  effect: EffectRecord,
+  run: RunRecord,
+  intent: CapabilityVerificationIntent,
+): Promise<EffectResult> {
+  if (input.verify === undefined)
+    return capabilityFailure(
+      effect,
+      "verify",
+      "verification capability unavailable",
+    );
+  try {
+    const intake = parseCapabilityIntake(run);
+    if (
+      intent.runId !== run.id ||
+      intent.worktreePath !== run.worktreePath ||
+      intent.expectedHeadSha !== run.headSha ||
+      intent.command !== intake.verificationCommand
+    )
+      throw new BuilderReceiptError(
+        "Verification intent does not match run facts.",
+      );
+    const expected = capabilityWorkspace(
+      {
+        worktreePath: intent.worktreePath,
+        branch: run.branch,
+        baseSha: run.baseSha,
+        changedFiles: intent.changedFiles,
+      },
+      run,
+      intent.expectedHeadSha,
+    );
+    await inspectCapabilityWorkspace(input, run, expected);
+    let rawResult: unknown;
+    try {
+      rawResult = await input.verify({
+        command: intent.command,
+        worktreePath: intent.worktreePath,
+        intake,
+        expectedHeadSha: intent.expectedHeadSha,
+      });
+    } catch (error) {
+      return capabilityFailure(
+        effect,
+        "verify",
+        `verification edge failed: ${errorMessage(error)}`,
+      );
+    }
+    const result = validateVerificationResult(
+      rawResult,
+      intent.command,
+      intent.worktreePath,
+      intent.expectedHeadSha,
+    );
+    if (result.kind === "failed")
+      return capabilityFailure(
+        effect,
+        "verify",
+        `Verification failed: ${result.reason ?? "command failed"}`,
+        {
+          kind: "failed",
+          command: result.command,
+          cwd: result.cwd,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          headSha: result.headSha,
+          changedFiles: intent.changedFiles,
+          reason: result.reason ?? "command failed",
+        },
+      );
+    const receipt: VerificationReceipt = {
+      kind: "succeeded",
+      command: result.command,
+      cwd: result.cwd,
+      exitCode: 0,
+      signal: null,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      headSha: result.headSha,
+      changedFiles: intent.changedFiles,
+    };
+    return {
+      outcome: "confirmed",
+      trigger: "verification_passed",
+      receipt,
+      evidence: "Verification passed.",
+    };
+  } catch (error) {
+    return capabilityFailure(
+      effect,
+      "verify",
+      `Malformed verification effect context or receipt: ${errorMessage(error)}`,
+    );
+  }
+}
+
+async function readCapabilityRun(
+  input: ExecutionCapabilityInput,
+  effect: EffectRecord,
+): Promise<RunRecord> {
+  if (input.readRun === undefined)
+    throw new BuilderReceiptError(
+      "Execution capability read seam unavailable.",
+    );
+  const run = await input.readRun(effect.runId);
+  if (!isRecord(run) || run.id !== effect.runId)
+    throw new BuilderReceiptError("Read run does not match effect identity.");
+  return run as unknown as RunRecord;
+}
+
+function ownedExecutionKind(
+  kind: EffectRecord["kind"],
+): kind is ExecutionEffectKind {
+  return (
+    kind === "workspace_prepare" || kind === "agent_build" || kind === "verify"
+  );
+}
+
+function capabilityIntentKeys(kind: ExecutionEffectKind): string[] {
+  if (kind === "workspace_prepare")
+    return ["baseBranch", "issueNumber", "runId"];
+  if (kind === "agent_build")
+    return [
+      "attempt",
+      "baseSha",
+      "branch",
+      "changedFiles",
+      "issueNumber",
+      "model",
+      "prompt",
+      "promptHash",
+      "reasoningEffort",
+      "runId",
+      "worktreePath",
+    ];
+  return [
+    "attempt",
+    "changedFiles",
+    "command",
+    "expectedHeadSha",
+    "runId",
+    "worktreePath",
+  ];
+}
+
+function parseOwnedCapabilityIntent(
+  effect: EffectRecord,
+):
+  | CapabilityWorkspaceIntent
+  | CapabilityBuilderIntent
+  | CapabilityVerificationIntent {
+  if (!ownedExecutionKind(effect.kind))
+    throw new BuilderReceiptError("Effect kind is outside Block 3 ownership.");
+  const parsed = parseCapabilityIntent(
+    effect,
+    effect.kind,
+    capabilityIntentKeys(effect.kind),
+  );
+  if (effect.kind === "workspace_prepare") {
+    if (
+      typeof parsed.runId !== "string" ||
+      !isPositiveSafeInteger(parsed.issueNumber) ||
+      parsed.baseBranch !== "main"
+    )
+      throw new BuilderReceiptError("Workspace effect intent is invalid.");
+    return parsed as unknown as CapabilityWorkspaceIntent;
+  }
+  if (effect.kind === "agent_build") {
+    if (
+      typeof parsed.runId !== "string" ||
+      !isPositiveSafeInteger(parsed.issueNumber) ||
+      !isNonEmptyText(parsed.worktreePath) ||
+      !isNonEmptyText(parsed.branch) ||
+      typeof parsed.baseSha !== "string" ||
+      !shaPattern.test(parsed.baseSha) ||
+      !validChangedFiles(parsed.changedFiles) ||
+      !isNonEmptyText(parsed.prompt) ||
+      !isNonEmptyText(parsed.promptHash) ||
+      !sha256Pattern.test(parsed.promptHash) ||
+      !isNonEmptyText(parsed.model) ||
+      !isNonEmptyText(parsed.reasoningEffort) ||
+      parsed.attempt !== 1
+    )
+      throw new BuilderReceiptError("Builder effect intent is invalid.");
+    validatePromptReceipt({
+      prompt: parsed.prompt,
+      promptHash: parsed.promptHash,
+    });
+    return parsed as unknown as CapabilityBuilderIntent;
+  }
+  if (
+    typeof parsed.runId !== "string" ||
+    !isNonEmptyText(parsed.worktreePath) ||
+    !isNonEmptyText(parsed.command) ||
+    typeof parsed.expectedHeadSha !== "string" ||
+    !shaPattern.test(parsed.expectedHeadSha) ||
+    !validChangedFiles(parsed.changedFiles) ||
+    parsed.attempt !== 1
+  )
+    throw new BuilderReceiptError("Verification effect intent is invalid.");
+  return parsed as unknown as CapabilityVerificationIntent;
+}
+
+/**
+ * Build the restart-safe Block 3 edge capability. Pending effects are
+ * dispatchable only after their canonical intent and current run are checked.
+ * In-flight and ambiguous process effects are observed fail-closed; neither
+ * builder nor verifier is relaunched or adopted from process state.
+ */
+export function createExecutionCapability(
+  input: ExecutionCapabilityInput,
+): ExecutionCapability {
+  const dispatch = async (effect: EffectRecord): Promise<EffectResult> => {
+    if (!ownedExecutionKind(effect.kind))
+      throw new BuilderReceiptError(
+        "Execution capability does not own effect kind.",
+      );
+    if (effect.status !== "in_flight")
+      return capabilityAmbiguous(effect, "effect is not safely dispatchable");
+    let run: RunRecord;
+    let parsed:
+      | CapabilityWorkspaceIntent
+      | CapabilityBuilderIntent
+      | CapabilityVerificationIntent;
+    try {
+      run = await readCapabilityRun(input, effect);
+      ensureCapabilityRun(effect, run, effect.kind, true);
+      parsed = parseOwnedCapabilityIntent(effect);
+    } catch (error) {
+      if (error instanceof StaleRevisionError)
+        return capabilityAmbiguous(effect, "effect revision is stale");
+      return capabilityFailure(
+        effect,
+        effect.kind,
+        `invalid canonical effect context: ${errorMessage(error)}`,
+      );
+    }
+    if (effect.kind === "workspace_prepare")
+      return dispatchWorkspaceEffect(
+        input,
+        effect,
+        run,
+        parsed as CapabilityWorkspaceIntent,
+      );
+    if (effect.kind === "agent_build")
+      return dispatchBuilderEffect(
+        input,
+        effect,
+        run,
+        parsed as CapabilityBuilderIntent,
+      );
+    return dispatchVerificationEffect(
+      input,
+      effect,
+      run,
+      parsed as CapabilityVerificationIntent,
+    );
+  };
+
+  const observe = async (effect: EffectRecord): Promise<EffectResult> => {
+    if (!ownedExecutionKind(effect.kind))
+      throw new BuilderReceiptError(
+        "Execution capability does not own effect kind.",
+      );
+    if (effect.status !== "in_flight" && effect.status !== "ambiguous")
+      return capabilityAmbiguous(effect, "effect is not observable");
+    try {
+      const run = await readCapabilityRun(input, effect);
+      ensureCapabilityRun(effect, run, effect.kind, false);
+      parseOwnedCapabilityIntent(effect);
+    } catch (error) {
+      return capabilityAmbiguous(
+        effect,
+        `cannot prove canonical context or ownership: ${errorMessage(error)}`,
+      );
+    }
+    return capabilityAmbiguous(
+      effect,
+      "external process completion is not provable after restart; no process was relaunched or adopted",
+    );
+  };
+  return { dispatcher: dispatch, observer: observe };
 }
 
 function isDispatchable(effect: EffectRecord): boolean {
