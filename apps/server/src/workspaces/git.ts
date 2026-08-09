@@ -105,6 +105,7 @@ function safeGitEnvironment(): NodeJS.ProcessEnv {
         "ENV",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CONFIG",
+        "GIT_COMMON_DIR",
         "GIT_DIR",
         "GIT_EXEC_PATH",
         "GIT_EXTERNAL_DIFF",

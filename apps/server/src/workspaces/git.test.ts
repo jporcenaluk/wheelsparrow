@@ -789,11 +789,14 @@ describe("contained Git worktree boundary", () => {
     });
     await writeFile(join(prepared.path, "README.md"), "safe-env\n", "utf8");
     const alternateIndex = join(repositoryRoot, "outside-index");
+    const alternateCommonDirectory = join(repositoryRoot, "outside-common");
     const previousGitDir = process.env.GIT_DIR;
     const previousGitIndex = process.env.GIT_INDEX_FILE;
+    const previousGitCommonDirectory = process.env.GIT_COMMON_DIR;
     let publishedHead = "";
     process.env.GIT_DIR = repositoryRoot;
     process.env.GIT_INDEX_FILE = alternateIndex;
+    process.env.GIT_COMMON_DIR = alternateCommonDirectory;
     try {
       const receipt = await commitAndPushRunWorktree({
         repositoryRoot,
@@ -814,6 +817,9 @@ describe("contained Git worktree boundary", () => {
       else process.env.GIT_DIR = previousGitDir;
       if (previousGitIndex === undefined) delete process.env.GIT_INDEX_FILE;
       else process.env.GIT_INDEX_FILE = previousGitIndex;
+      if (previousGitCommonDirectory === undefined)
+        delete process.env.GIT_COMMON_DIR;
+      else process.env.GIT_COMMON_DIR = previousGitCommonDirectory;
     }
     expect(publishedHead).toMatch(/^[0-9a-f]{40}$/u);
     expect(publishedHead).not.toBe(prepared.baseSha);
