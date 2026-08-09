@@ -1,37 +1,52 @@
-import { useEffect, useState } from "react";
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useMemo } from "react";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
-import { fetchHealth } from "./api.js";
+import { Shell } from "./components/layout.js";
+import { ConfigurationRoute } from "./routes/configuration.js";
+import { QueueRoute } from "./routes/queue.js";
+import { ReviewRoute } from "./routes/review.js";
+import { RunRoute } from "./routes/run.js";
 
-type ServiceState = "checking" | "live" | "unavailable";
+function OperatorRoutes() {
+  const queryClient = useQueryClient();
+  const invalidateSnapshots = useMemo(
+    () => () => {
+      void queryClient.invalidateQueries({ queryKey: ["operator"] });
+    },
+    [queryClient],
+  );
 
-const statusText: Record<ServiceState, string> = {
-  checking: "Checking service",
-  live: "Service live",
-  unavailable: "Service unavailable",
-};
+  return <Shell onSnapshot={invalidateSnapshots} />;
+}
 
 export function App() {
-  const [state, setState] = useState<ServiceState>("checking");
-
-  useEffect(() => {
-    let active = true;
-    void fetchHealth().then(
-      () => active && setState("live"),
-      () => active && setState("unavailable"),
-    );
-    return () => {
-      active = false;
-    };
-  }, []);
+  const queryClient = useMemo(
+    () =>
+      new QueryClient({
+        defaultOptions: { queries: { staleTime: 5_000, retry: false } },
+      }),
+    [],
+  );
 
   return (
-    <main className="control-surface">
-      <p className="eyebrow">Local SDLC orchestrator</p>
-      <h1>Wheelsparrow</h1>
-      <p className={`status status--${state}`} role="status" aria-live="polite">
-        <span aria-hidden="true" className="status__mark" />
-        {statusText[state]}
-      </p>
-    </main>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <Routes>
+          <Route element={<OperatorRoutes />}>
+            <Route index element={<Navigate to="/queue" replace />} />
+            <Route path="queue" element={<QueueRoute />} />
+            <Route path="runs/:runId" element={<RunRoute />} />
+            <Route path="review" element={<ReviewRoute />} />
+            <Route path="configuration" element={<ConfigurationRoute />} />
+            <Route path="*" element={<Navigate to="/queue" replace />} />
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </QueryClientProvider>
   );
 }

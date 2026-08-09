@@ -806,6 +806,131 @@ describe("workflow coordinator", () => {
     await coordinator.close();
   });
 
+  test("returns a review run to Todo immediately when the coding slot is free", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    await coordinator.createClaim(claimInput());
+    await coordinator.transition({
+      runId: "run-1",
+      expectedRevision: 1,
+      trigger: "handoff_required",
+      at: "2026-08-08T19:01:00.000Z",
+      summary: { text: "Needs operator review." },
+    });
+
+    const returned = await coordinator.returnToTodo({
+      runId: "run-1",
+      expectedRevision: 2,
+      feedback: "Address the reviewer finding about the timeout path.",
+      at: "2026-08-08T19:02:00.000Z",
+    });
+
+    expect(returned).toMatchObject({
+      state: "returning_to_todo",
+      revision: 3,
+      reworkEpoch: 1,
+      repairRound: 0,
+      requiredAction: "Address the reviewer finding about the timeout path.",
+    });
+    const events = await listEvents(connection.db, "run-1");
+    expect(events.at(-1)).toMatchObject({
+      kind: "return_todo_reserved",
+      summary: "Address the reviewer finding about the timeout path.",
+      runRevision: 3,
+    });
+    await coordinator.close();
+  });
+
+  test("queues Return to Todo while another run owns the coding slot", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    await coordinator.createClaim(claimInput("run-1"));
+    await coordinator.transition({
+      runId: "run-1",
+      expectedRevision: 1,
+      trigger: "handoff_required",
+      at: "2026-08-08T19:01:00.000Z",
+      summary: { text: "Needs operator review." },
+    });
+    await coordinator.createClaim(claimInput("run-2"));
+
+    await expect(
+      coordinator.returnToTodo({
+        runId: "run-1",
+        expectedRevision: 2,
+        feedback: "Queue this run behind the active ticket.",
+        at: "2026-08-08T19:02:00.000Z",
+      }),
+    ).resolves.toMatchObject({
+      state: "queued_rework",
+      revision: 3,
+      reworkEpoch: 0,
+      requiredAction: "Queue this run behind the active ticket.",
+    });
+    await coordinator.close();
+  });
+
+  test("rejects stale Return to Todo commands without changing durable evidence", async () => {
+    const connection = await createDatabase();
+    const coordinator = new WorkflowCoordinator({ connection });
+    await coordinator.createClaim(claimInput());
+    await coordinator.transition({
+      runId: "run-1",
+      expectedRevision: 1,
+      trigger: "handoff_required",
+      at: "2026-08-08T19:01:00.000Z",
+      summary: { text: "Needs operator review." },
+    });
+
+    await expect(
+      coordinator.returnToTodo({
+        runId: "run-1",
+        expectedRevision: 1,
+        feedback: "This stale command must not mutate the run.",
+        at: "2026-08-08T19:02:00.000Z",
+      }),
+    ).rejects.toBeInstanceOf(StaleRevisionError);
+    expect(await readRun(connection.db, "run-1")).toMatchObject({
+      state: "review",
+      revision: 2,
+      requiredAction: null,
+    });
+    await coordinator.close();
+  });
+
+  test.each([
+    ["blank", "   "],
+    ["oversized", "x".repeat(4 * 1024 + 1)],
+  ])(
+    "rejects %s Return to Todo feedback before a state change",
+    async (_kind, feedback) => {
+      const connection = await createDatabase();
+      const coordinator = new WorkflowCoordinator({ connection });
+      await coordinator.createClaim(claimInput());
+      await coordinator.transition({
+        runId: "run-1",
+        expectedRevision: 1,
+        trigger: "handoff_required",
+        at: "2026-08-08T19:01:00.000Z",
+        summary: { text: "Needs operator review." },
+      });
+
+      await expect(
+        coordinator.returnToTodo({
+          runId: "run-1",
+          expectedRevision: 2,
+          feedback,
+          at: "2026-08-08T19:02:00.000Z",
+        }),
+      ).rejects.toThrow(/feedback|summary|required action/i);
+      expect(await readRun(connection.db, "run-1")).toMatchObject({
+        state: "review",
+        revision: 2,
+      });
+      await coordinator.close();
+    },
+  );
+
   test("marks this coordinator's in-flight effects ambiguous on close with run evidence", async () => {
     const connection = await createDatabase();
     const complete = vi.fn();
