@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
-import { fetchRun } from "../api.js";
+import { fetchRun, safeGithubPullRequestUrl } from "../api.js";
 import {
   ErrorState,
   LoadingState,
@@ -17,6 +17,7 @@ export function RunRoute() {
   if (query.isPending) return <LoadingState />;
   if (query.isError) return <ErrorState message={query.error.message} />;
   const { run, steps, findings, approvals, events } = query.data;
+  const pullRequestHref = safeGithubPullRequestUrl(run.pull_request_url);
   return (
     <section className="route-stack" aria-labelledby="run-heading">
       <div className="page-heading page-heading--compact">
@@ -88,13 +89,13 @@ export function RunRoute() {
             <div>
               <dt>Pull request</dt>
               <dd>
-                {run.pull_request_url ? (
-                  <a href={run.pull_request_url}>
+                {pullRequestHref ? (
+                  <a href={pullRequestHref}>
                     {run.pull_request_title ??
                       `#${run.pull_request_number ?? "?"}`}
                   </a>
                 ) : (
-                  "—"
+                  (run.pull_request_url ?? "—")
                 )}
               </dd>
             </div>

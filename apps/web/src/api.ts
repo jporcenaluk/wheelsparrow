@@ -17,10 +17,46 @@ import {
 import type { TSchema } from "typebox";
 import { Value } from "typebox/value";
 
-const JSON_MEDIA_TYPE =
-  /^application\/[a-z0-9!#$&^_.+-]+(?:\+[a-z0-9!#$&^_.+-]+)?$/u;
+const JSON_MEDIA_TYPE = /^application\/(?:json|[a-z0-9!#$&^_.+-]+\+json)$/u;
 const OPERATOR_ROOT = "/api/operator";
+const GITHUB_PATH_SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u;
+const GITHUB_PULL_REQUEST_PATH =
+  /^\/([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\/([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\/pull\/([1-9][0-9]*)$/u;
 let csrfToken: string | null = null;
+
+export function safeGithubPullRequestUrl(value: string | null): string | null {
+  if (value === null || value.length === 0) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  const match = GITHUB_PULL_REQUEST_PATH.exec(parsed.pathname);
+  const owner = match?.[1];
+  const repository = match?.[2];
+  const number = match?.[3];
+  if (
+    match === null ||
+    owner === undefined ||
+    repository === undefined ||
+    number === undefined ||
+    !GITHUB_PATH_SEGMENT.test(owner) ||
+    !GITHUB_PATH_SEGMENT.test(repository) ||
+    !Number.isSafeInteger(Number(number)) ||
+    parsed.protocol !== "https:" ||
+    parsed.hostname !== "github.com" ||
+    parsed.port !== "" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.search !== "" ||
+    parsed.hash !== "" ||
+    parsed.href !== value
+  ) {
+    return null;
+  }
+  return value;
+}
 
 export class OperatorApiError extends Error {
   readonly status: number;

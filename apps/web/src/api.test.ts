@@ -2,7 +2,11 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { fetchQueue, subscribeToSnapshots } from "./api.js";
+import {
+  fetchQueue,
+  safeGithubPullRequestUrl,
+  subscribeToSnapshots,
+} from "./api.js";
 
 const queue = {
   schema_version: 1,
@@ -34,6 +38,37 @@ describe("operator API client", () => {
     );
 
     await expect(fetchQueue()).rejects.toThrow("JSON media type");
+  });
+
+  it("rejects application media types that are neither JSON nor +json", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(queue), {
+            status: 200,
+            headers: { "content-type": "application/problem" },
+          }),
+      ),
+    );
+
+    await expect(fetchQueue()).rejects.toThrow("JSON media type");
+  });
+
+  it("accepts only raw canonical GitHub pull request URLs", () => {
+    expect(
+      safeGithubPullRequestUrl("https://github.com/octo/widget/pull/7"),
+    ).toBe("https://github.com/octo/widget/pull/7");
+    for (const value of [
+      "https://example.com/octo/widget/pull/7",
+      "https://github.com/octo/widget/pull/0",
+      "https://github.com/octo/widget/pull/7?tab=files",
+      "https://github.com:443/octo/widget/pull/7",
+      "https://github.com/octo%2Fwidget/pull/7",
+      "javascript:alert(1)",
+    ]) {
+      expect(safeGithubPullRequestUrl(value)).toBeNull();
+    }
   });
 
   it("invalidates only for a valid snapshot notification and closes on cleanup", () => {
