@@ -75,6 +75,9 @@ importers:
 
   apps/web:
     dependencies:
+      '@tanstack/react-query':
+        specifier: 5.90.5
+        version: 5.90.5(react@19.2.8)
       '@wheelsparrow/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
@@ -84,6 +87,9 @@ importers:
       react-dom:
         specifier: 19.2.8
         version: 19.2.8(react@19.2.8)
+      react-router-dom:
+        specifier: 7.9.4
+        version: 7.9.4(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       typebox:
         specifier: 1.3.10
         version: 1.3.10
@@ -553,6 +559,14 @@ packages:
 
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
+
+  '@tanstack/query-core@5.90.5':
+    resolution: {integrity: sha512-wLamYp7FaDq6ZnNehypKI5fNvxHPfTYylE0m/ZpuuzJfJqhR5Pxg9gvGBHZx4n7J+V5Rg5mZxHHTlv25Zt5u+w==}
+
+  '@tanstack/react-query@5.90.5':
+    resolution: {integrity: sha512-pN+8UWpxZkEJ/Rnnj2v2Sxpx1WFlaa9L6a4UO89p6tTQbeo+m0MS8oYDjbggrR8QcTyjKoYWKS3xJQGr3ExT8Q==}
+    peerDependencies:
+      react: ^18 || ^19
 
   '@testing-library/dom@10.4.1':
     resolution: {integrity: sha512-o4PXJQidqJl82ckFaXUeoAW+XysPLauYI43Abki5hABd853iMhitooc6znOnczgbTYmEP6U6/y1ZyKAIsvMKGg==}
@@ -1412,6 +1426,23 @@ packages:
   react-is@17.0.2:
     resolution: {integrity: sha512-w2GsyukL62IJnlaff/nRegPQR94C/XXamvMWmSHRJ4y7Ts/4ocGRmTHvOs8PSE6pB3dWOrD/nueuU5sduBsQ4w==}
 
+  react-router-dom@7.9.4:
+    resolution: {integrity: sha512-f30P6bIkmYvnHHa5Gcu65deIXoA2+r3Eb6PJIAddvsT9aGlchMatJ51GgpU470aSqRRbFX22T70yQNUGuW3DfA==}
+    engines: {node: '>=20.0.0'}
+    peerDependencies:
+      react: '>=18'
+      react-dom: '>=18'
+
+  react-router@7.9.4:
+    resolution: {integrity: sha512-SD3G8HKviFHg9xj7dNODUKDFgpG4xqD5nhyd0mYoB5iISepuZAvzSr8ywxgxKJ52yRzf/HWtVHc9AWwoTbljvA==}
+    engines: {node: '>=20.0.0'}
+    peerDependencies:
+      react: '>=18'
+      react-dom: '>=18'
+    peerDependenciesMeta:
+      react-dom:
+        optional: true
+
   react@19.2.8:
     resolution: {integrity: sha512-PWaYA1L/q9u2u7xYQi+Y3L3Yfnie7XyLeaJICV1MGD6LprsBxcAqGjYyr0eY3p+QdsA+x/Irkt4Qif8D63+Sbw==}
     engines: {node: '>=0.10.0'}
@@ -2003,6 +2034,13 @@ snapshots:
   '@sindresorhus/merge-streams@4.0.0': {}
 
   '@standard-schema/spec@1.1.0': {}
+
+  '@tanstack/query-core@5.90.5': {}
+
+  '@tanstack/react-query@5.90.5(react@19.2.8)':
+    dependencies:
+      '@tanstack/query-core': 5.90.5
+      react: 19.2.8
 
   '@testing-library/dom@10.4.1':
     dependencies:
@@ -2901,6 +2939,20 @@ snapshots:
       scheduler: 0.27.0
 
   react-is@17.0.2: {}
+
+  react-router-dom@7.9.4(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
+    dependencies:
+      react: 19.2.8
+      react-dom: 19.2.8(react@19.2.8)
+      react-router: 7.9.4(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+
+  react-router@7.9.4(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
+    dependencies:
+      cookie: 1.1.1
+      react: 19.2.8
+      set-cookie-parser: 2.7.2
+    optionalDependencies:
+      react-dom: 19.2.8(react@19.2.8)
 
   react@19.2.8: {}
 
