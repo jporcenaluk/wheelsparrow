@@ -4,6 +4,11 @@ import {
   GitHubDeliveryClient,
   GitHubDeliveryClientError,
 } from "./delivery-client.js";
+import type {
+  ConditionalProjectStatusMove,
+  GitHubProjectGateway,
+  ProjectItem,
+} from "./project.js";
 
 const repository = "octo/widget";
 const baseSha = "a".repeat(40);
@@ -97,6 +102,26 @@ function graphqlCandidate() {
 }
 
 describe("GitHubDeliveryClient", () => {
+  test("fails closed before fetch when credentials are absent", async () => {
+    let calls = 0;
+    const gateway = new GitHubDeliveryClient({
+      owner: "octo",
+      repository: "widget",
+      endpoint: "https://api.github.test/graphql",
+      restEndpoint: "https://api.github.test",
+      fetch: async () => {
+        calls += 1;
+        return response(graphqlCandidate());
+      },
+    });
+    await expect(
+      gateway.readMergeCandidate(candidateRequest()),
+    ).rejects.toMatchObject({
+      kind: "credentials_unavailable",
+    });
+    expect(calls).toBe(0);
+  });
+
   test("reads exact PR identity, checks, threads, mergeability, and methods", async () => {
     const calls: Request[] = [];
     const gateway = client(async (input, init) => {
@@ -231,5 +256,192 @@ describe("GitHubDeliveryClient", () => {
     expect(error).toBeInstanceOf(GitHubDeliveryClientError);
     expect(String(error)).not.toContain("ghs_response_secret");
     expect(String(error)).not.toContain("provider token");
+  });
+
+  test("rejects exact-head drift before attempting the merge mutation", async () => {
+    const calls: Request[] = [];
+    const gateway = client(async (input, init) => {
+      calls.push(new Request(input, init));
+      const body = graphqlCandidate();
+      body.data.repository.pullRequest.headRefOid = "d".repeat(40);
+      return response(body);
+    });
+
+    await expect(
+      gateway.mergePullRequest({
+        ...candidateRequest(),
+        effectKey: "run:1:merge:drift",
+        method: "squash",
+      }),
+    ).rejects.toMatchObject({ kind: "head_drift" });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("classifies an explicit provider merge rejection as prevented", async () => {
+    const gateway = client(async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url.endsWith("/graphql")) return response(graphqlCandidate());
+      return response({ message: "merge conflict: provider details" }, 409);
+    });
+
+    await expect(
+      gateway.mergePullRequest({
+        ...candidateRequest(),
+        effectKey: "run:1:merge:prevented",
+        method: "squash",
+      }),
+    ).rejects.toMatchObject({ kind: "merge_prevented" });
+  });
+
+  test("classifies an explicit merged-false response as prevented", async () => {
+    const gateway = client(async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url.endsWith("/graphql")) return response(graphqlCandidate());
+      return response({ merged: false, sha: null });
+    });
+
+    await expect(
+      gateway.mergePullRequest({
+        ...candidateRequest(),
+        effectKey: "run:1:merge:false",
+        method: "squash",
+      }),
+    ).rejects.toMatchObject({ kind: "merge_prevented" });
+  });
+
+  test("reports a successful workflow with a different environment SHA as a mismatch", async () => {
+    const gateway = client(async (input) => {
+      const url = new URL(input.toString());
+      if (url.pathname.includes("/actions/workflows/")) {
+        return response({
+          workflow_runs: [
+            {
+              id: 11,
+              path: ".github/workflows/deploy.yml",
+              head_sha: mergeSha,
+              status: "completed",
+              conclusion: "success",
+            },
+          ],
+        });
+      }
+      if (url.pathname.endsWith("/deployments")) {
+        return response([
+          { id: 21, environment: "staging", sha: "d".repeat(40) },
+        ]);
+      }
+      return response([
+        {
+          id: 22,
+          environment: "staging",
+          state: "success",
+          created_at: "2026-08-09T10:00:00Z",
+        },
+      ]);
+    });
+
+    await expect(
+      gateway.observeStaging({
+        repository,
+        workflow: "deploy.yml",
+        environment: "staging",
+        mergeSha,
+      }),
+    ).resolves.toMatchObject({
+      outcome: "sha_mismatch",
+      deployment: { deployedSha: "d".repeat(40) },
+    });
+  });
+
+  test("fails closed for an arbitrary endpoint override", () => {
+    expect(
+      () =>
+        new GitHubDeliveryClient({
+          owner: "octo",
+          repository: "widget",
+          token: "ghs_test_token",
+          endpoint: "https://evil.example/graphql",
+        }),
+    ).toThrowError(expect.objectContaining({ kind: "invalid_input" }));
+  });
+
+  test("requires an observed merge SHA and replays Done by effect key", async () => {
+    const doneItem: ProjectItem = {
+      projectItemId: "PVTI_1",
+      projectId: "PVT_1",
+      projectNumber: 9,
+      repository,
+      issueNodeId: "I_42",
+      issueNumber: 42,
+      isOpen: true,
+      status: "Done",
+      revision: "revision-2",
+      labels: ["mvp"],
+      createdAt: "2026-08-09T12:00:00.000Z",
+      dependencies: [],
+    };
+    let moves = 0;
+    const projectGateway: GitHubProjectGateway = {
+      readProject: async () => ({
+        projectId: "PVT_1",
+        projectNumber: 9,
+        repository,
+        items: [doneItem],
+      }),
+      readProjectItem: async () => doneItem,
+      moveProjectItem: async (_request: ConditionalProjectStatusMove) => {
+        moves += 1;
+        return { outcome: "moved", item: doneItem };
+      },
+    };
+    const gateway = new GitHubDeliveryClient({
+      owner: "octo",
+      repository: "widget",
+      token: "ghs_test_token",
+      endpoint: "https://api.github.test/graphql",
+      restEndpoint: "https://api.github.test",
+      projectGateway,
+      fetch: async (input, init) => {
+        const request = new Request(input, init);
+        if (request.url.endsWith("/graphql"))
+          return response(graphqlCandidate());
+        return response({ merged: true, sha: mergeSha });
+      },
+    });
+    const doneRequest = {
+      repository,
+      projectId: "PVT_1",
+      projectNumber: 9,
+      itemId: "PVTI_1",
+      issueNodeId: "I_42",
+      issueNumber: 42,
+      expectedRevision: "revision-1",
+      fromStatus: "Review",
+      toStatus: "Done",
+      effectKey: "run:1:done",
+      mergeSha,
+    } as const;
+    await expect(
+      gateway.moveProjectItemToDone(doneRequest),
+    ).resolves.toMatchObject({
+      outcome: "rejected",
+      reason: { kind: "merge_not_observed" },
+    });
+    await gateway.mergePullRequest({
+      ...candidateRequest(),
+      effectKey: "run:1:merge:done",
+      method: "squash",
+    });
+    await expect(
+      gateway.moveProjectItemToDone(doneRequest),
+    ).resolves.toMatchObject({
+      outcome: "moved",
+    });
+    await expect(
+      gateway.moveProjectItemToDone(doneRequest),
+    ).resolves.toMatchObject({
+      outcome: "already_applied",
+    });
+    expect(moves).toBe(1);
   });
 });
