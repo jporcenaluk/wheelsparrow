@@ -1139,7 +1139,7 @@ async function inspectCapabilityWorkspace(
   return observed;
 }
 
-async function dispatchWorkspaceEffect(
+async function _dispatchWorkspaceEffect(
   input: ExecutionCapabilityInput,
   effect: EffectRecord,
   run: RunRecord,
@@ -1180,7 +1180,7 @@ async function dispatchWorkspaceEffect(
   }
 }
 
-async function dispatchBuilderEffect(
+async function _dispatchBuilderEffect(
   input: ExecutionCapabilityInput,
   effect: EffectRecord,
   run: RunRecord,
@@ -1322,7 +1322,7 @@ async function dispatchBuilderEffect(
   }
 }
 
-async function dispatchVerificationEffect(
+async function _dispatchVerificationEffect(
   input: ExecutionCapabilityInput,
   effect: EffectRecord,
   run: RunRecord,
@@ -1537,22 +1537,19 @@ function parseOwnedCapabilityIntent(
 export function createExecutionCapability(
   input: ExecutionCapabilityInput,
 ): ExecutionCapability {
-  const dispatch = async (effect: EffectRecord): Promise<EffectResult> => {
+  const dispatch = async (
+    effect: EffectRecord,
+  ): Promise<EffectResult | undefined> => {
     if (!ownedExecutionKind(effect.kind))
       throw new BuilderReceiptError(
         "Execution capability does not own effect kind.",
       );
     if (effect.status !== "in_flight")
       return capabilityAmbiguous(effect, "effect is not safely dispatchable");
-    let run: RunRecord;
-    let parsed:
-      | CapabilityWorkspaceIntent
-      | CapabilityBuilderIntent
-      | CapabilityVerificationIntent;
     try {
-      run = await readCapabilityRun(input, effect);
+      const run = await readCapabilityRun(input, effect);
       ensureCapabilityRun(effect, run, effect.kind, true);
-      parsed = parseOwnedCapabilityIntent(effect);
+      parseOwnedCapabilityIntent(effect);
     } catch (error) {
       if (error instanceof StaleRevisionError)
         return capabilityAmbiguous(effect, "effect revision is stale");
@@ -1562,26 +1559,24 @@ export function createExecutionCapability(
         `invalid canonical effect context: ${errorMessage(error)}`,
       );
     }
-    if (effect.kind === "workspace_prepare")
-      return dispatchWorkspaceEffect(
-        input,
+    if (input.execute === undefined)
+      return capabilityAmbiguous(
         effect,
-        run,
-        parsed as CapabilityWorkspaceIntent,
+        "coordinator-owned execution settlement capability is unavailable",
       );
-    if (effect.kind === "agent_build")
-      return dispatchBuilderEffect(
-        input,
+    try {
+      // This seam owns the actual edge and must settle its receipt through
+      // WorkflowCoordinator.settleExecution. Returning undefined prevents the
+      // generic coordinator callback from advancing state without its facts
+      // and append-only step record.
+      await input.execute(effect);
+      return undefined;
+    } catch (error) {
+      return capabilityAmbiguous(
         effect,
-        run,
-        parsed as CapabilityBuilderIntent,
+        `coordinator-owned execution settlement failed: ${errorMessage(error)}`,
       );
-    return dispatchVerificationEffect(
-      input,
-      effect,
-      run,
-      parsed as CapabilityVerificationIntent,
-    );
+    }
   };
 
   const observe = async (effect: EffectRecord): Promise<EffectResult> => {

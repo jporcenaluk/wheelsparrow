@@ -152,6 +152,35 @@ test("execution capability fails closed for an unprovable restarted builder", as
   expect(builderCalls).toBe(0);
 });
 
+test("execution capability delegates durable dispatch to its coordinator-owned seam", async () => {
+  const connection = await createDatabase();
+  const coordinator = new WorkflowCoordinator({ connection });
+  const run = await preparingRun(coordinator, connection);
+  const executed: string[] = [];
+  const capability = createExecutionCapability({
+    readRun: async () => run,
+    execute: async (effect) => {
+      executed.push(effect.key);
+    },
+  });
+  const effect = {
+    key: "run:run-1:workspace:prepare",
+    runId: "run-1",
+    reworkEpoch: run.reworkEpoch,
+    kind: "workspace_prepare",
+    targetRevision: run.revision,
+    intent: '{"baseBranch":"main","issueNumber":1,"runId":"run-1"}',
+    status: "in_flight",
+  } as unknown as EffectRecord;
+
+  const dispatcher = capability.dispatcher as (
+    effect: EffectRecord,
+  ) => Promise<unknown>;
+  await expect(dispatcher(effect)).resolves.toBeUndefined();
+  expect(executed).toEqual([effect.key]);
+  await coordinator.close();
+});
+
 describe("executeClaimedRun", () => {
   test("runs builder after committed intake and persists its receipt atomically", async () => {
     const connection = await createDatabase();
