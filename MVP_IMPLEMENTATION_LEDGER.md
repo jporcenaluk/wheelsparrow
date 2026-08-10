@@ -90,8 +90,8 @@ required product outcomes.
 | 5 | Contained worktree, builder, verification, and durable execution | 4 | `merged` | `.worktrees/block3-builder`; `feat/block-3-builder` | `docs/superpowers/plans/2026-08-09-block-3-builder-workspaces.md` | [#30](https://github.com/jporcenaluk/wheelsparrow/pull/30) | `3410fbfa6384fad8d8f1898f4212ca13d55d875b` |
 | 6 | Independent review and bounded repair | 5 | `merged` | `.worktrees/block4-review`; `feat/block-4-review-main` | `docs/superpowers/plans/2026-08-09-block-4-review-repair.md` | [#31](https://github.com/jporcenaluk/wheelsparrow/pull/31) | `558b4d54af18db185ef5a637ca635ae0f896abba` |
 | 7 | Contained publication, exact-head CI, and Review handoff | 6 | `merged` | `.worktrees/block5-publication`; `feat/block-5-publication` | `docs/superpowers/plans/2026-08-09-block-5-publication.md` | [#32](https://github.com/jporcenaluk/wheelsparrow/pull/32) | `11e442f17b535278c7177f144346a8e0e7e7835b` |
-| 8 | Operator API and browser controls | 3 and stable read contract | `review` | `.worktrees/block6-operator`; `feat/block-6-operator` | `docs/superpowers/plans/2026-08-09-block-6-operator.md` | — | — |
-| 9 | Exact-SHA approval, merge, staging, smoke, and Done transition | 7 and 8 | `pending` | — | — | — | — |
+| 8 | Operator API and browser controls | 3 and stable read contract | `merged` | `.worktrees/block6-operator`; `feat/block-6-operator` | `docs/superpowers/plans/2026-08-09-block-6-operator.md` | [#33](https://github.com/jporcenaluk/wheelsparrow/pull/33) | `383e441b8eaade289d1288c9d9d995350ace1da6` |
+| 9 | Exact-SHA approval, merge, staging, smoke, and Done transition | 7 and 8 | `review` | `.worktrees/block7-delivery`; `feat/block-7-delivery` | `docs/superpowers/plans/2026-08-09-block-7-delivery.md` | [#34](https://github.com/jporcenaluk/wheelsparrow/pull/34) | `ea6528b80bf1464c72016f57250758b0bb9965a6` |
 | 10 | Integration, security, artifact, and requirement-conformance closure | 9 | `pending` | — | — | — | — |
 
 ## Current Resume Point

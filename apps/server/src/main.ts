@@ -16,14 +16,24 @@ import type { DatabaseConnection } from "./database/connection.js";
 import { openDatabase } from "./database/connection.js";
 import { migrateDatabase } from "./database/migrate.js";
 import { acquireOwnership } from "./database/ownership.js";
+import { type RunRecord, readRun } from "./database/runs.js";
+import type { GitHubDeliveryGateway } from "./github/delivery.js";
+import { GitHubDeliveryClient } from "./github/delivery-client.js";
+import type { GitHubProjectGateway } from "./github/project.js";
 import {
   createGitHubProjectGateway,
   type GitHubProjectClientOptions,
+  githubTokenFromEnvironment,
 } from "./github/project-client.js";
 import { registerOperatorRoutes } from "./http/routes.js";
 import { createReadinessGate, type ReadinessGate } from "./readiness.js";
 import { registerWeb } from "./web.js";
 import { WorkflowCoordinator } from "./workflow/coordinator.js";
+import {
+  createDeliveryCapability,
+  createSafeSmokeRunner,
+  type SmokeRunner,
+} from "./workflow/delivery.js";
 import { discoverReadyQueue } from "./workflow/operator-discovery.js";
 import { reconcileEffects } from "./workflow/reconciliation.js";
 
@@ -64,7 +74,13 @@ export interface StartDependencies {
   openDatabase(databasePath: string): Database | Promise<Database>;
   migrateDatabase(database: Database, directory: string): void | Promise<void>;
   /** Construct and recover the workflow coordinator after migrations. */
-  createCoordinator?: ((database: Database) => Coordinator) | undefined;
+  createCoordinator?:
+    | ((
+        database: Database,
+        configuration: unknown,
+        repositoryRoot: string,
+      ) => Coordinator)
+    | undefined;
   reconcileEffects?:
     | ((database: Database, coordinator: Coordinator) => void | Promise<void>)
     | undefined;
@@ -97,6 +113,87 @@ export interface ProductionDiscoveryOptions {
   readonly token?: string;
   readonly fetch?: typeof globalThis.fetch;
   readonly endpoint?: string;
+}
+
+export interface ProductionCoordinatorOptions {
+  /** The repository root is the fixed working directory for smoke commands. */
+  readonly repositoryRoot?: string;
+  /** Optional seams are intentionally limited to deterministic composition tests. */
+  readonly projectGateway?: GitHubProjectGateway;
+  readonly deliveryGateway?: GitHubDeliveryGateway;
+  readonly smokeRunner?: SmokeRunner;
+  readonly token?: string;
+  readonly fetch?: typeof globalThis.fetch;
+  readonly endpoint?: string;
+  readonly restEndpoint?: string;
+}
+
+/**
+ * Return only executable lookup variables for smoke processes. Credentials,
+ * configuration overrides, and runtime flags must never cross this boundary.
+ */
+export function createProductionSmokeEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): Readonly<Record<string, string>> {
+  const projected: Record<string, string> = {};
+  const pathValue = environment.PATH ?? environment.Path;
+  if (typeof pathValue === "string" && pathValue.trim().length > 0)
+    projected.PATH = pathValue;
+  if (process.platform === "win32") {
+    for (const key of ["PATHEXT", "SystemRoot", "SYSTEMROOT"] as const) {
+      const value = environment[key];
+      if (typeof value === "string" && value.trim().length > 0)
+        projected[key] = value;
+    }
+  }
+  return projected;
+}
+
+type DoneProjectRunFacts = Pick<
+  RunRecord,
+  "repository" | "projectItemId" | "issueNodeId" | "issueNumber"
+>;
+
+export interface ResolvedDoneProject {
+  readonly projectId: string;
+  readonly projectNumber: number;
+  readonly expectedProjectRevision: string;
+}
+
+/** Resolve the current Review item immediately before scheduling Project Done. */
+export function createProductionDoneProjectResolver(
+  gateway: GitHubProjectGateway,
+  configuration: Configuration,
+): (run: DoneProjectRunFacts) => Promise<ResolvedDoneProject> {
+  const validated = requireConfiguration(configuration);
+  return async (run) => {
+    let item: Awaited<ReturnType<GitHubProjectGateway["readProjectItem"]>>;
+    try {
+      item = await gateway.readProjectItem(run.projectItemId);
+    } catch {
+      throw new Error("The current Review project item could not be read.");
+    }
+    if (
+      item === undefined ||
+      item.projectItemId !== run.projectItemId ||
+      item.projectNumber !== validated.github.project_number ||
+      item.repository !== run.repository ||
+      item.issueNodeId !== run.issueNodeId ||
+      item.issueNumber !== run.issueNumber ||
+      item.status !== validated.github.lanes.review ||
+      item.projectId.trim().length === 0 ||
+      item.revision.trim().length === 0
+    ) {
+      throw new Error(
+        "The current Review project item does not match the durable run.",
+      );
+    }
+    return {
+      projectId: item.projectId,
+      projectNumber: item.projectNumber,
+      expectedProjectRevision: item.revision,
+    };
+  };
 }
 
 function requireConfiguration(value: unknown): Configuration {
@@ -143,6 +240,85 @@ export function createProductionReadyDiscovery(
         requiredLabels: clientOptions.requiredLabels,
       },
     });
+}
+
+/**
+ * Compose the production coordinator with both external delivery adapters.
+ * Runtime configuration is checked again at this boundary so callers cannot
+ * accidentally construct a delivery capability from an unvalidated object.
+ */
+export function createProductionCoordinator(
+  connection: DatabaseConnection,
+  configuration: Configuration,
+  options: ProductionCoordinatorOptions = {},
+): WorkflowCoordinator {
+  const validated = requireConfiguration(configuration);
+  const repository = validated.github.repository.includes("/")
+    ? validated.github.repository
+    : `${validated.github.owner}/${validated.github.repository}`;
+  const token = options.token ?? githubTokenFromEnvironment();
+  const projectGateway =
+    options.projectGateway ??
+    createGitHubProjectGateway({
+      owner: validated.github.owner,
+      repository,
+      projectNumber: validated.github.project_number,
+      statusField: validated.github.status_field,
+      readyStatus: validated.github.lanes.ready,
+      requiredLabels: validated.github.required_labels,
+      priorityField: validated.github.priority_field,
+      ...(token === undefined ? {} : { token }),
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+      ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+    });
+  const deliveryGateway =
+    options.deliveryGateway ??
+    new GitHubDeliveryClient({
+      owner: validated.github.owner,
+      repository,
+      ...(token === undefined ? {} : { token }),
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+      ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+      ...(options.restEndpoint === undefined
+        ? {}
+        : { restEndpoint: options.restEndpoint }),
+      projectGateway,
+    });
+  const deliveryConfiguration = {
+    workflow: validated.staging.workflow,
+    environment: validated.staging.environment,
+    smokeCommand: validated.staging.smoke_command,
+    projectNumber: validated.github.project_number,
+    reviewStatus: validated.github.lanes.review,
+    doneStatus: validated.github.lanes.done,
+    resolveDoneProject: createProductionDoneProjectResolver(
+      projectGateway,
+      validated,
+    ),
+  };
+  const smokeRunner =
+    options.smokeRunner ??
+    createSafeSmokeRunner({
+      cwd: options.repositoryRoot ?? process.cwd(),
+      env: createProductionSmokeEnvironment(),
+    });
+  const capability = createDeliveryCapability(
+    deliveryGateway,
+    deliveryConfiguration,
+    smokeRunner,
+    {
+      resolveRun: (effect) => {
+        if (effect.runId.trim().length === 0)
+          throw new Error("Durable delivery effect has no run ID.");
+        return readRun(connection.db, effect.runId);
+      },
+    },
+  );
+  return new WorkflowCoordinator({
+    connection,
+    dispatcher: capability.dispatcher,
+    observer: capability.observer,
+  });
 }
 
 export function parsePort(value: string | undefined): number {
@@ -288,7 +464,11 @@ export async function startService(
         );
       }
       if (hasCoordinatorFactory && hasReconciler) {
-        coordinator = createCoordinator(database);
+        coordinator = createCoordinator(
+          database,
+          runtimeConfiguration,
+          repositoryRoot,
+        );
         stopIfRequested();
         await reconcile(database, coordinator);
         stopIfRequested();
@@ -385,10 +565,12 @@ const productionDependencies: StartDependencies = {
   acquireOwnership,
   openDatabase,
   migrateDatabase,
-  createCoordinator(database) {
-    return new WorkflowCoordinator({
-      connection: database as DatabaseConnection,
-    });
+  createCoordinator(database, configuration, repositoryRoot) {
+    return createProductionCoordinator(
+      database as DatabaseConnection,
+      requireConfiguration(configuration),
+      { repositoryRoot },
+    );
   },
   async reconcileEffects(database, coordinator) {
     await reconcileEffects({

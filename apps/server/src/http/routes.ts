@@ -1,9 +1,12 @@
 import type { ServerResponse } from "node:http";
 import type {
+  ApproveMergeRequest,
   OperatorQueueRun,
   ReturnToTodoRequest,
 } from "@wheelsparrow/contracts";
 import {
+  ApproveMergeRequestSchema,
+  ApproveMergeResponseSchema,
   ConfigurationResponseSchema,
   OperatorErrorResponseSchema,
   OperatorQueueRunSchema,
@@ -62,6 +65,8 @@ export interface OperatorRoutesHandle {
 }
 
 const OPERATOR_ROOT = "/api/operator";
+const DELIVERY_ROOT = "/api/runs";
+const LOCAL_OPERATOR_IDENTITY = "operator";
 
 interface ErrorBody {
   schema_version: typeof OPERATOR_SCHEMA_VERSION;
@@ -290,6 +295,66 @@ function schedulerProjection(control: SchedulerControl) {
       paused: control.paused,
       stop_after_current: control.stopAfterCurrent,
       updated_at: control.updatedAt,
+    },
+  };
+}
+
+function requiredMergeText(value: string | null, label: string): string {
+  if (value === null || value.trim().length === 0)
+    throw new TypeError(`Merge approval ${label} is unavailable.`);
+  return value;
+}
+
+function requiredMergeNumber(value: number | null, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1)
+    throw new TypeError(`Merge approval ${label} is unavailable.`);
+  return value as number;
+}
+
+function mergeApprovalProjection(
+  result: Awaited<ReturnType<WorkflowCoordinator["approveMerge"]>>,
+) {
+  const detail = projectRunDetail(result.run, {
+    approvals: [result.approval],
+  });
+  const approval = detail.approvals[0];
+  if (approval === undefined) throw new TypeError("Merge approval is missing.");
+  const run = detail.run;
+  return {
+    schema_version: OPERATOR_SCHEMA_VERSION,
+    run,
+    approval,
+    effect: {
+      key: result.effect.key,
+      kind: "merge" as const,
+      target_revision: result.effect.targetRevision,
+      // approveMerge starts the effect after its transaction commits. Its
+      // returned record is the pre-dispatch snapshot, so reflect that
+      // coordinator-owned lease in the sanitized response.
+      status:
+        result.effect.status === "pending"
+          ? ("in_flight" as const)
+          : result.effect.status,
+    },
+    merge_intent: {
+      repository: run.repository,
+      pull_request_number: requiredMergeNumber(
+        run.pull_request_number,
+        "pull request number",
+      ),
+      pull_request_url: requiredMergeText(
+        run.pull_request_url,
+        "pull request URL",
+      ),
+      branch: requiredMergeText(run.branch, "branch"),
+      base_sha: requiredMergeText(
+        result.run.observedBaseSha ?? result.run.baseSha,
+        "base SHA",
+      ),
+      head_sha: requiredMergeText(
+        result.run.approvedHeadSha ?? result.run.headSha,
+        "head SHA",
+      ),
     },
   };
 }
@@ -531,6 +596,85 @@ export function registerOperatorRoutes(
         });
         notifySnapshotChanged();
         return projectRunDetail(run);
+      } catch (error) {
+        if (error instanceof Error && error.name === "OperatorSecurityError")
+          return sendError(
+            reply,
+            403,
+            "csrf_forbidden",
+            "The request origin or CSRF token is invalid.",
+          );
+        return handleError(error, reply);
+      }
+    },
+  );
+
+  app.post(
+    `${DELIVERY_ROOT}/:runId/approve`,
+    {
+      schema: {
+        body: ApproveMergeRequestSchema,
+        response: {
+          200: ApproveMergeResponseSchema,
+          400: OperatorErrorResponseSchema,
+          403: OperatorErrorResponseSchema,
+          404: OperatorErrorResponseSchema,
+          409: OperatorErrorResponseSchema,
+          503: OperatorErrorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        security.checkMutation(request);
+        const runId = parseRunId(request);
+        if (!Value.Check(ApproveMergeRequestSchema, request.body))
+          throw new TypeError("The merge approval request is invalid.");
+        const body = request.body as ApproveMergeRequest;
+        const result = await options.coordinator.approveMerge({
+          runId,
+          expectedRevision: body.expected_run_revision,
+          operator: LOCAL_OPERATOR_IDENTITY,
+          approvedHeadSha: body.approved_head_sha,
+          approvedBaseSha: body.approved_base_sha,
+          at: new Date().toISOString(),
+        });
+        notifySnapshotChanged();
+        return mergeApprovalProjection(result);
+      } catch (error) {
+        if (error instanceof Error && error.name === "OperatorSecurityError")
+          return sendError(
+            reply,
+            403,
+            "csrf_forbidden",
+            "The request origin or CSRF token is invalid.",
+          );
+        return handleError(error, reply);
+      }
+    },
+  );
+
+  app.post(
+    `${DELIVERY_ROOT}/:runId/retry-staging`,
+    {
+      schema: {
+        response: {
+          400: OperatorErrorResponseSchema,
+          403: OperatorErrorResponseSchema,
+          503: OperatorErrorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      try {
+        security.checkMutation(request);
+        parseRunId(request);
+        return sendError(
+          reply,
+          503,
+          "capability_unavailable",
+          "The staging delivery retry capability is unavailable.",
+        );
       } catch (error) {
         if (error instanceof Error && error.name === "OperatorSecurityError")
           return sendError(
