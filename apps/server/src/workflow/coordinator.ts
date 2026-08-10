@@ -21,6 +21,7 @@ import {
   type PublicationFactsPatch,
   type RunRecord,
   readRun,
+  redactSensitiveText,
   type SchedulerControl,
   type SchedulerControlUpdateRequest,
   StaleRevisionError,
@@ -1503,7 +1504,7 @@ export class WorkflowCoordinator {
             sequence: (previous?.sequence ?? 0) + 1,
             run_revision: run.revision,
             kind: quarantinedEffectEventKind,
-            summary: command.evidence,
+            summary: redactSensitiveText(command.evidence),
             details_json: JSON.stringify({ effectKey: command.effectKey }),
             log_reference: null,
             created_at: at,
@@ -1570,7 +1571,7 @@ export class WorkflowCoordinator {
             sequence: (previous?.sequence ?? 0) + 1,
             run_revision: nextRevision,
             kind: quarantinedEffectEventKind,
-            summary: command.evidence,
+            summary: redactSensitiveText(command.evidence),
             details_json: JSON.stringify({ effectKey: command.effectKey }),
             log_reference: null,
             created_at: at,
@@ -1644,11 +1645,12 @@ export class WorkflowCoordinator {
             command.expectedRevision,
           );
 
+        const reason = redactSensitiveText(command.reason);
         let effect: EffectRecord;
         if (row.status === "pending") {
           effect = await createEffectMutationRepository(tx).cancelPendingEffect(
             command.effectKey,
-            command.reason,
+            reason,
             at,
           );
         } else {
@@ -1656,7 +1658,7 @@ export class WorkflowCoordinator {
             .updateTable("side_effects")
             .set({
               status: "cancelled",
-              failure: command.reason,
+              failure: reason,
               completed_at: at,
               updated_at: at,
             })
@@ -1673,7 +1675,7 @@ export class WorkflowCoordinator {
           effect = mapSideEffect({
             ...row,
             status: "cancelled",
-            failure: command.reason,
+            failure: reason,
             completed_at: at,
             updated_at: at,
           });
@@ -1684,7 +1686,7 @@ export class WorkflowCoordinator {
           expectedRevision: run.revision,
           trigger: "claim_rejected",
           at,
-          summary: { text: command.reason },
+          summary: { text: reason },
         });
         return { effect, run: rejected };
       });
@@ -1824,7 +1826,7 @@ export class WorkflowCoordinator {
               sequence: (previous?.sequence ?? 0) + 1,
               run_revision: nextRevision,
               kind: "effect_ambiguous",
-              summary: evidence,
+              summary: redactSensitiveText(evidence),
               details_json: null,
               log_reference: null,
               created_at: at,
@@ -1992,7 +1994,7 @@ export class WorkflowCoordinator {
         .updateTable("side_effects")
         .set({
           status: "ambiguous",
-          reconciliation_evidence: evidence,
+          reconciliation_evidence: redactSensitiveText(evidence),
           updated_at: at,
         })
         .where("key", "=", effectKey)
@@ -2025,7 +2027,7 @@ export class WorkflowCoordinator {
           sequence: (previous?.sequence ?? 0) + 1,
           run_revision: nextRevision,
           kind: "effect_ambiguous",
-          summary: evidence,
+          summary: redactSensitiveText(evidence),
           details_json: null,
           log_reference: null,
           created_at: at,

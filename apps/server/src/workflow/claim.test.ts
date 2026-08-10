@@ -7,7 +7,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { FakeGitHubProjectGateway } from "../../../../tests/fakes/github.js";
 import { openDatabase } from "../database/connection.js";
 import { migrateDatabase } from "../database/migrate.js";
-import { readRun } from "../database/runs.js";
+import { readRun, readSchedulerControl } from "../database/runs.js";
 import type {
   GitHubProjectGateway,
   ProjectItem,
@@ -1286,6 +1286,54 @@ describe("claimNextEligible", () => {
     expect(fake.mutations()).toHaveLength(1);
     await firstCoordinator.close();
     await secondCoordinator.close();
+  });
+
+  test("rejects a claim when Pause wins after discovery but before durable claim creation", async () => {
+    const connection = await createDatabase();
+    const fake = new FakeGitHubProjectGateway(snapshot());
+    const coordinator = coordinatorFor(connection, fake);
+    const control = await readSchedulerControl(connection.db);
+    let paused = false;
+    const racedCoordinator: ClaimNextEligibleInput["coordinator"] = {
+      get hasEffectDispatcher() {
+        return coordinator.hasEffectDispatcher;
+      },
+      get hasEffectObserver() {
+        return coordinator.hasEffectObserver;
+      },
+      async createClaim(...arguments_) {
+        if (!paused) {
+          paused = true;
+          await coordinator.updateSchedulerControl({
+            expectedRevision: control.revision,
+            patch: { paused: true },
+            at: now,
+          });
+        }
+        return coordinator.createClaim(...arguments_);
+      },
+      beginEffect: coordinator.beginEffect.bind(coordinator),
+      waitForEffectSettlement:
+        coordinator.waitForEffectSettlement.bind(coordinator),
+      abandonEffect: coordinator.abandonEffect.bind(coordinator),
+      rejectClaim: coordinator.rejectClaim.bind(coordinator),
+      quarantineEffect: coordinator.quarantineEffect.bind(coordinator),
+    };
+
+    const outcome = await claimNextEligible({
+      ...input(connection, fake, racedCoordinator),
+      expectedSchedulerControlRevision: control.revision,
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "claim_rejected",
+      reason: expect.stringMatching(/scheduler control changed/i),
+    });
+    expect(fake.mutations()).toEqual([]);
+    expect(
+      connection.native.prepare("SELECT COUNT(*) AS count FROM runs").get(),
+    ).toEqual({ count: 0 });
+    await coordinator.close();
   });
 
   test.each([

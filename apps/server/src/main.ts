@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import {
   type Configuration,
@@ -14,9 +15,14 @@ import {
 } from "./config.js";
 import type { DatabaseConnection } from "./database/connection.js";
 import { openDatabase } from "./database/connection.js";
+import type { EffectRecord } from "./database/effects.js";
 import { migrateDatabase } from "./database/migrate.js";
 import { acquireOwnership } from "./database/ownership.js";
-import { type RunRecord, readRun } from "./database/runs.js";
+import {
+  type RunRecord,
+  readRun,
+  readSchedulerControl,
+} from "./database/runs.js";
 import type { GitHubDeliveryGateway } from "./github/delivery.js";
 import { GitHubDeliveryClient } from "./github/delivery-client.js";
 import type { GitHubProjectGateway } from "./github/project.js";
@@ -28,6 +34,16 @@ import {
 import { registerOperatorRoutes } from "./http/routes.js";
 import { createReadinessGate, type ReadinessGate } from "./readiness.js";
 import { registerWeb } from "./web.js";
+import {
+  type ClaimConfiguration,
+  claimNextEligible,
+  createProjectTodoCapability,
+} from "./workflow/claim.js";
+import type {
+  EffectCompletion,
+  EffectDispatcherLike,
+  EffectObserverLike,
+} from "./workflow/coordinator.js";
 import { WorkflowCoordinator } from "./workflow/coordinator.js";
 import {
   createDeliveryCapability,
@@ -35,6 +51,20 @@ import {
   type SmokeRunner,
 } from "./workflow/delivery.js";
 import { discoverReadyQueue } from "./workflow/operator-discovery.js";
+import {
+  createGitHubIssueReader,
+  createProductionExecution,
+  type ProductionExecutionRuntime,
+  type ProductionIssueReader,
+} from "./workflow/production-execution.js";
+import {
+  createProductionReviewPublication,
+  type ProductionReviewPublicationRuntime,
+} from "./workflow/production-review-publication.js";
+import {
+  createProductionScheduler,
+  type ProductionScheduler,
+} from "./workflow/production-scheduler.js";
 import { reconcileEffects } from "./workflow/reconciliation.js";
 
 interface Ownership {
@@ -47,6 +77,8 @@ interface Database {
 
 export interface Coordinator {
   close(): Promise<void>;
+  productionExecution?: ProductionExecutionRuntime;
+  productionReviewPublication?: ProductionReviewPublicationRuntime;
 }
 
 interface Application {
@@ -79,10 +111,18 @@ export interface StartDependencies {
         database: Database,
         configuration: unknown,
         repositoryRoot: string,
-      ) => Coordinator)
+      ) => Coordinator | Promise<Coordinator>)
     | undefined;
   reconcileEffects?:
     | ((database: Database, coordinator: Coordinator) => void | Promise<void>)
+    | undefined;
+  createScheduler?:
+    | ((
+        database: Database,
+        coordinator: Coordinator,
+        configuration: unknown,
+        repositoryRoot: string,
+      ) => ProductionScheduler | Promise<ProductionScheduler>)
     | undefined;
   buildApp(options: {
     readiness: ReadinessGate;
@@ -120,12 +160,36 @@ export interface ProductionCoordinatorOptions {
   readonly repositoryRoot?: string;
   /** Optional seams are intentionally limited to deterministic composition tests. */
   readonly projectGateway?: GitHubProjectGateway;
+  /** The configured Project ID, resolved during production startup. */
+  readonly projectId?: string;
+  /** Optional issue source seam for deterministic composition tests. */
+  readonly issueReader?: ProductionIssueReader;
   readonly deliveryGateway?: GitHubDeliveryGateway;
   readonly smokeRunner?: SmokeRunner;
   readonly token?: string;
   readonly fetch?: typeof globalThis.fetch;
   readonly endpoint?: string;
   readonly restEndpoint?: string;
+}
+
+function dispatchEffectAdapter(
+  adapter: EffectDispatcherLike,
+  effect: EffectRecord,
+  complete: EffectCompletion,
+): unknown {
+  return typeof adapter === "function"
+    ? adapter(effect, complete)
+    : adapter.dispatch(effect, complete);
+}
+
+function observeEffectAdapter(
+  adapter: EffectObserverLike,
+  effect: EffectRecord,
+  complete: EffectCompletion,
+): unknown {
+  return typeof adapter === "function"
+    ? adapter(effect, complete)
+    : adapter.observe(effect, complete);
 }
 
 /**
@@ -251,7 +315,7 @@ export function createProductionCoordinator(
   connection: DatabaseConnection,
   configuration: Configuration,
   options: ProductionCoordinatorOptions = {},
-): WorkflowCoordinator {
+): Coordinator & WorkflowCoordinator {
   const validated = requireConfiguration(configuration);
   const repository = validated.github.repository.includes("/")
     ? validated.github.repository
@@ -314,11 +378,126 @@ export function createProductionCoordinator(
       },
     },
   );
-  return new WorkflowCoordinator({
+  const projectTodoCapability =
+    options.projectId === undefined
+      ? undefined
+      : createProjectTodoCapability(projectGateway, {
+          projectId: options.projectId,
+          projectNumber: validated.github.project_number,
+          repository,
+          readyStatus: validated.github.lanes.ready,
+          todoStatus: validated.github.lanes.todo,
+          requiredLabels: validated.github.required_labels,
+        } satisfies ClaimConfiguration);
+  let coordinator!: Coordinator & WorkflowCoordinator;
+  const productionExecution =
+    options.projectId === undefined
+      ? undefined
+      : createProductionExecution({
+          connection,
+          coordinator: () => coordinator,
+          configuration: validated,
+          repositoryRoot: options.repositoryRoot ?? process.cwd(),
+          projectGateway,
+          projectId: options.projectId,
+          issueReader:
+            options.issueReader ??
+            createGitHubIssueReader({
+              owner: validated.github.owner,
+              repository,
+              ...(token === undefined ? {} : { token }),
+              ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+              ...(options.restEndpoint === undefined
+                ? {}
+                : { endpoint: options.restEndpoint }),
+            }),
+        });
+  const productionReviewPublication =
+    productionExecution === undefined
+      ? undefined
+      : createProductionReviewPublication({
+          connection,
+          coordinator: () => coordinator,
+          configuration: validated,
+          repositoryRoot: options.repositoryRoot ?? process.cwd(),
+          workspaceInspect: productionExecution.workspaceInspect,
+          verify: productionExecution.verify,
+          ...(options.token === undefined ? {} : { token: options.token }),
+          ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+          ...(options.restEndpoint === undefined
+            ? {}
+            : { restEndpoint: options.restEndpoint }),
+        });
+  const executionKinds = new Set([
+    "workspace_prepare",
+    "intake_capture",
+    "agent_build",
+    "verify",
+  ]);
+  const reviewPublicationKinds = new Set([
+    "agent_review",
+    "agent_repair",
+    "publish",
+    "observe_ci",
+  ]);
+  const dispatcher: EffectDispatcherLike = (effect, complete) => {
+    if (effect.kind === "project_todo" && projectTodoCapability !== undefined)
+      return dispatchEffectAdapter(
+        projectTodoCapability.dispatcher,
+        effect,
+        complete,
+      );
+    if (productionExecution !== undefined && executionKinds.has(effect.kind))
+      return dispatchEffectAdapter(
+        productionExecution.capability.dispatcher,
+        effect,
+        complete,
+      );
+    if (
+      productionReviewPublication !== undefined &&
+      reviewPublicationKinds.has(effect.kind)
+    )
+      return dispatchEffectAdapter(
+        productionReviewPublication.capability.dispatcher,
+        effect,
+        complete,
+      );
+    return dispatchEffectAdapter(capability.dispatcher, effect, complete);
+  };
+  const observer: EffectObserverLike = (effect, complete) => {
+    if (effect.kind === "project_todo" && projectTodoCapability !== undefined)
+      return observeEffectAdapter(
+        projectTodoCapability.observer,
+        effect,
+        complete,
+      );
+    if (productionExecution !== undefined && executionKinds.has(effect.kind))
+      return observeEffectAdapter(
+        productionExecution.capability.observer,
+        effect,
+        complete,
+      );
+    if (
+      productionReviewPublication !== undefined &&
+      reviewPublicationKinds.has(effect.kind)
+    )
+      return observeEffectAdapter(
+        productionReviewPublication.capability.observer,
+        effect,
+        complete,
+      );
+    return observeEffectAdapter(capability.observer, effect, complete);
+  };
+  coordinator = new WorkflowCoordinator({
     connection,
-    dispatcher: capability.dispatcher,
-    observer: capability.observer,
+    dispatcher,
+    observer,
   });
+  if (productionExecution !== undefined)
+    coordinator.productionExecution = productionExecution;
+  if (productionReviewPublication !== undefined)
+    coordinator.productionReviewPublication = productionReviewPublication;
+  return coordinator;
 }
 
 export function parsePort(value: string | undefined): number {
@@ -359,6 +538,7 @@ export async function startService(
   let ownership: Ownership | undefined;
   let database: Database | undefined;
   let coordinator: Coordinator | undefined;
+  let scheduler: ProductionScheduler | undefined;
   let app: Application | undefined;
   let sigintHandlerInstalled = false;
   let sigtermHandlerInstalled = false;
@@ -391,6 +571,7 @@ export async function startService(
       ) {
         await attempt(() => readiness?.markNotReady());
       }
+      if (scheduler !== undefined) await attempt(() => scheduler?.stop());
       if (coordinator !== undefined) await attempt(() => coordinator?.close());
       if (app !== undefined) await attempt(() => app?.close());
       if (database !== undefined) await attempt(() => database?.close());
@@ -456,15 +637,22 @@ export async function startService(
       stopIfRequested();
       const createCoordinator = dependencies.createCoordinator;
       const reconcile = dependencies.reconcileEffects;
+      const createScheduler = dependencies.createScheduler;
       const hasCoordinatorFactory = createCoordinator !== undefined;
       const hasReconciler = reconcile !== undefined;
+      const hasSchedulerFactory = createScheduler !== undefined;
       if (hasCoordinatorFactory !== hasReconciler) {
         throw new Error(
           "Coordinator and reconciliation dependencies must be provided together",
         );
       }
+      if (hasSchedulerFactory && !hasCoordinatorFactory) {
+        throw new Error(
+          "Scheduler requires coordinator and reconciliation dependencies",
+        );
+      }
       if (hasCoordinatorFactory && hasReconciler) {
-        coordinator = createCoordinator(
+        coordinator = await createCoordinator(
           database,
           runtimeConfiguration,
           repositoryRoot,
@@ -472,6 +660,15 @@ export async function startService(
         stopIfRequested();
         await reconcile(database, coordinator);
         stopIfRequested();
+        if (createScheduler !== undefined) {
+          scheduler = await createScheduler(
+            database,
+            coordinator,
+            runtimeConfiguration,
+            repositoryRoot,
+          );
+          stopIfRequested();
+        }
       }
       const appOptions: {
         readiness: ReadinessGate;
@@ -509,6 +706,10 @@ export async function startService(
       });
       stopIfRequested();
       readiness.markReady();
+      if (scheduler !== undefined) {
+        await scheduler.start();
+        stopIfRequested();
+      }
       dependencies.announce(address);
     } finally {
       startupSettled = true;
@@ -565,17 +766,104 @@ const productionDependencies: StartDependencies = {
   acquireOwnership,
   openDatabase,
   migrateDatabase,
-  createCoordinator(database, configuration, repositoryRoot) {
+  async createCoordinator(database, configuration, repositoryRoot) {
+    const validated = requireConfiguration(configuration);
+    const token = githubTokenFromEnvironment();
+    const repository = validated.github.repository.includes("/")
+      ? validated.github.repository
+      : `${validated.github.owner}/${validated.github.repository}`;
+    const projectGateway = createGitHubProjectGateway({
+      owner: validated.github.owner,
+      repository,
+      projectNumber: validated.github.project_number,
+      statusField: validated.github.status_field,
+      readyStatus: validated.github.lanes.ready,
+      requiredLabels: validated.github.required_labels,
+      priorityField: validated.github.priority_field,
+      ...(token === undefined ? {} : { token }),
+    });
+    const project = await projectGateway.readConfiguredProject();
     return createProductionCoordinator(
       database as DatabaseConnection,
-      requireConfiguration(configuration),
-      { repositoryRoot },
+      validated,
+      {
+        repositoryRoot,
+        projectGateway,
+        projectId: project.projectId,
+        ...(token === undefined ? {} : { token }),
+      },
     );
   },
   async reconcileEffects(database, coordinator) {
     await reconcileEffects({
       connection: database as DatabaseConnection,
       coordinator: coordinator as WorkflowCoordinator,
+    });
+  },
+  createScheduler(database, coordinator, configuration) {
+    const validated = requireConfiguration(configuration);
+    const token = githubTokenFromEnvironment();
+    const repository = validated.github.repository.includes("/")
+      ? validated.github.repository
+      : `${validated.github.owner}/${validated.github.repository}`;
+    const projectGateway = createGitHubProjectGateway({
+      owner: validated.github.owner,
+      repository,
+      projectNumber: validated.github.project_number,
+      statusField: validated.github.status_field,
+      readyStatus: validated.github.lanes.ready,
+      requiredLabels: validated.github.required_labels,
+      priorityField: validated.github.priority_field,
+      ...(token === undefined ? {} : { token }),
+    });
+    const connection = database as DatabaseConnection;
+    const ownerToken = randomUUID();
+    return createProductionScheduler({
+      intervalMs: validated.poll_interval_seconds * 1_000,
+      readControl: () => readSchedulerControl(connection.db),
+      claim: async (at, control) => {
+        const project = await projectGateway.readConfiguredProject();
+        const outcome = await claimNextEligible({
+          connection,
+          coordinator: coordinator as WorkflowCoordinator,
+          gateway: projectGateway,
+          configuration: {
+            projectId: project.projectId,
+            projectNumber: validated.github.project_number,
+            repository,
+            readyStatus: validated.github.lanes.ready,
+            todoStatus: validated.github.lanes.todo,
+            requiredLabels: validated.github.required_labels,
+          },
+          ownerToken,
+          expectedSchedulerControlRevision: control.revision,
+          now: () => at,
+          runId: randomUUID,
+        });
+        if (outcome.kind === "claimed") {
+          const execution = coordinator.productionExecution;
+          if (execution === undefined)
+            throw new Error("Production execution capability is unavailable.");
+          const executionOutcome = await execution.runClaimedRun(outcome.run);
+          if (executionOutcome.kind === "reviewing") {
+            const reviewPublication = coordinator.productionReviewPublication;
+            if (reviewPublication === undefined)
+              throw new Error(
+                "Production review/publication capability is unavailable.",
+              );
+            await reviewPublication.runFromVerification(
+              executionOutcome.run,
+              executionOutcome.verification,
+            );
+          }
+        }
+        return outcome;
+      },
+      onError: (error) => {
+        process.stderr.write(
+          `WHEELSPARROW_SCHEDULER_ERROR=${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      },
     });
   },
   buildApp,
@@ -600,9 +888,28 @@ const productionDependencies: StartDependencies = {
   },
 };
 
+/**
+ * Local production-smoke proof exercises daemon lifecycle and assets without
+ * making network calls or requiring an operator's credential store.
+ */
+export function resolveRuntimeDependencies(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): StartDependencies {
+  if (environment.WHEELSPARROW_LOCAL_SMOKE !== "1")
+    return productionDependencies;
+  const {
+    createCoordinator: _createCoordinator,
+    reconcileEffects: _reconcileEffects,
+    createScheduler: _createScheduler,
+    registerOperator: _registerOperator,
+    ...localSmokeDependencies
+  } = productionDependencies;
+  return localSmokeDependencies;
+}
+
 export async function start(repositoryRoot = process.cwd()): Promise<void> {
   try {
-    await startService(repositoryRoot, productionDependencies);
+    await startService(repositoryRoot, resolveRuntimeDependencies());
   } catch (error) {
     if (!(error instanceof ShutdownRequestedError)) throw error;
   }

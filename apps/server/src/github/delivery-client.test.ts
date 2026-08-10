@@ -382,7 +382,7 @@ describe("GitHubDeliveryClient", () => {
     ).rejects.toMatchObject({ kind: "merge_prevented" });
   });
 
-  test("reports a successful workflow with a different environment SHA as a mismatch", async () => {
+  test("waits for a deployment bound to the successful workflow merge SHA", async () => {
     const gateway = client(async (input) => {
       const url = new URL(input.toString());
       if (url.pathname.includes("/actions/workflows/")) {
@@ -421,8 +421,8 @@ describe("GitHubDeliveryClient", () => {
         mergeSha,
       }),
     ).resolves.toMatchObject({
-      outcome: "sha_mismatch",
-      deployment: { deployedSha: "d".repeat(40) },
+      outcome: "pending",
+      deployment: undefined,
     });
   });
 
@@ -486,7 +486,7 @@ describe("GitHubDeliveryClient", () => {
     });
   });
 
-  test("chooses the latest configured workflow even when its SHA drifted", async () => {
+  test("chooses the latest configured workflow bound to the merge SHA", async () => {
     const driftedSha = "d".repeat(40);
     const gateway = client(async (input) => {
       const url = new URL(input.toString());
@@ -522,8 +522,8 @@ describe("GitHubDeliveryClient", () => {
         mergeSha,
       }),
     ).resolves.toMatchObject({
-      outcome: "sha_mismatch",
-      workflowRun: { id: "2", headSha: driftedSha },
+      outcome: "pending",
+      workflowRun: { id: "1", headSha: mergeSha },
     });
   });
 

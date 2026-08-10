@@ -696,7 +696,9 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
         const path = text(run.path) ?? text(run.name);
         return (
           path !== undefined &&
-          (path === expected.workflow || path.endsWith(`/${expected.workflow}`))
+          (path === expected.workflow ||
+            path.endsWith(`/${expected.workflow}`)) &&
+          text(run.head_sha) === expected.mergeSha
         );
       })
       .sort(providerRecency)[0];
@@ -718,7 +720,11 @@ export class GitHubDeliveryClient implements GitHubDeliveryGateway {
     const deploymentList = records(deployments);
     if (deploymentList === undefined) this.#invalid();
     const deployment = deploymentList
-      .filter((item) => item.environment === expected.environment)
+      .filter(
+        (item) =>
+          item.environment === expected.environment &&
+          item.sha === expected.mergeSha,
+      )
       .sort(providerRecency)[0];
     if (deployment === undefined)
       return assertStagingObservation({
