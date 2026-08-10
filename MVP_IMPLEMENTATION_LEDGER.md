@@ -92,7 +92,7 @@ required product outcomes.
 | 7 | Contained publication, exact-head CI, and Review handoff | 6 | `merged` | `.worktrees/block5-publication`; `feat/block-5-publication` | `docs/superpowers/plans/2026-08-09-block-5-publication.md` | [#32](https://github.com/jporcenaluk/wheelsparrow/pull/32) | `11e442f17b535278c7177f144346a8e0e7e7835b` |
 | 8 | Operator API and browser controls | 3 and stable read contract | `merged` | `.worktrees/block6-operator`; `feat/block-6-operator` | `docs/superpowers/plans/2026-08-09-block-6-operator.md` | [#33](https://github.com/jporcenaluk/wheelsparrow/pull/33) | `383e441b8eaade289d1288c9d9d995350ace1da6` |
 | 9 | Exact-SHA approval, merge, staging, smoke, and Done transition | 7 and 8 | `merged` | `.worktrees/block7-delivery`; `feat/block-7-delivery` | `docs/superpowers/plans/2026-08-09-block-7-delivery.md` | [#34](https://github.com/jporcenaluk/wheelsparrow/pull/34) | `c68febf9002306e4bfd0579daeacc416462214f2` |
-| 10 | Integration, security, artifact, and requirement-conformance closure | 9 | `merged` | `.worktrees/block8-closure`; `feat/block-8-closure` | Current focused closure slice | [#35](https://github.com/jporcenaluk/wheelsparrow/pull/35) | `146f2d657d5bfbe68f315d22ec5a16a067c04e41` |
+| 10 | Integration, security, artifact, and requirement-conformance closure | 9 | `merged` | `.worktrees/block8-closure`; local `feat/block-8-closure`, published `feat/block-8-publish` | Current focused closure slice | [#35](https://github.com/jporcenaluk/wheelsparrow/pull/35) | `146f2d657d5bfbe68f315d22ec5a16a067c04e41` |
 
 ## Current Completion Evidence
 
@@ -148,7 +148,7 @@ required product outcomes.
 ## Historical Setup Checklist
 
 This checklist is immutable historical evidence from the original Block 0 setup. It is not current
-programme status or delivery order; only the merge train and current resume point carry those facts.
+programme status or delivery order; only the merge train and current completion evidence carry those facts.
 
 - [x] Read the active goal.
 - [x] Verify current local and remote `main` SHA.
