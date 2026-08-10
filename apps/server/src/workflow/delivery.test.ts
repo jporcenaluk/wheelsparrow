@@ -19,6 +19,7 @@ import { WorkflowCoordinator } from "./coordinator.js";
 import {
   createDeliveryCapability,
   createSafeSmokeRunner,
+  type DeliveryConfiguration,
   executeMergeStage,
   executeProjectDoneStage,
   executeSmokeStage,
@@ -224,7 +225,9 @@ function deployment(sha: string): StagingDeploymentReceipt {
   };
 }
 
-async function reachSmoked() {
+async function reachSmoked(
+  configuration: DeliveryConfiguration = deliveryConfiguration(),
+) {
   const connection = await createDatabase();
   const gateway = new FakeGitHubDeliveryGateway({
     repository: "octo/widget",
@@ -261,7 +264,7 @@ async function reachSmoked() {
     coordinator,
     gateway,
     run: approval.run,
-    configuration: deliveryConfiguration(),
+    configuration,
     now: () => at,
   });
   if (merged.kind !== "merged") throw new Error("merge did not complete");
@@ -271,14 +274,14 @@ async function reachSmoked() {
     coordinator,
     gateway,
     run: merged.run,
-    configuration: deliveryConfiguration(),
+    configuration,
     now: () => at,
   });
   if (staged.kind !== "staged") throw new Error("staging did not complete");
   const smoked = await executeSmokeStage({
     coordinator,
     run: staged.run,
-    configuration: deliveryConfiguration(),
+    configuration,
     smokeRunner: {
       run: async () => ({
         outcome: "passed" as const,
@@ -308,6 +311,34 @@ afterEach(async () => {
 });
 
 describe("coordinator-owned delivery stages", () => {
+  test("binds a freshly resolved Project revision into the durable Done intent", async () => {
+    const {
+      projectId: _projectId,
+      projectNumber: _projectNumber,
+      expectedProjectRevision: _expectedProjectRevision,
+      ...withoutDoneFacts
+    } = deliveryConfiguration();
+    const resolveDoneProject = vi.fn(async () => ({
+      projectId: "PVT_fresh",
+      projectNumber: 9,
+      expectedProjectRevision: "revision-fresh",
+    }));
+    const fixture = await reachSmoked({
+      ...withoutDoneFacts,
+      resolveDoneProject,
+    });
+
+    expect(resolveDoneProject).toHaveBeenCalledWith(
+      expect.objectContaining({ id: fixture.smoked.run.id }),
+    );
+    expect(JSON.parse(fixture.doneEffect.effect.intent)).toMatchObject({
+      projectId: "PVT_fresh",
+      projectNumber: 9,
+      expectedRevision: "revision-fresh",
+    });
+    await fixture.coordinator.close();
+  });
+
   test("rereads and merges only the exact approved candidate, then schedules staging", async () => {
     const connection = await createDatabase();
     const gateway = new FakeGitHubDeliveryGateway({

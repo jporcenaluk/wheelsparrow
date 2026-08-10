@@ -45,6 +45,12 @@ export interface DeliveryConfiguration {
   readonly expectedProjectRevision?: string;
   readonly reviewStatus?: string;
   readonly doneStatus?: string;
+  /** Re-read the current Project item immediately before durable Done intent creation. */
+  readonly resolveDoneProject?: (run: RunRecord) => Promise<{
+    readonly projectId: string;
+    readonly projectNumber: number;
+    readonly expectedProjectRevision: string;
+  }>;
 }
 
 /** A deliberately narrow command runner. It does not expose a shell or child process. */
@@ -460,6 +466,15 @@ function doneConfigError(
   if (!text(configuration.doneStatus, 256))
     return "Done status is unavailable.";
   return undefined;
+}
+
+async function resolveDoneConfiguration(
+  run: RunRecord,
+  configuration: DeliveryConfiguration,
+): Promise<DeliveryConfiguration> {
+  if (configuration.resolveDoneProject === undefined) return configuration;
+  const facts = await configuration.resolveDoneProject(run);
+  return { ...configuration, ...facts };
 }
 
 function parseIntent(
@@ -1171,9 +1186,13 @@ export async function executeSmokeStage(
   }
   const doneKey = effectKey(settled.run, "done");
   try {
-    const { effectKey: _effectKey, ...doneIntent } = doneRequest(
+    const doneConfiguration = await resolveDoneConfiguration(
       settled.run,
       input.configuration,
+    );
+    const { effectKey: _effectKey, ...doneIntent } = doneRequest(
+      settled.run,
+      doneConfiguration,
       doneKey,
     );
     await input.coordinator.createEffectIntent({
