@@ -16,7 +16,7 @@ import type { DatabaseConnection } from "./database/connection.js";
 import { openDatabase } from "./database/connection.js";
 import { migrateDatabase } from "./database/migrate.js";
 import { acquireOwnership } from "./database/ownership.js";
-import { readRun } from "./database/runs.js";
+import { type RunRecord, readRun } from "./database/runs.js";
 import type { GitHubDeliveryGateway } from "./github/delivery.js";
 import { GitHubDeliveryClient } from "./github/delivery-client.js";
 import type { GitHubProjectGateway } from "./github/project.js";
@@ -32,7 +32,6 @@ import { WorkflowCoordinator } from "./workflow/coordinator.js";
 import {
   createDeliveryCapability,
   createSafeSmokeRunner,
-  type DeliveryConfiguration,
   type SmokeRunner,
 } from "./workflow/delivery.js";
 import { discoverReadyQueue } from "./workflow/operator-discovery.js";
@@ -150,6 +149,53 @@ export function createProductionSmokeEnvironment(
   return projected;
 }
 
+type DoneProjectRunFacts = Pick<
+  RunRecord,
+  "repository" | "projectItemId" | "issueNodeId" | "issueNumber"
+>;
+
+export interface ResolvedDoneProject {
+  readonly projectId: string;
+  readonly projectNumber: number;
+  readonly expectedProjectRevision: string;
+}
+
+/** Resolve the current Review item immediately before scheduling Project Done. */
+export function createProductionDoneProjectResolver(
+  gateway: GitHubProjectGateway,
+  configuration: Configuration,
+): (run: DoneProjectRunFacts) => Promise<ResolvedDoneProject> {
+  const validated = requireConfiguration(configuration);
+  return async (run) => {
+    let item: Awaited<ReturnType<GitHubProjectGateway["readProjectItem"]>>;
+    try {
+      item = await gateway.readProjectItem(run.projectItemId);
+    } catch {
+      throw new Error("The current Review project item could not be read.");
+    }
+    if (
+      item === undefined ||
+      item.projectItemId !== run.projectItemId ||
+      item.projectNumber !== validated.github.project_number ||
+      item.repository !== run.repository ||
+      item.issueNodeId !== run.issueNodeId ||
+      item.issueNumber !== run.issueNumber ||
+      item.status !== validated.github.lanes.review ||
+      item.projectId.trim().length === 0 ||
+      item.revision.trim().length === 0
+    ) {
+      throw new Error(
+        "The current Review project item does not match the durable run.",
+      );
+    }
+    return {
+      projectId: item.projectId,
+      projectNumber: item.projectNumber,
+      expectedProjectRevision: item.revision,
+    };
+  };
+}
+
 function requireConfiguration(value: unknown): Configuration {
   if (!Value.Check(ConfigurationSchema, value)) {
     throw new Error("Validated runtime configuration is unavailable.");
@@ -238,13 +284,17 @@ export function createProductionCoordinator(
         : { restEndpoint: options.restEndpoint }),
       projectGateway,
     });
-  const deliveryConfiguration: DeliveryConfiguration = {
+  const deliveryConfiguration = {
     workflow: validated.staging.workflow,
     environment: validated.staging.environment,
     smokeCommand: validated.staging.smoke_command,
     projectNumber: validated.github.project_number,
     reviewStatus: validated.github.lanes.review,
     doneStatus: validated.github.lanes.done,
+    resolveDoneProject: createProductionDoneProjectResolver(
+      projectGateway,
+      validated,
+    ),
   };
   const smokeRunner =
     options.smokeRunner ??

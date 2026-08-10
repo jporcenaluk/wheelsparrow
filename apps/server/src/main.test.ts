@@ -11,9 +11,11 @@ import { openDatabase } from "./database/connection.js";
 import { migrateDatabase } from "./database/migrate.js";
 import { createRunMutationRepository, readRun } from "./database/runs.js";
 import type { MergeCandidateReceipt } from "./github/delivery.js";
+import type { GitHubProjectGateway, ProjectItem } from "./github/project.js";
 import { GitHubCredentialsUnavailableError } from "./github/project-client.js";
 import {
   createProductionCoordinator,
+  createProductionDoneProjectResolver,
   createProductionReadyDiscovery,
   createProductionSmokeEnvironment,
   parsePort,
@@ -381,6 +383,88 @@ function lifecycleFakes({
 }
 
 describe("start", () => {
+  test("resolves Project Done facts from the current matching Review item", async () => {
+    const item: ProjectItem = {
+      projectItemId: "PVTI_42",
+      projectId: "PVT_1",
+      projectNumber: 1,
+      repository: "owner/repository",
+      issueNodeId: "I_42",
+      issueNumber: 42,
+      isOpen: true,
+      status: productionConfiguration.github.lanes.review,
+      revision: "revision-7",
+      labels: ["mvp"],
+      createdAt: "2026-08-10T09:00:00.000Z",
+      dependencies: [],
+    };
+    const projectGateway: GitHubProjectGateway = {
+      readProject: async () => {
+        throw new Error("not used");
+      },
+      readProjectItem: async (projectItemId) =>
+        projectItemId === item.projectItemId ? item : undefined,
+      moveProjectItem: async () => {
+        throw new Error("not used");
+      },
+    };
+    const resolveDoneProject = createProductionDoneProjectResolver(
+      projectGateway,
+      productionConfiguration,
+    );
+
+    await expect(
+      resolveDoneProject({
+        repository: item.repository,
+        projectItemId: item.projectItemId,
+        issueNodeId: item.issueNodeId,
+        issueNumber: item.issueNumber,
+      }),
+    ).resolves.toEqual({
+      projectId: item.projectId,
+      projectNumber: item.projectNumber,
+      expectedProjectRevision: item.revision,
+    });
+  });
+
+  test("rejects a Project Done resolver read outside the current Review lane", async () => {
+    const projectGateway: GitHubProjectGateway = {
+      readProject: async () => {
+        throw new Error("not used");
+      },
+      readProjectItem: async () => ({
+        projectItemId: "PVTI_42",
+        projectId: "PVT_1",
+        projectNumber: 1,
+        repository: "owner/repository",
+        issueNodeId: "I_42",
+        issueNumber: 42,
+        isOpen: true,
+        status: productionConfiguration.github.lanes.done,
+        revision: "revision-8",
+        labels: ["mvp"],
+        createdAt: "2026-08-10T09:00:00.000Z",
+        dependencies: [],
+      }),
+      moveProjectItem: async () => {
+        throw new Error("not used");
+      },
+    };
+    const resolveDoneProject = createProductionDoneProjectResolver(
+      projectGateway,
+      productionConfiguration,
+    );
+
+    await expect(
+      resolveDoneProject({
+        repository: "owner/repository",
+        projectItemId: "PVTI_42",
+        issueNodeId: "I_42",
+        issueNumber: 42,
+      }),
+    ).rejects.toThrow("does not match the durable run");
+  });
+
   test("projects PATH but no credentials into the production smoke environment", () => {
     const environment = createProductionSmokeEnvironment({
       PATH: "/safe/bin",
