@@ -31,7 +31,141 @@ jobs:
       - name: Build
         run: make build
       - name: Production smoke
-        run: node scripts/production-smoke.mjs
+        run: make smoke-production
+      - name: Upload test diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-test-failure-${{ github.sha }}
+          path: |
+            coverage
+            test-results
+            artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+
+  prompt-contract:
+    name: prompt-contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+      - name: Enable pinned pnpm
+        run: corepack enable
+      - name: Install frozen dependencies
+        run: make setup
+      - name: Prompt contract
+        run: |
+          mkdir -p artifacts
+          set -o pipefail
+          make test-prompts 2>&1 | tee artifacts/prompt-contract.log
+      - name: Upload prompt diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-prompt-contract-failure-${{ github.sha }}
+          path: artifacts/prompt-contract.log
+          if-no-files-found: error
+          retention-days: 14
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+      - name: Enable pinned pnpm
+        run: corepack enable
+      - name: Install frozen dependencies
+        run: make setup
+      - name: Integration suite
+        run: |
+          mkdir -p artifacts
+          set -o pipefail
+          make test-integration 2>&1 | tee artifacts/integration.log
+      - name: Upload integration diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-integration-failure-${{ github.sha }}
+          path: artifacts/integration.log
+          if-no-files-found: error
+          retention-days: 14
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+      - name: Enable pinned pnpm
+        run: corepack enable
+      - name: Install dependencies and browser
+        run: |
+          make setup
+          pnpm exec playwright install --with-deps chromium
+      - name: End-to-end suite
+        run: |
+          mkdir -p artifacts
+          set -o pipefail
+          make test-e2e 2>&1 | tee artifacts/e2e.log
+      - name: Upload Playwright diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-e2e-failure-${{ github.sha }}
+          path: |
+            playwright-report
+            test-results
+            artifacts/e2e.log
+          if-no-files-found: error
+          retention-days: 14
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+      - name: Enable pinned pnpm
+        run: corepack enable
+      - name: Install pinned workflow analyzers
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          python -m pip install --user zizmor==1.27.0
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install frozen dependencies
+        run: make setup
+      - name: Lint and verify workflow policy
+        run: |
+          mkdir -p artifacts
+          set -o pipefail
+          make actionlint 2>&1 | tee artifacts/actionlint.log
+      - name: Upload workflow diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-actionlint-failure-${{ github.sha }}
+          path: artifacts/actionlint.log
+          if-no-files-found: error
+          retention-days: 14
 
   native-storage:
     name: native-storage

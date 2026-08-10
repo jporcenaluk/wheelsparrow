@@ -1,6 +1,6 @@
 # Wheelsparrow MVP Implementation Ledger
 
-Updated: 2026-08-09
+Updated: 2026-08-10
 
 Active goal thread: `019fd8d9-1c69-7810-82ae-6e6b35c2e2e6`
 
@@ -91,27 +91,27 @@ required product outcomes.
 | 6 | Independent review and bounded repair | 5 | `merged` | `.worktrees/block4-review`; `feat/block-4-review-main` | `docs/superpowers/plans/2026-08-09-block-4-review-repair.md` | [#31](https://github.com/jporcenaluk/wheelsparrow/pull/31) | `558b4d54af18db185ef5a637ca635ae0f896abba` |
 | 7 | Contained publication, exact-head CI, and Review handoff | 6 | `merged` | `.worktrees/block5-publication`; `feat/block-5-publication` | `docs/superpowers/plans/2026-08-09-block-5-publication.md` | [#32](https://github.com/jporcenaluk/wheelsparrow/pull/32) | `11e442f17b535278c7177f144346a8e0e7e7835b` |
 | 8 | Operator API and browser controls | 3 and stable read contract | `merged` | `.worktrees/block6-operator`; `feat/block-6-operator` | `docs/superpowers/plans/2026-08-09-block-6-operator.md` | [#33](https://github.com/jporcenaluk/wheelsparrow/pull/33) | `383e441b8eaade289d1288c9d9d995350ace1da6` |
-| 9 | Exact-SHA approval, merge, staging, smoke, and Done transition | 7 and 8 | `review` | `.worktrees/block7-delivery`; `feat/block-7-delivery` | `docs/superpowers/plans/2026-08-09-block-7-delivery.md` | [#34](https://github.com/jporcenaluk/wheelsparrow/pull/34) | `ea6528b80bf1464c72016f57250758b0bb9965a6` |
-| 10 | Integration, security, artifact, and requirement-conformance closure | 9 | `pending` | — | — | — | — |
+| 9 | Exact-SHA approval, merge, staging, smoke, and Done transition | 7 and 8 | `merged` | `.worktrees/block7-delivery`; `feat/block-7-delivery` | `docs/superpowers/plans/2026-08-09-block-7-delivery.md` | [#34](https://github.com/jporcenaluk/wheelsparrow/pull/34) | `c68febf9002306e4bfd0579daeacc416462214f2` |
+| 10 | Integration, security, artifact, and requirement-conformance closure | 9 | `review` | `.worktrees/block8-closure`; `feat/block-8-closure` | Current focused closure slice | Pending publication | Pending exact-head CI |
 
 ## Current Resume Point
 
 - Branch base: protected `main` at
-  `11e442f17b535278c7177f144346a8e0e7e7835b`.
-- Active slice: merge-train row 8, Block 6 operator API and browser controls.
-- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block6-operator`.
-- Branch: `feat/block-6-operator`.
-- Observed executable head before this ledger edit:
-  `ff9bb23bbc220327edde953b2874a51965eae3d7`.
-- Active plan: `docs/superpowers/plans/2026-08-09-block-6-operator.md`; redacted snapshots,
-  guarded scheduler and Return-to-Todo controls, SSE invalidation, configured GitHub discovery,
-  and accessible operator routes are complete locally.
-- Local evidence: host-executed unit suite passed 43 files / 798 tests; prompt suite passed 55/55;
-  `make verify-agent`, build, smoke, Biome, TypeScript, and diff checks passed. Fresh security,
-  browser, discovery, and ordering reviews drove and approved the final repairs.
-- Publication state: Block 6 has no remote PR, GitHub CI, or merge evidence yet.
-- Next safe command: push the exact reviewed branch, open a non-draft Block 6 PR, and observe CI
-  for that exact head before any merge decision.
+  `c68febf9002306e4bfd0579daeacc416462214f2`.
+- Active slice: merge-train row 10, Block 8 closure.
+- Active worktree: `/home/jporc/wheelsparrow/.worktrees/block8-closure`.
+- Branch: `feat/block-8-closure`.
+- Reviewed executable head before this ledger edit:
+  `6e95ae48baf62849cff25889ed8e8d9cb91b89d8`.
+- Local evidence: full host unit/type/lint gate, workflow policy, production-server Playwright,
+  build, production smoke, and diff hygiene passed. Fresh independent specification and quality
+  reviews drove exact-SHA staging, waiter redaction, CI artifact gating, diagnostics, and
+  disposable-target credential repairs.
+- Publication state: no remote PR or exact-head CI evidence yet.
+- Live smoke remains externally deferred: the workflow now requires a target-scoped
+  `WHEELSPARROW_LIVE_SMOKE_TOKEN`, but no disposable target or execution authority is available.
+- Next safe command: commit this ledger update, push the exact reviewed branch, open a non-draft
+  Block 8 PR, and observe required checks for that exact head before any merge decision.
 - Current owner: root orchestrator; no bounded code worker is active at this checkpoint.
 - Blocker: none.
 

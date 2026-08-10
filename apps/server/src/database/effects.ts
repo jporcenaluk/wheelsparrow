@@ -15,6 +15,8 @@ import {
   createRunMutationRepository,
   type RunRecord,
   readRun,
+  redactSensitiveJson,
+  redactSensitiveText,
   type SanitizedSummary,
 } from "./runs.js";
 import type { DatabaseSchema, SideEffectsTable } from "./schema.js";
@@ -131,6 +133,14 @@ function boundedText(value: unknown, label: string, maximum: number): string {
   return value;
 }
 
+function sensitiveText(value: unknown, label: string, maximum: number): string {
+  const bounded = boundedText(value, label, maximum);
+  const redacted = redactSensitiveText(bounded);
+  if (byteLength(redacted) > maximum)
+    throw new RangeError(`${label} exceeds its size limit.`);
+  return redacted;
+}
+
 function identifier(value: unknown, label: string): string {
   return boundedText(value, label, maximumIdentifierBytes);
 }
@@ -177,7 +187,7 @@ function canonicalJson(value: unknown, label: string): string {
       throw new TypeError(`${label} must be valid JSON.`);
     }
   }
-  const serialized = JSON.stringify(normalizeJson(parsed));
+  const serialized = JSON.stringify(normalizeJson(redactSensitiveJson(parsed)));
   if (serialized === undefined)
     throw new TypeError(`${label} must be valid JSON.`);
   if (byteLength(serialized) > maximumJsonBytes)
@@ -457,7 +467,7 @@ export function createEffectMutationRepository(
         "Expected revision",
       );
       const ownerToken = identifier(ownerTokenInput, "Executor owner token");
-      const evidence = boundedText(
+      const evidence = sensitiveText(
         evidenceInput,
         "Retry evidence",
         maximumEvidenceBytes,
@@ -501,7 +511,7 @@ export function createEffectMutationRepository(
         "Expected revision",
       );
       const at = identifier(atInput, "Timestamp");
-      const evidence = boundedText(
+      const evidence = sensitiveText(
         observation.evidence,
         "Observation evidence",
         maximumEvidenceBytes,
@@ -564,7 +574,7 @@ export function createEffectMutationRepository(
       atInput,
     ): Promise<EffectRecord> {
       const key = identifier(keyInput, "Effect key");
-      const reason = boundedText(
+      const reason = sensitiveText(
         reasonInput,
         "Cancellation reason",
         maximumEvidenceBytes,
@@ -589,7 +599,7 @@ export function createEffectMutationRepository(
 
     async markOwnedInFlightAmbiguous(ownerTokenInput, evidenceInput, atInput) {
       const ownerToken = identifier(ownerTokenInput, "Executor owner token");
-      const evidence = boundedText(
+      const evidence = sensitiveText(
         evidenceInput,
         "Reconciliation evidence",
         maximumEvidenceBytes,

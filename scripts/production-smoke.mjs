@@ -468,7 +468,11 @@ function spawnService(bundleRoot, repositoryRoot, startupBarrier = false) {
     : [resolveBuiltMain(bundleRoot)];
   const child = spawn(process.execPath, args, {
     cwd: repositoryRoot,
-    env: { ...process.env, WHEELSPARROW_PORT: "0" },
+    env: {
+      ...process.env,
+      WHEELSPARROW_LOCAL_SMOKE: "1",
+      WHEELSPARROW_PORT: "0",
+    },
     stdio: startupBarrier
       ? ["ignore", "pipe", "pipe", "ipc"]
       : ["ignore", "pipe", "pipe"],

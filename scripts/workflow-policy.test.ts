@@ -5,7 +5,13 @@ import { parse } from "yaml";
 
 const root = resolve(import.meta.dirname, "..");
 const workflowDirectory = resolve(root, ".github/workflows");
-const knownWorkflows = ["pr-title.yml", "ci.yml", "main.yml"] as const;
+const knownWorkflows = [
+  "pr-title.yml",
+  "ci.yml",
+  "main.yml",
+  "live-smoke.yml",
+  "security.yml",
+] as const;
 type WorkflowFilename = (typeof knownWorkflows)[number];
 type WorkflowStep = {
   name?: string;
@@ -31,12 +37,52 @@ const approvedActions: Record<
   "ci.yml": [
     { reference: checkout, release: "v6.0.2" },
     { reference: setupNode, release: "v6.4.0" },
+    { reference: uploadArtifact, release: "v7.0.1" },
+    { reference: checkout, release: "v6.0.2" },
+    { reference: setupNode, release: "v6.4.0" },
+    { reference: uploadArtifact, release: "v7.0.1" },
+    { reference: checkout, release: "v6.0.2" },
+    { reference: setupNode, release: "v6.4.0" },
+    { reference: uploadArtifact, release: "v7.0.1" },
+    { reference: checkout, release: "v6.0.2" },
+    { reference: setupNode, release: "v6.4.0" },
+    { reference: uploadArtifact, release: "v7.0.1" },
+    { reference: checkout, release: "v6.0.2" },
+    { reference: setupNode, release: "v6.4.0" },
+    { reference: uploadArtifact, release: "v7.0.1" },
     { reference: checkout, release: "v6.0.2" },
     { reference: setupNode, release: "v6.4.0" },
   ],
   "main.yml": [
     { reference: checkout, release: "v6.0.2" },
     { reference: setupNode, release: "v6.4.0" },
+    { reference: checkout, release: "v6.0.2" },
+    { reference: setupNode, release: "v6.4.0" },
+    { reference: uploadArtifact, release: "v7.0.1" },
+    { reference: uploadArtifact, release: "v7.0.1" },
+  ],
+  "live-smoke.yml": [
+    { reference: checkout, release: "v6.0.2" },
+    { reference: setupNode, release: "v6.4.0" },
+    { reference: uploadArtifact, release: "v7.0.1" },
+  ],
+  "security.yml": [
+    { reference: checkout, release: "v6.0.2" },
+    {
+      reference:
+        "github/codeql-action/init@03e4368ac7daa2bd82b3e85262f3bf87ee112f57",
+      release: "v3.36.0",
+    },
+    {
+      reference:
+        "github/codeql-action/analyze@03e4368ac7daa2bd82b3e85262f3bf87ee112f57",
+      release: "v3.36.0",
+    },
+    {
+      reference:
+        "gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e",
+      release: "v3.0.0",
+    },
     { reference: uploadArtifact, release: "v7.0.1" },
   ],
 };
@@ -44,6 +90,7 @@ const prTitleEnv = `PR_TITLE: ${"$"}{{ github.event.pull_request.title }}`;
 const prDraftEnv = `PR_DRAFT: ${"$"}{{ github.event.pull_request.draft }}`;
 const ciConcurrency = `ci-${"$"}{{ github.event.pull_request.number || github.sha }}`;
 const prOnlyCancellation = `${"$"}{{ github.event_name == 'pull_request' }}`;
+const failureOnly = `${"$"}{{ failure() }}`;
 const githubShaShell = `${"$"}{GITHUB_SHA}`;
 const discoveredWorkflows = readdirSync(workflowDirectory, {
   recursive: true,
@@ -122,7 +169,7 @@ describe("workflow policy", () => {
   it("uses immutable actions, least privilege, and no pull_request_target", () => {
     for (const filename of discoveredWorkflows) {
       const { source, workflow } = readWorkflow(filename);
-      expect(workflow.permissions).toEqual({ contents: "read" });
+      expect(workflow.permissions).toMatchObject({ contents: "read" });
       expect(source).not.toContain("pull_request_target");
       commentedActionUses(source, workflow);
     }
@@ -193,9 +240,7 @@ describe("workflow policy", () => {
     );
     expect(runCommands(steps[verifyIndex])).toEqual(["make verify-agent"]);
     expect(runCommands(steps[buildIndex])).toEqual(["make build"]);
-    expect(runCommands(steps[smokeIndex])).toEqual([
-      "node scripts/production-smoke.mjs",
-    ]);
+    expect(runCommands(steps[smokeIndex])).toEqual(["make smoke-production"]);
     expect(buildIndex).toBeGreaterThan(verifyIndex);
     expect(smokeIndex).toBeGreaterThan(buildIndex);
     for (const step of steps.filter(({ uses }) => uses === checkout)) {
@@ -268,10 +313,17 @@ describe("workflow policy", () => {
     const { workflow } = readWorkflow("main.yml");
     const jobs = workflow.jobs as Record<string, WorkflowJob>;
     const buildJob = jobs["build-artifact"];
+    const waitJob = jobs["await-required-checks"];
     const steps = buildJob?.steps ?? [];
 
     expect(workflow.on).toEqual({ push: { branches: ["main"] } });
     expect(buildJob?.name).toBe("build-artifact");
+    expect(waitJob).toMatchObject({ name: "await-required-checks" });
+    expect(buildJob).toMatchObject({ needs: "await-required-checks" });
+    expect(workflow.permissions).toEqual({ checks: "read", contents: "read" });
+    expect(commandText(waitJob?.steps ?? [])).toContain(
+      "node scripts/await-required-checks.mjs",
+    );
     const checkoutStep = steps.find((step) => step.uses === checkout);
     expect(checkoutStep?.with?.["persist-credentials"]).toBe(false);
 
@@ -290,7 +342,12 @@ describe("workflow policy", () => {
     const verifyIndex = steps.findIndex(
       (step) => step.name === "Verify packaged artifact",
     );
-    const uploadIndex = steps.findIndex((step) => step.uses === uploadArtifact);
+    const failureUpload = steps.find(
+      (step) => step.name === "Upload build diagnostics",
+    );
+    const uploadIndex = steps.findIndex(
+      (step) => step.uses === uploadArtifact && step.name === undefined,
+    );
     expect(packageIndex).toBeGreaterThanOrEqual(0);
     expect(verifyIndex).toBeGreaterThan(packageIndex);
     expect(uploadIndex).toBeGreaterThan(verifyIndex);
@@ -319,7 +376,10 @@ describe("workflow policy", () => {
       "packages/contracts/tsconfig.json",
       "packages/contracts/dist",
       "migrations",
+      "prompts",
       "wheelsparrow.yaml",
+      "scripts/live-smoke.mjs",
+      "scripts/await-required-checks.mjs",
       "scripts/production-smoke.mjs",
     ]) {
       expect(packageText).toContain(requiredPath);
@@ -337,6 +397,11 @@ describe("workflow policy", () => {
     expect(verificationText).toContain(
       'test "$(cat "$PACKAGE_DIR/REVISION")" = "$GITHUB_SHA"',
     );
+    for (const prompt of ["builder.md", "reviewer.md", "repair.md"]) {
+      expect(verificationText).toContain(
+        `test -s "$PACKAGE_DIR/prompts/${prompt}"`,
+      );
+    }
     expect(verificationText).toContain(
       'pnpm --dir "$PACKAGE_DIR" install --prod --frozen-lockfile',
     );
@@ -352,5 +417,76 @@ describe("workflow policy", () => {
       "retention-days": 7,
       "if-no-files-found": "error",
     });
+    expect(failureUpload).toMatchObject({
+      if: failureOnly,
+      uses: uploadArtifact,
+      with: { "if-no-files-found": "ignore", "retention-days": 14 },
+    });
+  });
+
+  it("makes external live smoke explicitly opt-in and refuses this repository", () => {
+    const { source, workflow } = readWorkflow("live-smoke.yml");
+    const trigger = workflow.on as {
+      workflow_dispatch?: { inputs?: Record<string, Record<string, unknown>> };
+    };
+    const inputs = trigger.workflow_dispatch?.inputs ?? {};
+    for (const name of [
+      "repository",
+      "project_number",
+      "disposable_confirmation",
+    ]) {
+      expect(inputs[name]?.required).toBe(true);
+    }
+    expect(inputs.repository?.type).toBe("string");
+    expect(inputs.project_number?.type).toBe("number");
+    expect(inputs.disposable_confirmation?.type).toBe("boolean");
+    expect(source).toContain(
+      'test "$WHEELSPARROW_LIVE_SMOKE_DISPOSABLE" = "true"',
+    );
+    expect(source).toContain(
+      'test "$WHEELSPARROW_LIVE_SMOKE_REPOSITORY" != "$GITHUB_REPOSITORY"',
+    );
+    expect(source).toContain(
+      `GITHUB_TOKEN: ${"$"}{{ secrets.WHEELSPARROW_LIVE_SMOKE_TOKEN }}`,
+    );
+    expect(source).toContain('test -n "$GITHUB_TOKEN"');
+    expect(source).toContain("make live-smoke");
+  });
+
+  it("runs exact-head CodeQL and Gitleaks with minimal security permissions", () => {
+    const { source, workflow } = readWorkflow("security.yml");
+    const security = job(workflow, "security") as WorkflowJob & {
+      permissions?: Record<string, string>;
+    };
+    expect(security.permissions).toEqual({
+      contents: "read",
+      "security-events": "write",
+    });
+    expect(source).toContain('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"');
+    expect(source).toContain("javascript-typescript");
+    expect(source).toContain("gitleaks/gitleaks-action@");
+    expect(source).toContain('GITLEAKS_ENABLE_COMMENTS: "false"');
+  });
+
+  it("runs prompt, integration, browser, and workflow policy gates in CI", () => {
+    const { workflow } = readWorkflow("ci.yml");
+    for (const [identifier, command] of [
+      ["prompt-contract", "make test-prompts"],
+      ["integration", "make test-integration"],
+      ["e2e", "make test-e2e"],
+      ["actionlint", "make actionlint"],
+    ] as const) {
+      const steps = job(workflow, identifier).steps ?? [];
+      expect(commandText(steps)).toContain(command);
+    }
+    expect(commandText(job(workflow, "e2e").steps ?? [])).toContain(
+      "playwright install --with-deps chromium",
+    );
+    expect(commandText(job(workflow, "actionlint").steps ?? [])).toContain(
+      "actionlint@v1.7.12",
+    );
+    expect(commandText(job(workflow, "actionlint").steps ?? [])).toContain(
+      "zizmor==1.27.0",
+    );
   });
 });

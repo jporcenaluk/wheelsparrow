@@ -6,6 +6,7 @@ import {
   RunOwnershipConflictError,
   type RunRecord,
   readRun,
+  SchedulerControlPreconditionError,
 } from "../database/runs.js";
 import type {
   ConditionalProjectStatusMove,
@@ -53,6 +54,8 @@ export interface ClaimNextEligibleInput {
   readonly ownerToken: string;
   readonly now: () => string;
   readonly runId: () => string;
+  /** Captured by the scheduler before external discovery; checked on commit. */
+  readonly expectedSchedulerControlRevision?: number;
   readonly settlementTimeoutMs?: number;
 }
 
@@ -971,6 +974,12 @@ export async function claimNextEligible(
         issueNodeId: candidate.issueNodeId,
         issueNumber: candidate.issueNumber,
         ownerToken: input.ownerToken,
+        ...(input.expectedSchedulerControlRevision === undefined
+          ? {}
+          : {
+              expectedSchedulerControlRevision:
+                input.expectedSchedulerControlRevision,
+            }),
         at: input.now(),
         summary: { text: `Claim issue #${candidate.issueNumber}.` },
       },
@@ -996,6 +1005,15 @@ export async function claimNextEligible(
         kind: "no_candidate",
         discovery: selected,
         reason: "ownership_conflict",
+      };
+    }
+    if (error instanceof SchedulerControlPreconditionError) {
+      return {
+        kind: "claim_rejected",
+        item: candidate,
+        discovery: freshDiscovery,
+        reason:
+          "Scheduler control changed, paused, or requested stop before the claim could commit.",
       };
     }
     throw error;

@@ -12,6 +12,9 @@ import {
   OperatorRunDetailSchema,
   type QueueResponse,
   QueueResponseSchema,
+  type ReturnToTodoRequest,
+  type ReturnToTodoResponse,
+  ReturnToTodoResponseSchema,
   type ReviewResponse,
   ReviewResponseSchema,
   type SchedulerControlPatch,
@@ -244,6 +247,17 @@ export function retryStaging(runId: string): Promise<OperatorErrorResponse> {
     `${DELIVERY_ROOT}/${encodeURIComponent(runId)}/retry-staging`,
     OperatorErrorResponseSchema,
     { method: "POST" },
+  );
+}
+
+export function returnRunToTodo(
+  runId: string,
+  request: ReturnToTodoRequest,
+): Promise<ReturnToTodoResponse> {
+  return requestJson<ReturnToTodoResponse>(
+    `${OPERATOR_ROOT}/runs/${encodeURIComponent(runId)}/return-to-todo`,
+    ReturnToTodoResponseSchema,
+    { method: "POST", body: JSON.stringify(request) },
   );
 }
 

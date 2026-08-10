@@ -4,7 +4,10 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Configuration } from "@wheelsparrow/contracts";
 import { afterEach, describe, expect, test } from "vitest";
-import { FakeGitHubDeliveryGateway } from "../../../tests/fakes/github.js";
+import {
+  FakeGitHubDeliveryGateway,
+  FakeGitHubProjectGateway,
+} from "../../../tests/fakes/github.js";
 import type { LocalPaths } from "./config.js";
 import type { DatabaseConnection } from "./database/connection.js";
 import { openDatabase } from "./database/connection.js";
@@ -21,10 +24,12 @@ import {
   parsePort,
   type RunningService,
   resolveMigrationsDirectory,
+  resolveRuntimeDependencies,
   type StartDependencies,
   start,
   startService,
 } from "./main.js";
+import { claimNextEligible } from "./workflow/claim.js";
 
 const temporaryDirectories: string[] = [];
 const temporaryConnections: ReturnType<typeof openDatabase>[] = [];
@@ -365,6 +370,7 @@ function lifecycleFakes({
     signalTarget,
     createCoordinator: undefined as StartDependencies["createCoordinator"],
     reconcileEffects: undefined as StartDependencies["reconcileEffects"],
+    createScheduler: undefined as StartDependencies["createScheduler"],
   } satisfies StartDependencies;
   return {
     paths,
@@ -383,6 +389,22 @@ function lifecycleFakes({
 }
 
 describe("start", () => {
+  test("uses a credential-free dependency set only for explicit local smoke", () => {
+    const production = resolveRuntimeDependencies({});
+    const localSmoke = resolveRuntimeDependencies({
+      WHEELSPARROW_LOCAL_SMOKE: "1",
+    });
+
+    expect(production.createCoordinator).toBeDefined();
+    expect(production.reconcileEffects).toBeDefined();
+    expect(production.createScheduler).toBeDefined();
+    expect(production.registerOperator).toBeDefined();
+    expect(localSmoke.createCoordinator).toBeUndefined();
+    expect(localSmoke.reconcileEffects).toBeUndefined();
+    expect(localSmoke.createScheduler).toBeUndefined();
+    expect(localSmoke.registerOperator).toBeUndefined();
+  });
+
   test("resolves Project Done facts from the current matching Review item", async () => {
     const item: ProjectItem = {
       projectItemId: "PVTI_42",
@@ -536,6 +558,95 @@ describe("start", () => {
     }
   });
 
+  test("composes the Project Todo capability used by the production scheduler", async () => {
+    const connection = await createMainCompositionDatabase();
+    const projectGateway = new FakeGitHubProjectGateway({
+      projectId: "PVT_1",
+      projectNumber: 1,
+      repository: "owner/repository",
+      items: [
+        {
+          projectItemId: "PVTI_42",
+          projectId: "PVT_1",
+          projectNumber: 1,
+          repository: "owner/repository",
+          issueNodeId: "I_42",
+          issueNumber: 42,
+          isOpen: true,
+          status: productionConfiguration.github.lanes.ready,
+          revision: "revision-1",
+          labels: ["mvp"],
+          createdAt: "2026-08-10T09:00:00.000Z",
+          dependencies: [],
+        },
+      ],
+    });
+    const deliveryGateway = new FakeGitHubDeliveryGateway({
+      repository: "owner/repository",
+      requiredChecks: ["test"],
+      staging: {
+        workflow: productionConfiguration.staging.workflow,
+        environment: productionConfiguration.staging.environment,
+      },
+    });
+    const coordinator = createProductionCoordinator(
+      connection,
+      productionConfiguration,
+      {
+        projectGateway,
+        projectId: "PVT_1",
+        deliveryGateway,
+        smokeRunner: {
+          run: async () => ({ outcome: "passed" }),
+        },
+      },
+    );
+
+    try {
+      const outcome = await claimNextEligible({
+        connection,
+        coordinator,
+        gateway: projectGateway,
+        configuration: {
+          projectId: "PVT_1",
+          projectNumber: 1,
+          repository: "owner/repository",
+          readyStatus: productionConfiguration.github.lanes.ready,
+          todoStatus: productionConfiguration.github.lanes.todo,
+          requiredLabels: productionConfiguration.github.required_labels,
+        },
+        ownerToken: "scheduler-owner",
+        now: () => "2026-08-10T10:00:00.000Z",
+        runId: () => "scheduler-run-42",
+      });
+
+      expect(outcome.kind).toBe("claimed");
+      expect(projectGateway.mutations()).toHaveLength(1);
+      expect(
+        (
+          coordinator as typeof coordinator & {
+            productionExecution?: unknown;
+            productionReviewPublication?: unknown;
+          }
+        ).productionExecution,
+      ).toBeDefined();
+      expect(
+        (
+          coordinator as typeof coordinator & {
+            productionReviewPublication?: unknown;
+          }
+        ).productionReviewPublication,
+      ).toBeDefined();
+      await expect(
+        readRun(connection.db, "scheduler-run-42"),
+      ).resolves.toMatchObject({
+        state: "preparing",
+      });
+    } finally {
+      await coordinator.close();
+    }
+  });
+
   test("composes a credential-backed discovery callback that fails closed without credentials", async () => {
     let fetchCalls = 0;
     const discoverReady = createProductionReadyDiscovery({
@@ -684,6 +795,72 @@ describe("start", () => {
 
     expect(events.slice(-7)).toEqual([
       "not-ready",
+      "coordinator-close",
+      "app-close",
+      "database-close",
+      "ownership-release",
+      "remove:SIGINT",
+      "remove:SIGTERM",
+    ]);
+  });
+
+  test("starts polling only after reconciliation and stops it before the coordinator", async () => {
+    const events: string[] = [];
+    const fake = lifecycleFakes({ events });
+    const coordinator = {
+      async close() {
+        events.push("coordinator-close");
+      },
+    };
+    fake.dependencies.createCoordinator = () => {
+      events.push("coordinator");
+      return coordinator;
+    };
+    fake.dependencies.reconcileEffects = () => {
+      events.push("reconcile");
+    };
+    fake.dependencies.createScheduler = () => {
+      events.push("scheduler");
+      return {
+        async start() {
+          events.push("scheduler-start");
+        },
+        async stop() {
+          events.push("scheduler-stop");
+        },
+        async tick() {
+          events.push("scheduler-tick");
+        },
+      };
+    };
+
+    const service = await startService(
+      fake.paths.repositoryRoot,
+      fake.dependencies,
+    );
+
+    expect(events).toEqual([
+      "load-runtime",
+      "install:SIGINT",
+      "install:SIGTERM",
+      "prepare-paths",
+      "acquire",
+      "open",
+      "migrate",
+      "coordinator",
+      "reconcile",
+      "scheduler",
+      "build",
+      "listen",
+      "ready",
+      "scheduler-start",
+      "announce",
+    ]);
+
+    await service.close();
+    expect(events.slice(-8)).toEqual([
+      "not-ready",
+      "scheduler-stop",
       "coordinator-close",
       "app-close",
       "database-close",

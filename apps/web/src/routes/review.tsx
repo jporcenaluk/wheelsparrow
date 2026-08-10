@@ -3,6 +3,7 @@ import type {
   ApproveMergeRequest,
   OperatorReviewItem,
   OperatorRun,
+  ReturnToTodoRequest,
 } from "@wheelsparrow/contracts";
 import { useState } from "react";
 import {
@@ -11,13 +12,14 @@ import {
   fetchRun,
   OperatorApiError,
   retryStaging,
+  returnRunToTodo,
 } from "../api.js";
 import { RunCard } from "../components/cards.js";
 import { ErrorState, LoadingState } from "../components/layout.js";
 
 function actionErrorMessage(
   error: unknown,
-  action: "approve" | "retry",
+  action: "approve" | "retry" | "return",
 ): string {
   const apiError = error instanceof OperatorApiError ? error : null;
   const status = apiError?.status;
@@ -31,10 +33,10 @@ function actionErrorMessage(
   if (status === 409 || apiError?.code === "revision_conflict")
     return `This review candidate is stale${statusSuffix}. Refresh and confirm the current head and base again.`;
   if (status === 403 || apiError?.code === "csrf_forbidden")
-    return `${action === "approve" ? "Approval" : "Staging retry"} was not authorized${statusSuffix}. Check the operator session and try again.`;
+    return `${action === "approve" ? "Approval" : action === "retry" ? "Staging retry" : "Return to Todo"} was not authorized${statusSuffix}. Check the operator session and try again.`;
   if (status === 400 || apiError?.code === "invalid_request")
-    return `${action === "approve" ? "Approval" : "Staging retry"} was not accepted${statusSuffix}. Refresh the current run facts and try again.`;
-  return `${action === "approve" ? "Approval" : "Staging retry"} could not be completed${statusSuffix}. The durable run state was not changed by the browser.`;
+    return `${action === "approve" ? "Approval" : action === "retry" ? "Staging retry" : "Return to Todo"} was not accepted${statusSuffix}. Refresh the current run facts and try again.`;
+  return `${action === "approve" ? "Approval" : action === "retry" ? "Staging retry" : "Return to Todo"} could not be completed${statusSuffix}. The durable run state was not changed by the browser.`;
 }
 
 function DeliveryFacts({ run }: { run: OperatorRun }) {
@@ -71,6 +73,8 @@ function DeliveryFacts({ run }: { run: OperatorRun }) {
 function ReviewDeliveryControls({ item }: { item: OperatorReviewItem }) {
   const queryClient = useQueryClient();
   const [confirmed, setConfirmed] = useState(false);
+  const [returning, setReturning] = useState(false);
+  const [feedback, setFeedback] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
   const detailQuery = useQuery({
     queryKey: ["operator", "run", item.run_id],
@@ -108,6 +112,19 @@ function ReviewDeliveryControls({ item }: { item: OperatorReviewItem }) {
       await invalidateDeliveryQueries();
     },
   });
+  const returnMutation = useMutation({
+    mutationFn: (request: ReturnToTodoRequest) =>
+      returnRunToTodo(item.run_id, request),
+    onError: (error: unknown) => {
+      setActionError(actionErrorMessage(error, "return"));
+    },
+    onSuccess: () => setActionError(null),
+    onSettled: async () => {
+      setReturning(false);
+      setFeedback("");
+      await invalidateDeliveryQueries();
+    },
+  });
 
   if (item.state !== "review") return null;
   if (detailQuery.isPending) {
@@ -131,7 +148,10 @@ function ReviewDeliveryControls({ item }: { item: OperatorReviewItem }) {
   }
 
   const run = detailQuery.data.run;
-  const actionPending = approvalMutation.isPending || retryMutation.isPending;
+  const actionPending =
+    approvalMutation.isPending ||
+    retryMutation.isPending ||
+    returnMutation.isPending;
   const canApprove =
     run.state === "review" &&
     run.base_sha !== null &&
@@ -209,6 +229,45 @@ function ReviewDeliveryControls({ item }: { item: OperatorReviewItem }) {
           </button>
         </div>
       )}
+      <div className="delivery-controls delivery-controls--return">
+        {returning && (
+          <label className="confirmation-control">
+            <span>Operator feedback</span>
+            <textarea
+              aria-label="Operator feedback"
+              value={feedback}
+              onChange={(event) => setFeedback(event.currentTarget.value)}
+              disabled={actionPending}
+            />
+          </label>
+        )}
+        <button
+          type="button"
+          className="button button--quiet"
+          onClick={() => {
+            if (!returning) {
+              setReturning(true);
+              return;
+            }
+            if (feedback.trim().length === 0) return;
+            setActionError(null);
+            returnMutation.mutate({
+              schema_version: 1,
+              expected_revision: run.revision,
+              feedback: feedback.trim(),
+            });
+          }}
+          disabled={
+            actionPending || (returning && feedback.trim().length === 0)
+          }
+        >
+          {returnMutation.isPending
+            ? "Returning to Todo…"
+            : returning
+              ? "Confirm return to Todo"
+              : "Return to Todo"}
+        </button>
+      </div>
       {!canApprove && !canRetryStaging && (
         <p className="muted-line">
           Approval is unavailable until the server exposes a complete Review

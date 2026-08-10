@@ -46,6 +46,13 @@ export interface CreateClaimInput {
   issueNodeId: string;
   issueNumber: number;
   ownerToken: string;
+  /**
+   * When scheduled work supplied a control revision, accepting a claim is
+   * conditional on the same still-enabled durable control row. This closes
+   * the read/claim race without bringing an external Project read inside the
+   * SQLite transaction.
+   */
+  expectedSchedulerControlRevision?: number;
   at: string;
   summary: SanitizedSummary;
 }
@@ -324,6 +331,14 @@ export class RunOwnershipConflictError extends Error {
   }
 }
 
+/** The scheduler was paused/stopped or changed before its claim committed. */
+export class SchedulerControlPreconditionError extends Error {
+  constructor() {
+    super("The durable scheduler control no longer permits a new claim.");
+    this.name = "SchedulerControlPreconditionError";
+  }
+}
+
 /** Compatibility name for callers that use the shorter ownership error. */
 export {
   RunOwnershipConflictError as OwnershipConflictError,
@@ -339,6 +354,69 @@ class DurableRunWriteError extends Error {
 
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
+}
+
+const redactedCredential = "[REDACTED]";
+const githubCredentialPattern =
+  /\b(?:gh[pousr]_[A-Za-z0-9][A-Za-z0-9_-]*|github_pat_[A-Za-z0-9][A-Za-z0-9_-]*)\b/gu;
+const bearerCredentialPattern = /\bBearer\s+[A-Za-z0-9._~+/=-]+/giu;
+const urlUserInfoPattern =
+  /\b([a-z][a-z\d+.-]*:\/\/)[^/\s:@]+(?::[^/\s@]*)?@/giu;
+const authorizationCredentialPattern =
+  /\b(authorization)\b(\s*[:=]\s*)(?:(?:Bearer|Basic)\s+[^\s,;\]}]+|"[^"]*"|'[^']*'|[^\s,;\]}]+)/giu;
+const labeledCredentialPattern =
+  /\b((?:[A-Za-z\d]+[_-])*?(?:secret|token|api[\s_-]*key|access[\s_-]*token|refresh[\s_-]*token|authorization|password))\b(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;\]}]+)/giu;
+const credentialKeyPattern =
+  /(?:^|_)(?:secret|token|api_key|access_token|refresh_token|authorization|password)(?:$|_)/u;
+
+function isCredentialKey(key: string): boolean {
+  const normalized = key
+    .replace(/([a-z\d])([A-Z])/gu, "$1_$2")
+    .replace(/[\s-]+/gu, "_")
+    .toLowerCase();
+  return credentialKeyPattern.test(normalized);
+}
+
+/** Redact credentials in untrusted prose before it reaches a durable column. */
+export function redactSensitiveText(value: string): string {
+  return value
+    .replace(urlUserInfoPattern, "$1[REDACTED]@")
+    .replace(githubCredentialPattern, redactedCredential)
+    .replace(bearerCredentialPattern, "Bearer [REDACTED]")
+    .replace(
+      authorizationCredentialPattern,
+      (_match, label: string, separator: string) =>
+        `${label}${separator}${redactedCredential}`,
+    )
+    .replace(
+      labeledCredentialPattern,
+      (_match, label: string, separator: string, value: string) => {
+        const quote =
+          value.length >= 2 &&
+          ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'")))
+            ? value[0]
+            : "";
+        return `${label}${separator}${quote}${redactedCredential}${quote}`;
+      },
+    );
+}
+
+/** Recursively redact string values and values under credential-shaped keys. */
+export function redactSensitiveJson(value: unknown): unknown {
+  if (typeof value === "string") return redactSensitiveText(value);
+  if (Array.isArray(value)) return value.map(redactSensitiveJson);
+  if (typeof value !== "object" || value === null) return value;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const result: Record<string, unknown> = Object.create(null);
+  for (const [key, child] of Object.entries(value)) {
+    const safeKey = redactSensitiveText(key);
+    result[safeKey] = isCredentialKey(key)
+      ? redactedCredential
+      : redactSensitiveJson(child);
+  }
+  return result;
 }
 
 function boundedText(value: unknown, label: string, maximum: number): string {
@@ -361,11 +439,21 @@ function summaryText(summary: unknown): string {
   ) {
     throw new TypeError("Summary must contain non-empty text.");
   }
-  return boundedText(
+  const text = boundedText(
     (summary as { text?: unknown }).text,
     "Summary",
     maximumEvidenceBytes,
   );
+  return boundedText(
+    redactSensitiveText(text),
+    "Summary",
+    maximumEvidenceBytes,
+  );
+}
+
+function sensitiveText(value: unknown, label: string, maximum: number): string {
+  const bounded = boundedText(value, label, maximum);
+  return boundedText(redactSensitiveText(bounded), label, maximum);
 }
 
 function optionalText(
@@ -473,9 +561,28 @@ function boundedIntakeJson(value: string | IntakeJsonValue): string {
   }
   if (!isIntakeJsonValue(parsed))
     throw new TypeError("Intake JSON must contain JSON values.");
-  const serialized = typeof value === "string" ? value : JSON.stringify(value);
+  const serialized = JSON.stringify(redactSensitiveJson(parsed));
+  if (serialized === undefined)
+    throw new TypeError("Intake JSON must contain JSON values.");
   if (byteLength(serialized) > maximumJsonBytes)
     throw new RangeError("Intake JSON exceeds its size limit.");
+  return serialized;
+}
+
+function boundedRedactedJson(value: string, label: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new TypeError(`${label} must be valid JSON.`);
+  }
+  if (!isIntakeJsonValue(parsed))
+    throw new TypeError(`${label} must contain JSON values.`);
+  const serialized = JSON.stringify(redactSensitiveJson(parsed));
+  if (serialized === undefined)
+    throw new TypeError(`${label} must contain JSON values.`);
+  if (byteLength(serialized) > maximumJsonBytes)
+    throw new RangeError(`${label} exceeds its size limit.`);
   return serialized;
 }
 
@@ -622,7 +729,12 @@ function translateWriteError(error: unknown): never {
   ) {
     throw new RunOwnershipConflictError();
   }
-  if (error instanceof DurableRunWriteError) throw error;
+  if (
+    error instanceof DurableRunWriteError ||
+    error instanceof SchedulerControlPreconditionError
+  ) {
+    throw error;
+  }
   throw new DurableRunWriteError();
 }
 
@@ -851,8 +963,25 @@ export function createRunMutationRepository(
       const at = identifier(input.at, "Timestamp");
       const summary = summaryText(input.summary);
       const issueNumber = positiveInteger(input.issueNumber, "Issue number");
+      const expectedSchedulerControlRevision =
+        input.expectedSchedulerControlRevision === undefined
+          ? undefined
+          : revision(
+              input.expectedSchedulerControlRevision,
+              "Expected scheduler control revision",
+            );
 
       try {
+        if (expectedSchedulerControlRevision !== undefined) {
+          const control = await readSchedulerControl(tx);
+          if (
+            control.revision !== expectedSchedulerControlRevision ||
+            control.paused ||
+            control.stopAfterCurrent
+          ) {
+            throw new SchedulerControlPreconditionError();
+          }
+        }
         await tx
           .insertInto("runs")
           .values({
@@ -916,7 +1045,7 @@ export function createRunMutationRepository(
       const requiredAction =
         request.requiredAction === undefined
           ? undefined
-          : boundedText(
+          : sensitiveText(
               request.requiredAction,
               "Required action",
               maximumEvidenceBytes,
@@ -1101,7 +1230,7 @@ export function createRunMutationRepository(
       );
       if (!githubNodeIdPattern.test(pullRequestNodeId))
         throw new TypeError("Pull request node ID is malformed.");
-      const pullRequestTitle = boundedText(
+      const pullRequestTitle = sensitiveText(
         facts.pullRequestTitle,
         "Pull request title",
         maximumPullRequestTitleBytes,
@@ -1199,11 +1328,10 @@ export function createRunMutationRepository(
         input.completedAt,
         "Completion timestamp",
       );
-      const exitResultJson = optionalText(
-        input.exitResultJson,
-        "Step result",
-        maximumJsonBytes,
-      );
+      const exitResultJson =
+        input.exitResultJson === undefined || input.exitResultJson === null
+          ? null
+          : boundedRedactedJson(input.exitResultJson, "Step result");
       const summary =
         input.summary === undefined || input.summary === null
           ? null
@@ -1264,7 +1392,7 @@ export function createRunMutationRepository(
       const stableKey = identifier(input.stableKey, "Finding key");
       const severity = identifier(input.severity, "Finding severity");
       const disposition = identifier(input.disposition, "Finding disposition");
-      const evidence = boundedText(
+      const evidence = sensitiveText(
         input.evidence,
         "Finding evidence",
         maximumEvidenceBytes,
@@ -1319,7 +1447,7 @@ export function createRunMutationRepository(
         input.invalidationReason === undefined ||
         input.invalidationReason === null
           ? null
-          : boundedText(
+          : sensitiveText(
               input.invalidationReason,
               "Invalidation reason",
               maximumEvidenceBytes,
