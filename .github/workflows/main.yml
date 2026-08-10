@@ -5,11 +5,28 @@ on:
     branches: [main]
 
 permissions:
+  checks: read
   contents: read
 
 jobs:
+  await-required-checks:
+    name: await-required-checks
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+      - name: Await same-revision required checks
+        run: node scripts/await-required-checks.mjs
+
   build-artifact:
     name: build-artifact
+    needs: await-required-checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -54,7 +71,10 @@ jobs:
             packages/contracts/tsconfig.json \
             packages/contracts/dist \
             migrations \
+            prompts \
             wheelsparrow.yaml \
+            scripts/live-smoke.mjs \
+            scripts/await-required-checks.mjs \
             scripts/production-smoke.mjs
       - name: Verify packaged artifact
         run: |
@@ -63,8 +83,22 @@ jobs:
           mkdir -p "$PACKAGE_DIR"
           tar -xzf "$ARTIFACT_PATH" -C "$PACKAGE_DIR"
           test "$(cat "$PACKAGE_DIR/REVISION")" = "$GITHUB_SHA"
+          test -s "$PACKAGE_DIR/prompts/builder.md"
+          test -s "$PACKAGE_DIR/prompts/reviewer.md"
+          test -s "$PACKAGE_DIR/prompts/repair.md"
           pnpm --dir "$PACKAGE_DIR" install --prod --frozen-lockfile
           node "$PACKAGE_DIR/scripts/production-smoke.mjs"
+      - name: Upload build diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: main-build-failure-${{ github.sha }}
+          path: |
+            wheelsparrow-*.tar.gz
+            REVISION
+            artifacts
+          if-no-files-found: ignore
+          retention-days: 14
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheelsparrow-${{ github.sha }}
