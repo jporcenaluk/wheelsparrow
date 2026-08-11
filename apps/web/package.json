@@ -9,7 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@tanstack/react-query": "5.90.5",
+    "@tanstack/react-query": "5.101.4",
     "@wheelsparrow/contracts": "workspace:*",
     "react": "19.2.8",
     "react-dom": "19.2.8",
