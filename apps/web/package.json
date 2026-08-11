@@ -13,7 +13,7 @@
     "@wheelsparrow/contracts": "workspace:*",
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "react-router-dom": "7.9.4",
+    "react-router-dom": "7.18.2",
     "typebox": "1.3.11"
   },
   "devDependencies": {
