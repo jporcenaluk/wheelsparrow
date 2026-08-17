@@ -15,7 +15,7 @@
     "@fastify/type-provider-typebox": "6.1.0",
     "@wheelsparrow/contracts": "workspace:*",
     "better-sqlite3": "13.0.3",
-    "fastify": "5.11.2",
+    "fastify": "5.12.0",
     "fs-native-extensions": "1.5.0",
     "kysely": "0.29.4",
     "pino": "10.3.1",
